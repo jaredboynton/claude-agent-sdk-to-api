@@ -17,9 +17,13 @@ import {
   stripCacheControl,
   makeInputQueue,
   claimStreamedToolUse,
+  normalizeToolInput,
+  extractIdHint,
   abandonToolRound,
   raceTurn,
+  toolInputShape,
 } from "../src/server.mjs";
+import { z } from "../src/sdk.mjs";
 
 function fakeSession(bucket, { seenCount = 0, seenHash = hashMessages([], 0), closed = false, currentTurn = null } = {}) {
   return { key: `s-${Math.random().toString(16).slice(2)}`, bucket, seenCount, seenHash, closed, currentTurn };
@@ -275,6 +279,189 @@ test("claimStreamedToolUse FIFO-falls back for identical same-name inputs", () =
 
 test("claimStreamedToolUse returns null when nothing is queued", () => {
   assert.equal(claimStreamedToolUse(toolSession([]), "alpha", {}), null);
+});
+
+// ---------------------------------------------------------------------------
+// claimStreamedToolUse — schema-symmetric normalization (the desync fix for
+// tools whose JSON Schema has `default` values, e.g. Cursor Grep/Glob/Read).
+// The MCP layer parses handler args through normalizeObjectSchema(inputSchema),
+// injecting every default; the streamed entry.input is the raw model JSON. We
+// canonicalize both sides through the same z.object(shape) so they match.
+// ---------------------------------------------------------------------------
+
+// A Cursor-Grep-like schema with defaults on several optional fields.
+const GREP_SCHEMA = {
+  type: "object",
+  properties: {
+    pattern: { type: "string" },
+    path: { type: "string" },
+    output_mode: { type: "string", enum: ["content", "files_with_matches", "count"], default: "content" },
+    case_insensitive: { type: "boolean", default: false },
+    line_numbers: { type: "boolean", default: true },
+    head_limit: { type: "number" },
+    multiline: { type: "boolean", default: false },
+  },
+  required: ["pattern"],
+  additionalProperties: false,
+};
+
+const GLOB_SCHEMA = {
+  type: "object",
+  properties: {
+    pattern: { type: "string" },
+    folder: { type: "string" },
+    case_sensitive: { type: "boolean", default: true },
+    include_hidden: { type: "boolean", default: false },
+  },
+  required: ["pattern"],
+  additionalProperties: false,
+};
+
+function parserSession(parsers) {
+  return { streamedToolUses: [], inputParsers: new Map(parsers), fifoFallbacks: 0 };
+}
+
+function buildParser(schema) {
+  return z.object(toolInputShape(schema));
+}
+
+test("normalizeToolInput is identity when no parser is registered for the tool", () => {
+  const s = parserSession([]);
+  assert.deepEqual(normalizeToolInput(s, "X", { a: 1 }), { a: 1 });
+});
+
+test("normalizeToolInput injects schema defaults into raw model input", () => {
+  const s = parserSession([["Grep", buildParser(GREP_SCHEMA)]]);
+  const raw = { pattern: "rtinferd", path: "/x" };
+  const out = normalizeToolInput(s, "Grep", raw);
+  assert.equal(out.output_mode, "content");
+  assert.equal(out.line_numbers, true);
+  assert.equal(out.multiline, false);
+  assert.equal(out.case_insensitive, false);
+  assert.equal(out.pattern, "rtinferd");
+});
+
+test("claimStreamedToolUse matches a defaulted tool when args carry injected defaults but the streamed entry does not", () => {
+  const parser = buildParser(GREP_SCHEMA);
+  const s = parserSession([["Grep", parser]]);
+  // The model streamed a raw subset (no defaulted keys); the SDK will parse this
+  // and hand the handler an args object WITH defaults. Pre-fix this fell to FIFO.
+  s.streamedToolUses = [{ id: "g1", name: "Grep", input: { pattern: "rtinferd", path: "/x", head_limit: 60 } }];
+  const sdkArgs = parser.parse({ pattern: "rtinferd", path: "/x", head_limit: 60 });
+  const got = claimStreamedToolUse(s, "Grep", sdkArgs);
+  assert.equal(got?.id, "g1");
+  assert.equal(s.streamedToolUses.length, 0);
+  assert.equal(s.fifoFallbacks, 0, "must not fall to FIFO when normalized match succeeds");
+});
+
+test("claimStreamedToolUse does not cross-wire parallel non-identical defaulted calls claimed out of order", () => {
+  const grep = buildParser(GREP_SCHEMA);
+  const glob = buildParser(GLOB_SCHEMA);
+  const s = parserSession([["Grep", grep], ["Glob", glob]]);
+  // Both tools emitted in one assistant message; handlers may dispatch in any order.
+  s.streamedToolUses = [
+    { id: "grep_1", name: "Grep", input: { pattern: "rtinferd", path: "/x" } },
+    { id: "glob_1", name: "Glob", input: { pattern: "**/rtinfer*", folder: "/x" } },
+  ];
+  // Glob handler fires first (out of stream order) with SDK-parsed args.
+  const globArgs = glob.parse({ pattern: "**/rtinfer*", folder: "/x" });
+  const g = claimStreamedToolUse(s, "Glob", globArgs);
+  assert.equal(g?.id, "glob_1", "Glob claim must not steal Grep's id");
+  const grepArgs = grep.parse({ pattern: "rtinferd", path: "/x" });
+  const r = claimStreamedToolUse(s, "Grep", grepArgs);
+  assert.equal(r?.id, "grep_1", "Grep claim must get its own id");
+  assert.equal(s.streamedToolUses.length, 0);
+  assert.equal(s.fifoFallbacks, 0, "no FIFO fallback should occur");
+});
+
+test("claimStreamedToolUse still disambiguates same-name defaulted calls by normalized input", () => {
+  const parser = buildParser(GREP_SCHEMA);
+  const s = parserSession([["Grep", parser]]);
+  s.streamedToolUses = [
+    { id: "g_a", name: "Grep", input: { pattern: "alpha" } },
+    { id: "g_b", name: "Grep", input: { pattern: "beta" } },
+  ];
+  const b = claimStreamedToolUse(s, "Grep", parser.parse({ pattern: "beta" }));
+  assert.equal(b?.id, "g_b");
+  const a = claimStreamedToolUse(s, "Grep", parser.parse({ pattern: "alpha" }));
+  assert.equal(a?.id, "g_a");
+  assert.equal(s.streamedToolUses.length, 0);
+  assert.equal(s.fifoFallbacks, 0);
+});
+
+test("claimStreamedToolUse prefers an idHint over content matching (future-proof direct-id path)", () => {
+  const parser = buildParser(GREP_SCHEMA);
+  const s = parserSession([["Grep", parser]]);
+  // Two identical-content calls — content alone could not disambiguate, but an
+  // idHint forwarded via extra._meta picks the right one.
+  s.streamedToolUses = [
+    { id: "g_1", name: "Grep", input: { pattern: "x" } },
+    { id: "g_2", name: "Grep", input: { pattern: "x" } },
+  ];
+  const args = parser.parse({ pattern: "x" });
+  const second = claimStreamedToolUse(s, "Grep", args, "g_2");
+  assert.equal(second?.id, "g_2");
+  const first = claimStreamedToolUse(s, "Grep", args, "g_1");
+  assert.equal(first?.id, "g_1");
+  assert.equal(s.streamedToolUses.length, 0);
+});
+
+test("claimStreamedToolUse uses per-name single candidate when normalized match drifts", () => {
+  // A uniquely-named tool whose input drifted (e.g. parser divergence) should
+  // still claim the only same-name entry rather than FIFO.
+  const s = parserSession([]);
+  s.streamedToolUses = [
+    { id: "only", name: "Unique", input: { x: 1 } },
+  ];
+  const got = claimStreamedToolUse(s, "Unique", { x: 999 });
+  assert.equal(got?.id, "only");
+  assert.equal(s.fifoFallbacks, 0, "single same-name candidate is not a FIFO fallback");
+});
+
+test("claimStreamedToolUse FIFO-falls back (with counter + log) when two same-name entries cannot be disambiguated", () => {
+  const s = parserSession([]);
+  s.streamedToolUses = [
+    { id: "u_1", name: "Unique", input: { x: 1 } },
+    { id: "u_2", name: "Unique", input: { x: 1 } },
+    { id: "u_3", name: "Unique", input: { x: 1 } },
+  ];
+  // First claim: 3 same-name candidates, no content match -> FIFO (count 1).
+  const a = claimStreamedToolUse(s, "Unique", { x: 999 });
+  assert.equal(a?.id, "u_1");
+  assert.equal(s.fifoFallbacks, 1);
+  // Second claim: 2 same-name candidates still -> FIFO again (count 2).
+  const b = claimStreamedToolUse(s, "Unique", { x: 999 });
+  assert.equal(b?.id, "u_2");
+  assert.equal(s.fifoFallbacks, 2);
+  // Third claim: 1 same-name candidate left -> single-candidate path (NOT FIFO).
+  const c = claimStreamedToolUse(s, "Unique", { x: 999 });
+  assert.equal(c?.id, "u_3");
+  assert.equal(s.fifoFallbacks, 2, "single same-name candidate is not a FIFO fallback");
+  assert.equal(s.streamedToolUses.length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// extractIdHint — opportunistic direct-id from extra._meta
+// ---------------------------------------------------------------------------
+
+test("extractIdHint returns a streamed id when one is present in extra._meta", () => {
+  const s = parserSession([]);
+  s.streamedToolUses = [{ id: "abc", name: "X", input: {} }];
+  assert.equal(extractIdHint(s, { _meta: { anything: "abc" } }), "abc");
+});
+
+test("extractIdHint returns null when no _meta value matches a streamed id", () => {
+  const s = parserSession([]);
+  s.streamedToolUses = [{ id: "abc", name: "X", input: {} }];
+  assert.equal(extractIdHint(s, { _meta: { foo: "nope" } }), null);
+  assert.equal(extractIdHint(s, { _meta: null }), null);
+  assert.equal(extractIdHint(s, {}), null);
+  assert.equal(extractIdHint(s, null), null);
+});
+
+test("extractIdHint returns null when nothing is streamed", () => {
+  const s = parserSession([]);
+  assert.equal(extractIdHint(s, { _meta: { x: "abc" } }), null);
 });
 
 // ---------------------------------------------------------------------------

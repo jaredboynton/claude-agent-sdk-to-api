@@ -203,19 +203,94 @@ function stripBridgeToolName(name, originalNames) {
   return stripped;
 }
 
+// Normalize a tool input value through the SAME Zod object schema the MCP layer
+// used to validate the handler's args. The SDK's validateToolInput runs
+// normalizeObjectSchema(inputSchema).parse(raw), which injects every JSON-Schema
+// `default` and applies coercions — so the args the handler receives are NOT the
+// raw JSON the model streamed. Running BOTH the streamed entry.input and the
+// handler args through our parser (built from the same shape) canonicalizes them
+// to the same form, making isDeepStrictEqual succeed. Idempotent: parsing an
+// already-normalized value yields the same object. Identity when no parser is
+// registered (keeps pure-logic tests and bare sessions working).
+function normalizeToolInput(session, name, value) {
+  const parser = session.inputParsers?.get(name);
+  if (!parser) return value;
+  try {
+    const r = parser.safeParse(value);
+    return r.success ? r.data : value;
+  } catch {
+    return value;
+  }
+}
+
+// Opportunistic, future-proof id hint: if the SDK ever forwards the Anthropic
+// tool_use.id into the handler's extra._meta, claim that id directly and skip
+// content matching entirely. Today the mcp_message path forwards a plain
+// JSON-RPC tools/call with no Anthropic id, so this scans _meta for any value
+// that already equals a currently-streamed id — zero-risk: a value only matches
+// if it genuinely is one of our streamed ids.
+function extractIdHint(session, extra) {
+  const meta = extra && typeof extra === "object" ? extra._meta : null;
+  if (!meta || typeof meta !== "object") return null;
+  const ids = new Set();
+  for (const e of session.streamedToolUses) if (e && e.id) ids.add(e.id);
+  if (!ids.size) return null;
+  for (const v of Object.values(meta)) {
+    if (typeof v === "string" && ids.has(v)) return v;
+  }
+  return null;
+}
+
 // Claim the streamed tool_use entry that corresponds to a handler invocation.
 // The SDK does not pass the tool_use id to the handler, but it passes the tool
-// name (via the handler closure) and the validated input args. We therefore
-// correlate by (name, input), consuming the matched entry so parallel or
-// duplicate calls cannot collide. If exact matching fails, fall back to FIFO.
-function claimStreamedToolUse(session, name, args) {
-  const idx = session.streamedToolUses.findIndex(
-    (entry) => entry.name === name && isDeepStrictEqual(entry.input, args)
-  );
-  if (idx !== -1) return session.streamedToolUses.splice(idx, 1)[0] || null;
+// name (via the handler closure) and the validated input args. We correlate in
+// layered priority so a correlation miss can never silently wedge a session:
+//   1. Direct id (idHint) — if a real tool_use.id was forwarded via extra._meta.
+//   2. Exact normalized (name + normalized input) — the primary path; defaults
+//      and coercions are canceled by parsing both sides through the same schema.
+//   3. Per-name single candidate — safety net for a uniquely-named tool whose
+//      normalization drifted; avoids FIFO when only one entry shares the name.
+//   4. Global FIFO (last resort) — preserves prior behavior, but structured log
+//      + counter make the drift observable instead of a silent 4.5-min hang.
+function claimStreamedToolUse(session, name, args, idHint = null) {
+  // 1. Direct id.
+  if (idHint) {
+    const idx = session.streamedToolUses.findIndex((e) => e && e.id === idHint);
+    if (idx !== -1) return session.streamedToolUses.splice(idx, 1)[0] || null;
+  }
+
+  // 2. Exact normalized (name + normalized input).
+  const normArgs = normalizeToolInput(session, name, args);
+  for (let i = 0; i < session.streamedToolUses.length; i++) {
+    const entry = session.streamedToolUses[i];
+    if (!entry || entry.name !== name) continue;
+    if (isDeepStrictEqual(normalizeToolInput(session, name, entry.input), normArgs)) {
+      return session.streamedToolUses.splice(i, 1)[0] || null;
+    }
+  }
+
+  // 3. Per-name single candidate.
+  let sameNameIdx = -1;
+  let sameNameCount = 0;
+  for (let i = 0; i < session.streamedToolUses.length; i++) {
+    const entry = session.streamedToolUses[i];
+    if (entry && entry.name === name) { sameNameIdx = i; sameNameCount++; }
+  }
+  if (sameNameCount === 1) {
+    return session.streamedToolUses.splice(sameNameIdx, 1)[0] || null;
+  }
+
+  // 4. Global FIFO (last resort) — observable.
   if (session.streamedToolUses.length) {
     const fallback = session.streamedToolUses[0];
-    process.stderr.write(`${LOG_PREFIX} no exact match for ${name}(${JSON.stringify(args)}); falling back to FIFO ${fallback.id}\n`);
+    session.fifoFallbacks = (session.fifoFallbacks || 0) + 1;
+    totalFifoFallbacks++;
+    const remaining = session.streamedToolUses.map((e) => e?.id).filter(Boolean).join(",");
+    process.stderr.write(
+      `${LOG_PREFIX} tool correlation FIFO fallback for ${name}: no exact match `
+      + `(args=${JSON.stringify(args).slice(0, 200)}); claiming ${fallback?.id}`
+      + ` (remaining: ${remaining})\n`
+    );
     return session.streamedToolUses.shift();
   }
   return null;
@@ -228,45 +303,58 @@ function claimStreamedToolUse(session, name, args) {
 // so the SDK agent loop survives a never-delivered tool result.
 function buildParkingMcpServer(tools, session, createServer = createSdkMcpServer) {
   if (!tools || !tools.length) return null;
-  const mcpTools = tools.map((t) => ({
-    name: t.name,
-    description: t.description || "",
-    inputSchema: toolInputShape(t.input_schema || { type: "object", properties: {} }),
-    handler: async (args) => {
-      const originalName = t.name;
-      const entry = claimStreamedToolUse(session, originalName, args);
-      const id = entry?.id;
+  const mcpTools = tools.map((t) => {
+    const shape = toolInputShape(t.input_schema || { type: "object", properties: {} });
+    // Capture a canonical parser mirroring the MCP layer's validateToolInput so
+    // claimStreamedToolUse can normalize both the streamed raw input and the
+    // handler's already-parsed args to the same form (defaults, coercions).
+    try {
+      const parser = z.object(shape);
+      if (session.inputParsers) session.inputParsers.set(t.name, parser);
+    } catch (e) {
+      process.stderr.write(`${LOG_PREFIX} z.object(shape) failed for ${t.name} (${String(e?.message || e).slice(0, 100)}); correlation will use raw input\n`);
+    }
+    return {
+      name: t.name,
+      description: t.description || "",
+      inputSchema: shape,
+      handler: async (args, extra) => {
+        const originalName = t.name;
+        const idHint = extractIdHint(session, extra);
+        const entry = claimStreamedToolUse(session, originalName, args, idHint);
+        const id = entry?.id;
 
-      if (id && session.resolvedResults.has(id)) {
-        const r = session.resolvedResults.get(id);
-        session.resolvedResults.delete(id);
-        return r;
-      }
+        if (id && session.resolvedResults.has(id)) {
+          const r = session.resolvedResults.get(id);
+          session.resolvedResults.delete(id);
+          return r;
+        }
 
-      return new Promise((resolve) => {
-        let settled = false;
-        const timer = setTimeout(() => {
-          if (!settled) {
-            settled = true;
-            if (id) session.pendingTools.delete(id);
-            process.stderr.write(`${LOG_PREFIX} tool ${id ?? originalName} park timeout after ${TOOL_TIMEOUT_MS}ms; returning isError\n`);
-            resolve({ content: [{ type: "text", text: `Tool result was not provided within ${TOOL_TIMEOUT_MS}ms` }], isError: true });
-          }
-        }, TOOL_TIMEOUT_MS);
+        return new Promise((resolve) => {
+          let settled = false;
+          const timer = setTimeout(() => {
+            if (!settled) {
+              settled = true;
+              if (id) session.pendingTools.delete(id);
+              process.stderr.write(`${LOG_PREFIX} tool ${id ?? originalName} park timeout after ${TOOL_TIMEOUT_MS}ms; returning isError\n`);
+              resolve({ content: [{ type: "text", text: `Tool result was not provided within ${TOOL_TIMEOUT_MS}ms` }], isError: true });
+            }
+          }, TOOL_TIMEOUT_MS);
 
-        const wrappedResolve = (result) => {
-          if (!settled) {
-            settled = true;
-            clearTimeout(timer);
-            resolve(result);
-          }
-        };
+          const wrappedResolve = (result) => {
+            if (!settled) {
+              settled = true;
+              clearTimeout(timer);
+              resolve(result);
+            }
+          };
 
-        if (id) session.pendingTools.set(id, wrappedResolve);
-        else session.orphanResolvers.push(wrappedResolve);
-      });
-    },
-  }));
+          if (id) session.pendingTools.set(id, wrappedResolve);
+          else session.orphanResolvers.push(wrappedResolve);
+        });
+      },
+    };
+  });
   return createServer({ name: "bridge", tools: mcpTools, alwaysLoad: true });
 }
 
@@ -364,6 +452,11 @@ function normalizeUsage(u) {
 
 const sessions = new Map(); // key (UUID) -> Session
 
+// Process-wide count of tool-use correlations that fell through to the global
+// FIFO fallback. Surfaced in /healthz so a correlation regression is a visible
+// metric instead of a silent 4.5-minute park timeout.
+let totalFifoFallbacks = 0;
+
 // Find the live session this request belongs to: same bucket, not closed, not
 // mid-turn (a mid-turn match means a genuinely concurrent request -> fork a new
 // session so we never clobber currentTurn/res), and whose already-processed
@@ -424,6 +517,8 @@ function createSession(key, model, tools, callerSystem, bucket) {
     orphanResolvers: [],          // resolvers with no captured id (defensive)
     streamedToolUses: [],         // completed {id,name,input} tool_use blocks awaiting handler claim
     toolUseAccum: new Map(),      // stream index -> {id,name,partial} (input JSON assembled across deltas)
+    inputParsers: new Map(),      // toolName -> z.object(shape); canonical parser mirroring MCP validateToolInput
+    fifoFallbacks: 0,             // per-session count of correlation FIFO fallbacks (observable)
     currentTurn: null,            // { resolve } deferred for the active HTTP turn
     res: null,                    // current streaming HTTP response
     nonStream: null,              // { blocks, stopReason } when buffering for non-stream
@@ -785,6 +880,7 @@ export function startServer({ port = 32809, host = "127.0.0.1", account = null, 
         profileDir: profileDir || null,
         account: account?.email || null,
         sessions: sessions.size,
+        fifoFallbacks: totalFifoFallbacks,
       });
     }
     if (req.method === "POST" && (url === "/v1/messages" || url === "/v1/messages/")) {
@@ -832,6 +928,8 @@ export {
   toUserFrame,
   makeInputQueue,
   claimStreamedToolUse,
+  normalizeToolInput,
+  extractIdHint,
   abandonToolRound,
   buildParkingMcpServer,
   raceTurn,
