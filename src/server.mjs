@@ -22,7 +22,7 @@
 //     primed with the full prior transcript so context is recovered; the live
 //     loop still drives every NEW tool call.
 //   - Sessions idle past SESSION_TTL_MS (5 min, matches Claude's prompt cache)
-//     are closed by a sweeper.
+//     are closed by a sweeper, unless a client tool round is still active.
 //
 // Authentication is handled by src/auth.mjs BEFORE this module's query() runs:
 // the SDK's bundled `claude` authenticates natively off the profile named by
@@ -54,17 +54,17 @@ import {
   buildCodeToolDescription,
   formatCodeResult,
   codeToolInputShape,
+  normalizeClientToolMeta,
 } from "./code-mode.mjs";
 
 const HOME = homedir();
 const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS || process.env.ACP_SESSION_TTL_MS || 300000); // 5 min
 const HEARTBEAT_MS = Number(process.env.HEARTBEAT_MS || process.env.ACP_HEARTBEAT_MS || 15000);
-const TOOL_TIMEOUT_MS = Number(process.env.TOOL_TIMEOUT_MS || process.env.ACP_TOOL_TIMEOUT_MS || 270000); // 4.5 min; must stay under SESSION_TTL_MS
+const TOOL_TIMEOUT_MS = Number(process.env.TOOL_TIMEOUT_MS || process.env.ACP_TOOL_TIMEOUT_MS || 1800000); // 30 min; active tool rounds are retained past SESSION_TTL_MS
 // Turn-level watchdog: backstop for any path where message_stop never fires
 // (e.g. the SDK stream goes quiet mid-thinking, or a parked handler blocks the
 // SDK from emitting message_stop and the per-handler TOOL_TIMEOUT_MS somehow
-// doesn't fire). Must be > TOOL_TIMEOUT_MS so the handler park timeout gets the
-// first chance to unblock the loop; default matches SESSION_TTL_MS.
+// doesn't fire).
 const TURN_TIMEOUT_MS = Number(process.env.TURN_TIMEOUT_MS || process.env.ACP_TURN_TIMEOUT_MS || 300000);
 const LOG_PREFIX = "[claude-agent-api]";
 
@@ -320,12 +320,14 @@ function claimStreamedToolUse(session, name, args, idHint = null) {
 // client POSTs the matching tool_result. A watchdog timeout returns {isError:true}
 // so the SDK agent loop survives a never-delivered tool result.
 //
-// In code mode, client tools are NOT registered — only the `code` meta-tool is.
-// Client tool schemas are stored on session.clientTools for validation/expansion.
+// In code mode, `code` is registered alongside the original tools. The model can
+// batch non-interactive work through `code`, while native client tools remain
+// available for interactive/approval/handoff flows with their real schemas.
 function buildParkingMcpServer(tools, session, createServer = createSdkMcpServer) {
   if (!tools || !tools.length) return null;
 
   const makeHandler = (originalName) => async (args, extra) => {
+    session.lastActivity = Date.now();
     const idHint = extractIdHint(session, extra);
     const entry = claimStreamedToolUse(session, originalName, args, idHint);
     const id = entry?.id;
@@ -333,6 +335,7 @@ function buildParkingMcpServer(tools, session, createServer = createSdkMcpServer
     if (id && session.resolvedResults.has(id)) {
       const r = session.resolvedResults.get(id);
       session.resolvedResults.delete(id);
+      session.lastActivity = Date.now();
       return r;
     }
 
@@ -342,6 +345,12 @@ function buildParkingMcpServer(tools, session, createServer = createSdkMcpServer
         if (!settled) {
           settled = true;
           if (id) session.pendingTools.delete(id);
+          else {
+            const idx = session.orphanResolvers.indexOf(wrappedResolve);
+            if (idx !== -1) session.orphanResolvers.splice(idx, 1);
+          }
+          if (session.codeMode && originalName === "code" && id) clearCodeExpansion(session, id);
+          session.lastActivity = Date.now();
           process.stderr.write(`${LOG_PREFIX} tool ${id ?? originalName} park timeout after ${TOOL_TIMEOUT_MS}ms; returning isError\n`);
           resolve({ content: [{ type: "text", text: `Tool result was not provided within ${TOOL_TIMEOUT_MS}ms` }], isError: true });
         }
@@ -351,6 +360,7 @@ function buildParkingMcpServer(tools, session, createServer = createSdkMcpServer
         if (!settled) {
           settled = true;
           clearTimeout(timer);
+          session.lastActivity = Date.now();
           resolve(result);
         }
       };
@@ -363,10 +373,10 @@ function buildParkingMcpServer(tools, session, createServer = createSdkMcpServer
   if (session.codeMode) {
     session.clientTools = session.clientTools || new Map();
     for (const t of tools) {
-      session.clientTools.set(t.name, {
+      session.clientTools.set(t.name, normalizeClientToolMeta(t.name, {
         description: t.description || "",
         input_schema: t.input_schema || { type: "object", properties: {} },
-      });
+      }));
     }
     const codeShape = codeToolInputShape(z);
     const codeTool = {
@@ -375,7 +385,22 @@ function buildParkingMcpServer(tools, session, createServer = createSdkMcpServer
       inputSchema: codeShape,
       handler: makeHandler("code"),
     };
-    return createServer({ name: "bridge", tools: [codeTool], alwaysLoad: true });
+    const passthroughTools = tools.map((t) => {
+      const shape = toolInputShape(t.input_schema || { type: "object", properties: {} });
+      try {
+        const parser = z.object(shape);
+        if (session.inputParsers) session.inputParsers.set(t.name, parser);
+      } catch (e) {
+        process.stderr.write(`${LOG_PREFIX} z.object(shape) failed for ${t.name} (${String(e?.message || e).slice(0, 100)}); correlation will use raw input\n`);
+      }
+      return {
+        name: t.name,
+        description: t.description || "",
+        inputSchema: shape,
+        handler: makeHandler(t.name),
+      };
+    });
+    return createServer({ name: "bridge", tools: [codeTool, ...passthroughTools], alwaysLoad: true });
   }
 
   const mcpTools = tools.map((t) => {
@@ -634,6 +659,22 @@ function clearAllCodeState(session) {
   session.suppressEndTurn = false;
 }
 
+function hasActiveToolRound(session, { includeCurrentTurn = true } = {}) {
+  return !!(
+    (includeCurrentTurn && session.currentTurn) ||
+    session.pendingTools?.size ||
+    session.orphanResolvers?.length ||
+    session.streamedToolUses?.length ||
+    session.toolUseAccum?.size ||
+    (session.codeMode && (
+      session.codeExpansions?.size ||
+      session.syntheticToCode?.size ||
+      session.codePendingResults?.size ||
+      session.suppressEndTurn
+    ))
+  );
+}
+
 function syntheticIdFor(codeToolUseId, idx) {
   const short = String(codeToolUseId || "code").replace(/^toolu_/, "").slice(0, 8);
   return `toolu_code_${short}_${idx}`;
@@ -845,7 +886,7 @@ function createSession(key, model, tools, callerSystem, bucket, { resume, codeMo
     codeMode: !!codeMode,
     originalNames: new Set(
       codeMode
-        ? ["code"]
+        ? ["code", ...(tools || []).map((t) => t && t.name).filter(Boolean)]
         : (tools || []).map((t) => t && t.name).filter(Boolean),
     ),
     input,
@@ -1011,6 +1052,7 @@ function writeEvent(session, ev) {
 // the SDK loop, then wipe all tool-correlation state. Distinct from a normal
 // turn boundary, where parked handlers MUST survive.
 function abandonToolRound(session) {
+  session.lastActivity = Date.now();
   for (const resolve of session.pendingTools.values()) {
     resolve({ content: [{ type: "text", text: "Tool round abandoned before result was provided" }], isError: true });
   }
@@ -1052,6 +1094,7 @@ function failTurn(session, err) {
 // Resolve a parked tool handler (or stash the result if the handler hasn't
 // parked yet).
 function resolveTool(session, toolUseId, result) {
+  session.lastActivity = Date.now();
   if (session.pendingTools.has(toolUseId)) {
     const resolve = session.pendingTools.get(toolUseId);
     session.pendingTools.delete(toolUseId);
@@ -1068,6 +1111,7 @@ const sweeper = setInterval(() => {
   const now = Date.now();
   for (const [key, s] of sessions) {
     if (now - s.lastActivity > SESSION_TTL_MS) {
+      if (hasActiveToolRound(s)) continue;
       process.stderr.write(`${LOG_PREFIX} evicting idle session ${key}\n`);
       try { s.input.close(); s.abortController.abort(); } catch {}
       sessions.delete(key);
@@ -1081,6 +1125,7 @@ sweeper.unref?.();
 // ----------------------------------------------------------------------------
 
 async function resolveCodeModeToolResults(session, toolResults) {
+  session.lastActivity = Date.now();
   for (const tr of toolResults) {
     const codeId = session.syntheticToCode.get(tr.tool_use_id);
     if (codeId) {
@@ -1168,6 +1213,7 @@ async function handleMessages(req, res) {
   }
 
   process.stderr.write(`${LOG_PREFIX} request model=${model} stream=${isStream} codeMode=${codeMode} key=${session.key.slice(0, 8)} action=${action} tools=${tools?.length || 0} msgs=${messages.length} [${summarizeMessages(messages)}]\n`);
+  session.lastActivity = Date.now();
 
   // Attach this HTTP response as the session's current turn.
   let onClose;
@@ -1216,7 +1262,7 @@ async function handleMessages(req, res) {
     // left a tool round parked (the caller interjected text instead of returning
     // a tool_result), abandon it so the new turn is not stuck behind a handler
     // that will never be resolved.
-    if (session.pendingTools.size || session.streamedToolUses.length || session.orphanResolvers.length) {
+    if (hasActiveToolRound(session, { includeCurrentTurn: false })) {
       abandonToolRound(session);
     }
     session.input.push(toUserFrame(last));
@@ -1354,6 +1400,7 @@ export {
   extractIdHint,
   abandonToolRound,
   buildParkingMcpServer,
+  hasActiveToolRound,
   raceTurn,
   pushColdStartFrames,
   noteStreamTiming,

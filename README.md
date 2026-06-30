@@ -90,6 +90,8 @@ See `examples/curl-and-client.mjs` for a complete tool round-trip: POST a messag
 
 When enabled (the default), the bridge collapses the client's N tools into one deterministic `code({ calls, script })` meta-tool for the model. The model declares all client tool invocations upfront in `calls[]`; the bridge expands them into normal `tool_use` blocks for the unchanged client, collapses N `tool_result`s, runs the script in a JS sandbox, and returns only the script's output to the model. This reduces context growth (especially raw tool results) and improves cache-read efficiency on multi-tool turns.
 
+The original client tools are still exposed alongside `code`, so clients keep their native schemas and interactive/approval/user-input flows can run directly instead of being forced through batching.
+
 **Contract:** every sub-tool call must be listed in `calls[]` up front. The `script` processes results but cannot add new tool calls after seeing them. Data-dependent chaining requires a second `code` call on the next turn.
 
 **Opt out:** set `"codeMode": false` on a profile in `profiles.json`, pass `--code-mode 0` to `claude-agent-api run`, or send `X-Code-Mode: 0` on a request.
@@ -108,9 +110,10 @@ Live validation (requires a running bridge):
 | `PORT` | `32809` | Listen port (also `--port`) |
 | `HOST` | `127.0.0.1` | Listen host (also `--host`) |
 | `SESSION_TTL_MS` | `300000` | Idle session eviction (matches Claude prompt cache) |
-| `TOOL_TIMEOUT_MS` | `270000` | Parked-tool watchdog; returns an error result so the loop survives |
+| `TOOL_TIMEOUT_MS` | `1800000` | Parked-tool watchdog; returns an error result so the loop survives |
 | `HEARTBEAT_MS` | `15000` | SSE keep-alive interval |
 | `CODE_SCRIPT_TIMEOUT_MS` | `10000` | Code-mode script sandbox timeout |
+| `CODE_SCRIPT_MAX_OUTPUT_BYTES` | `32768` | Maximum collapsed code result before returning a "summarize smaller" error |
 | `X-Code-Mode` | (default on) | Per-request header: `0` disables, `1` enables code mode |
 
 ## Tests

@@ -35,6 +35,8 @@ import {
   bucketKey,
   hashMessages,
   toCallToolResult,
+  buildParkingMcpServer,
+  hasActiveToolRound,
 } from "../src/server.mjs";
 import { z } from "../src/sdk.mjs";
 
@@ -155,6 +157,12 @@ test("formatCodeResult pretty-prints objects", () => {
   assert.match(r.content[0].text, /\[console\]/);
 });
 
+test("formatCodeResult rejects oversized script output", () => {
+  const r = formatCodeResult("abcdef", [], { maxBytes: 3 });
+  assert.equal(r.isError, true);
+  assert.match(r.content[0].text, /exceeded 3 bytes/);
+});
+
 test("buildCodeToolDescription lists client tools", () => {
   const d = buildCodeToolDescription(CLIENT_TOOLS);
   assert.match(d, /Grep/);
@@ -176,6 +184,7 @@ test("buildCodeToolDescription emits typed signatures with required/optional and
   assert.match(d, /Grep\(args: \{/);
   // guidance to avoid dumping full contents
   assert.match(d, /do not dump full file or search contents/);
+  assert.match(d, /results\.<id>\.text/);
 });
 
 test("buildCodeToolDescription renders the exact arg type that previously misfired (string, not object)", () => {
@@ -196,6 +205,47 @@ test("buildCodeToolDescription renders the exact arg type that previously misfir
   assert.match(d, /\/\/ the question text/);
   assert.match(d, /questionnaire: string;/);
   assert.doesNotMatch(d, /questionnaire\?:/);
+});
+
+test("buildCodeToolDescription does not hardcode client-specific DSLs", () => {
+  const tools = new Map([
+    ["AskUser", {
+      description: "Ask the user a question",
+      input_schema: {
+        type: "object",
+        properties: { questionnaire: { type: "string" } },
+        required: ["questionnaire"],
+      },
+    }],
+  ]);
+  const d = buildCodeToolDescription(tools);
+  assert.match(d, /questionnaire: string/);
+  assert.doesNotMatch(d, /\[question\]/);
+  assert.doesNotMatch(d, /Blue-green/);
+});
+
+test("buildCodeToolDescription propagates generic schema metadata", () => {
+  const tools = new Map([
+    ["Constrained", {
+      description: "Uses constraints from the client schema.",
+      input_schema: {
+        type: "object",
+        properties: {
+          mode: { type: "string", enum: ["fast", "safe"], default: "safe", description: "Execution mode", examples: ["safe"] },
+          name: { type: "string", pattern: "^[a-z]+$", minLength: 2 },
+        },
+        required: ["name"],
+      },
+    }],
+  ]);
+  const d = buildCodeToolDescription(tools);
+  assert.match(d, /\/\/ Execution mode/);
+  assert.match(d, /\/\/ Default: "safe"/);
+  assert.match(d, /\/\/ Examples: "safe"/);
+  assert.match(d, /\/\/ Pattern: \^\[a-z\]\+\$/);
+  assert.match(d, /\/\/ Minimum length: 2/);
+  assert.match(d, /mode\?: "fast" \| "safe"/);
+  assert.match(d, /name: string/);
 });
 
 test("buildCodeToolDescription describes nested object and array arg types", () => {
@@ -247,6 +297,25 @@ test("expandCodeToolUse synthesizes N client tool_use blocks with mapping", () =
   assert.equal(starts.find((s) => s.content_block.name === "code"), undefined);
   assert.equal(starts[0].content_block.name, "Grep");
   assert.equal(starts[1].content_block.name, "Glob");
+});
+
+test("buildParkingMcpServer exposes code plus original tools in code mode", () => {
+  const session = fakeCodeSession({ inputParsers: new Map() });
+  let captured = null;
+  buildParkingMcpServer(
+    [
+      { name: "Grep", description: "grep", input_schema: GREP_SCHEMA },
+      { name: "AskUser", description: "ask", input_schema: { type: "object", properties: { questionnaire: { type: "string" } }, required: ["questionnaire"] } },
+    ],
+    session,
+    (config) => { captured = config; return { ok: true }; },
+  );
+  const names = captured.tools.map((t) => t.name);
+  assert.deepEqual(names, ["code", "Grep", "AskUser"]);
+  assert.equal(session.clientTools.has("Grep"), true);
+  assert.equal(session.clientTools.has("AskUser"), true);
+  assert.equal(session.inputParsers.has("Grep"), true);
+  assert.equal(session.inputParsers.has("AskUser"), true);
 });
 
 test("projectEvent remaps indexes around suppressed code block", () => {
@@ -381,6 +450,22 @@ test("abandonToolRound clears code maps", () => {
   assert.equal(session.codeExpansions.size, 0);
   assert.equal(session.syntheticToCode.size, 0);
   assert.equal(session.suppressEndTurn, false);
+});
+
+test("hasActiveToolRound includes direct and code-mode parked work", () => {
+  const session = fakeCodeSession({ currentTurn: null });
+  assert.equal(hasActiveToolRound(session), false);
+  session.currentTurn = { resolve: () => {} };
+  assert.equal(hasActiveToolRound(session), true);
+  assert.equal(hasActiveToolRound(session, { includeCurrentTurn: false }), false);
+  session.currentTurn = null;
+  session.pendingTools.set("toolu_1", () => {});
+  assert.equal(hasActiveToolRound(session), true);
+  session.pendingTools.clear();
+  session.codeExpansions.set("code_1", { script: "", calls: [] });
+  assert.equal(hasActiveToolRound(session), true);
+  clearAllCodeState(session);
+  assert.equal(hasActiveToolRound(session), false);
 });
 
 test("persistResumeIndex is no-op for code-mode sessions", () => {

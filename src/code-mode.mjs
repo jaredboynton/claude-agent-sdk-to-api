@@ -9,6 +9,7 @@ import vm from "node:vm";
 
 const CALL_ID_RE = /^[A-Za-z_][A-Za-z0-9_-]{0,63}$/;
 const DEFAULT_SCRIPT_TIMEOUT_MS = Number(process.env.CODE_SCRIPT_TIMEOUT_MS || 10000);
+const DEFAULT_SCRIPT_OUTPUT_MAX_BYTES = Number(process.env.CODE_SCRIPT_MAX_OUTPUT_BYTES || 32768);
 
 export const CODE_MODE_APPEND = `
 
@@ -17,6 +18,10 @@ When you need multiple tools in one turn, use ONE \`code\` tool call instead of 
 Put every client tool invocation in \`calls[]\` with a unique \`id\`, \`tool\` name, and \`args\`.
 Use \`script\` only to process the \`results\` object (keyed by call id) and return your final output.
 Only the script's return value is visible to you — raw tool results are not added to your context individually.
+Inside script, use \`results.<id>.text\` for each tool's text output. Parse it yourself when a tool returns JSON text.
+If a tool returns an error, summarize the error and keep going when possible instead of declaring the tool unavailable.
+Original client tools remain available for compatibility. Use direct tool calls instead of \`code\` only for interactive/user-input/approval/handoff tools, or when the tool description says its native UI/flow matters.
+For ordinary read/search/write/shell/validation work, batch independent calls through \`code\` whenever more than one tool call is useful.
 Example:
 code({
   calls: [
@@ -52,6 +57,18 @@ function jsonLiteral(value) {
 
 function propertyName(name) {
   return JS_IDENT_RE.test(name) ? name : jsonLiteral(name);
+}
+
+function asObject(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+
+export function normalizeClientToolMeta(name, meta = {}) {
+  const inputSchema = asObject(meta.input_schema);
+  return {
+    description: typeof meta.description === "string" ? meta.description : "",
+    input_schema: Object.keys(inputSchema).length ? inputSchema : { type: "object", properties: {} },
+  };
 }
 
 /**
@@ -116,7 +133,7 @@ function renderObject(schema, indent) {
   const required = new Set(Array.isArray(schema.required) ? schema.required : []);
   const props = schema.properties && typeof schema.properties === "object" ? schema.properties : {};
   const names = Object.keys(props).sort();
-  const hasDescriptions = names.some((n) => typeof props[n]?.description === "string" && props[n].description.trim());
+  const hasDescriptions = names.some((n) => propCommentLines(props[n]).length);
 
   const renderProp = (name) => {
     const opt = required.has(name) ? "" : "?";
@@ -127,8 +144,7 @@ function renderObject(schema, indent) {
     const inner = indent + "  ";
     const lines = ["{"];
     for (const name of names) {
-      const desc = typeof props[name]?.description === "string" ? props[name].description : "";
-      for (const dl of desc.split("\n").map((l) => l.trim()).filter(Boolean)) {
+      for (const dl of propCommentLines(props[name])) {
         lines.push(`${inner}// ${dl}`);
       }
       lines.push(`${inner}${renderProp(name)}`);
@@ -143,10 +159,38 @@ function renderObject(schema, indent) {
   return parts.length ? `{ ${parts.join(" ")} }` : "{}";
 }
 
+function propCommentLines(schema) {
+  if (!schema || typeof schema !== "object") return [];
+  const lines = [];
+  if (typeof schema.description === "string") {
+    lines.push(...schema.description.split("\n").map((l) => l.trim()).filter(Boolean));
+  }
+  if ("default" in schema) lines.push(`Default: ${jsonLiteral(schema.default)}`);
+  if (Array.isArray(schema.examples) && schema.examples.length) {
+    lines.push(`Examples: ${schema.examples.map(jsonLiteral).join(", ")}`);
+  }
+  if (typeof schema.format === "string") lines.push(`Format: ${schema.format}`);
+  if (typeof schema.pattern === "string") lines.push(`Pattern: ${schema.pattern}`);
+  for (const [key, label] of [
+    ["minimum", "Minimum"],
+    ["maximum", "Maximum"],
+    ["exclusiveMinimum", "Exclusive minimum"],
+    ["exclusiveMaximum", "Exclusive maximum"],
+    ["minLength", "Minimum length"],
+    ["maxLength", "Maximum length"],
+    ["minItems", "Minimum items"],
+    ["maxItems", "Maximum items"],
+  ]) {
+    if (schema[key] != null) lines.push(`${label}: ${schema[key]}`);
+  }
+  return lines;
+}
+
 /** Build a typed declaration block for one client tool (codex-style). */
 function describeClientTool(name, meta) {
-  const argsType = jsonSchemaToTs(meta?.input_schema || { type: "object", properties: {} });
-  const desc = typeof meta?.description === "string" ? meta.description.trim() : "";
+  const normalized = normalizeClientToolMeta(name, meta);
+  const argsType = jsonSchemaToTs(normalized.input_schema || { type: "object", properties: {} });
+  const desc = typeof normalized.description === "string" ? normalized.description.trim() : "";
   const heading = `### ${name}`;
   const sig = `${name}(args: ${argsType})`;
   return desc ? `${heading}\n${desc}\n${sig}` : `${heading}\n${sig}`;
@@ -158,10 +202,13 @@ export function buildCodeToolDescription(clientTools) {
   const toolBlocks = entries.map(([name, meta]) => describeClientTool(name, meta));
   return (
     "Run multiple client tools with one model-visible tool call. "
+    + "Prefer this for non-interactive read/search/write/shell/validation batches; use original tools directly for interactive, approval, handoff, or native-UI flows. "
     + "Declare every client tool invocation in calls[] up front, each as { id, tool, args }. "
     + "args MUST match the TypeScript signature for that tool below: a trailing ? marks an optional field, "
     + "\"a\" | \"b\" lists the allowed literal values, and Array<T> is an array. "
+    + "Descriptions, comments, defaults, examples, formats, and patterns come from the client schema; follow them exactly. "
     + "The bridge executes all calls for the client in parallel, then runs script with a results object keyed by call id. "
+    + "Each script result entry is { text, raw }; use results.<id>.text, and JSON.parse it yourself when the tool returns JSON text. "
     + "Return only the data you actually need from script — do not dump full file or search contents — "
     + "since only the script's return value is seen by the assistant.\n\n"
     + (toolBlocks.length ? `Available tools:\n\n${toolBlocks.join("\n\n")}` : "Available tools: (none)")
@@ -186,11 +233,16 @@ export function validateCodeInput(input, clientTools, { toolInputShape, z }) {
   const toolsMap = clientTools instanceof Map ? clientTools : new Map(Object.entries(clientTools || {}));
   const parsers = new Map();
   for (const [name, meta] of toolsMap) {
+    const normalized = normalizeClientToolMeta(name, meta);
     try {
-      const shape = toolInputShape(meta?.input_schema || { type: "object", properties: {} });
-      parsers.set(name, z.object(shape));
+      parsers.set(name, z.fromJSONSchema(normalized.input_schema || { type: "object", properties: {} }, { unrepresentable: "any" }));
     } catch {
-      parsers.set(name, null);
+      try {
+        const shape = toolInputShape(normalized.input_schema || { type: "object", properties: {} });
+        parsers.set(name, z.object(shape));
+      } catch {
+        parsers.set(name, null);
+      }
     }
   }
 
@@ -225,13 +277,19 @@ export function validateCodeInput(input, clientTools, { toolInputShape, z }) {
 }
 
 /** Convert script return value (+ optional captured logs) to MCP CallToolResult text. */
-export function formatCodeResult(value, logs = []) {
+export function formatCodeResult(value, logs = [], { maxBytes = DEFAULT_SCRIPT_OUTPUT_MAX_BYTES } = {}) {
   let text;
   if (value === undefined || value === null) text = "";
   else if (typeof value === "string") text = value;
   else text = JSON.stringify(value, null, 2);
   const logText = (logs || []).filter(Boolean).join("\n");
   if (logText) text = text ? `${text}\n\n[console]\n${logText}` : `[console]\n${logText}`;
+  if (maxBytes > 0 && Buffer.byteLength(text, "utf8") > maxBytes) {
+    return {
+      content: [{ type: "text", text: `code script output exceeded ${maxBytes} bytes; return a smaller summary instead of raw tool output` }],
+      isError: true,
+    };
+  }
   return { content: [{ type: "text", text }] };
 }
 
