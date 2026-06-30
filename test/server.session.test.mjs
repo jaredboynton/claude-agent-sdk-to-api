@@ -59,6 +59,43 @@ test("bucketKey handles string content and is 32 hex chars", () => {
   assert.equal(bucketKey("", a).length, 32);
 });
 
+test("bucketKey uses convId when provided, ignoring content", () => {
+  const a = [{ role: "user", content: "hello" }];
+  const b = [{ role: "user", content: "totally different" }];
+  // Same convId => same bucket regardless of content.
+  assert.equal(bucketKey("sysA", a, "conv-1"), bucketKey("sysB", b, "conv-1"));
+  assert.equal(bucketKey("", a, "conv-1"), "cc:conv-1");
+  // Different convId => different bucket even with identical content.
+  assert.notEqual(bucketKey("sys", a, "conv-1"), bucketKey("sys", a, "conv-2"));
+});
+
+test("findSession separates parallel conversations with identical prefix by convId", () => {
+  sessions.clear();
+  const sys = "sys";
+  const first = { role: "user", content: [{ type: "text", text: "same task" }] };
+  // Two sessions, identical system+first-user content, but distinct convIds —
+  // exactly the fan-out-subagent case content hashing alone cannot separate.
+  const sA = { key: "A", bucket: bucketKey(sys, [first], "conv-A"), seenCount: 0, seenHash: hashMessages([], 0), closed: false, currentTurn: null };
+  const sB = { key: "B", bucket: bucketKey(sys, [first], "conv-B"), seenCount: 0, seenHash: hashMessages([], 0), closed: false, currentTurn: null };
+  sessions.set("A", sA); markSeen(sA, [first]);
+  sessions.set("B", sB); markSeen(sB, [first]);
+  assert.equal(findSession([first], sys, "conv-A")?.key, "A");
+  assert.equal(findSession([first], sys, "conv-B")?.key, "B");
+  // Without the convId, both share a content bucket and neither cc: bucket matches.
+  assert.equal(findSession([first], sys), null);
+  sessions.clear();
+});
+
+test("findSession falls back to content bucket when no convId (Droid path)", () => {
+  sessions.clear();
+  const sys = "sys";
+  const first = { role: "user", content: [{ type: "text", text: "task" }] };
+  const s = { key: "k", bucket: bucketKey(sys, [first]), seenCount: 0, seenHash: hashMessages([], 0), closed: false, currentTurn: null };
+  sessions.set("k", s); markSeen(s, [first]);
+  assert.equal(findSession([first], sys)?.key, "k");
+  sessions.clear();
+});
+
 test("hashMessages is stable across cache_control drift", () => {
   const a = [{ role: "user", content: [{ type: "text", text: "hi", cache_control: { type: "ephemeral" } }] }];
   const b = [{ role: "user", content: [{ type: "text", text: "hi" }] }];

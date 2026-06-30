@@ -156,9 +156,14 @@ function renderMsgText(message) {
     .join("\n");
 }
 
-// Bucket key: hash of system prompt + first user message. Groups sessions that
-// could belong to the same conversation; final match is by history prefix.
-function bucketKey(system, messages) {
+// Bucket key: groups sessions that could belong to the same conversation; the
+// final match is by history prefix. When the client supplies a stable
+// conversation id (Claude Code sends `x-claude-code-session-id`), use it
+// directly — this deterministically separates parallel conversations that
+// share an identical system+first-user prefix (e.g. fan-out subagents), which
+// content hashing alone cannot. Falls back to hash(system + first user msg).
+function bucketKey(system, messages, convId = null) {
+  if (convId) return `cc:${convId}`;
   const firstUser = (messages || []).find((m) => m.role === "user");
   const text = extractSystemText(system) + "\u0000" + renderMsgText(firstUser);
   return createHash("sha256").update(text).digest("hex").slice(0, 32);
@@ -575,7 +580,7 @@ function persistResumeIndex(session, model, system, messages) {
     const index = loadResumeIndex(resumeIndexFile);
     const updated = upsertResumeEntry(index, {
       profileKey: profileKey(serverProfileDir),
-      bucket: bucketKey(system, messages),
+      bucket: session.bucket,
       seenCount: session.seenCount,
       seenHash: session.seenHash,
       sdkSessionId: session.sdkSessionId,
@@ -682,8 +687,8 @@ function pushColdStartFrames(session, messages, last, lastIsToolResult) {
 // session so we never clobber currentTurn/res), and whose already-processed
 // prefix the incoming history extends. Longest matching prefix wins (most
 // specific). Returns null on cold start (model swap / eviction / restart).
-function findSession(messages, system) {
-  const b = bucketKey(system, messages);
+function findSession(messages, system, convId = null) {
+  const b = bucketKey(system, messages, convId);
   let best = null;
   for (const s of sessions.values()) {
     if (s.bucket !== b || s.closed || s.currentTurn) continue;
@@ -1482,7 +1487,17 @@ async function handleMessages(req, res) {
   const toolResults = Array.isArray(last?.content) ? last.content.filter((b) => b.type === "tool_result") : [];
   const lastIsToolResult = toolResults.length > 0;
 
-  let session = findSession(messages, system);
+  // Stable conversation id when the client provides one. Claude Code sends
+  // `x-claude-code-session-id` (distinct per conversation AND per subagent), so
+  // parallel fan-out sessions that share an identical system+first-user prefix
+  // get separate bridge sessions instead of colliding in one content bucket.
+  // Droid sends no such header and falls back to content-derived bucketing.
+  const convId = (() => {
+    const h = req.headers["x-claude-code-session-id"] || req.headers["x-session-id"] || req.headers["x-conversation-id"];
+    return typeof h === "string" && h.trim() ? h.trim() : null;
+  })();
+
+  let session = findSession(messages, system, convId);
   let resumeCatchupTail = null;
   // "resolve" => feed tool_result(s) to the parked handler of a matched session.
   // "push"    => push the latest user turn into a matched session.
@@ -1496,7 +1511,7 @@ async function handleMessages(req, res) {
   } else if (session) {
     action = "push";
   } else if (messages.length > 1) {
-    const b = bucketKey(system, messages);
+    const b = bucketKey(system, messages, convId);
     if (!codeMode) {
       const index = loadResumeIndex(resumeIndexFile);
       const candidate = findResumeCandidate({
@@ -1522,7 +1537,7 @@ async function handleMessages(req, res) {
       action = "cold";
     }
   } else {
-    session = createSession(randomUUID(), model, tools, callerSystem, bucketKey(system, messages), { codeMode });
+    session = createSession(randomUUID(), model, tools, callerSystem, bucketKey(system, messages, convId), { codeMode });
     action = "new";
   }
 
