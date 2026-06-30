@@ -1,0 +1,8 @@
+# Published package excludes dev-only material. The "files" allowlist in
+# package.json is authoritative; this is belt-and-suspenders.
+test/
+.github/
+*.log
+.DS_Store
+.env
+.env.*

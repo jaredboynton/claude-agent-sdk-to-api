@@ -1,0 +1,52 @@
+{
+  "name": "claude-agent-api",
+  "version": "0.1.0",
+  "description": "Anthropic-compatible HTTP bridge that exposes the Claude Agent SDK as a /v1/messages API, authenticating natively off your already-logged-in Claude OAuth profiles. Run one instance per profile, each on its own port.",
+  "type": "module",
+  "bin": {
+    "claude-agent-api": "bin/cli.mjs"
+  },
+  "exports": {
+    ".": "./src/server.mjs"
+  },
+  "files": [
+    "src",
+    "bin",
+    "service",
+    "examples",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "start": "node bin/cli.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.195",
+    "zod": "^4.4.3"
+  },
+  "keywords": [
+    "claude",
+    "anthropic",
+    "claude-agent-sdk",
+    "oauth",
+    "messages-api",
+    "bridge",
+    "proxy",
+    "tool-use",
+    "mcp"
+  ],
+  "author": "jaredboynton",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jaredboynton/claude-agent-sdk-to-api.git"
+  },
+  "homepage": "https://github.com/jaredboynton/claude-agent-sdk-to-api#readme",
+  "bugs": {
+    "url": "https://github.com/jaredboynton/claude-agent-sdk-to-api/issues"
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "profiles": [
+    { "name": "personal", "configDir": "~/.claude", "port": 32809 },
+    { "name": "work", "configDir": "~/.claude-work", "port": 32810 }
+  ]
+}

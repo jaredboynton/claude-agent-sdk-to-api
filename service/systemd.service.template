@@ -1,0 +1,12 @@
+[Unit]
+Description=claude-agent-api bridge (%i)
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart={{NODE}} {{SERVER}} run --profile {{PROFILE}} --port {{PORT}} --host {{HOST}}
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target
