@@ -73,7 +73,11 @@ function cmdRun(args) {
       (auth.account?.email ? ` account=${auth.account.email}` : "") +
       "\n"
   );
-  startServer({ port, host, account: auth.account, profileDir: auth.configDir, version: PKG.version, codeMode: args["code-mode"] !== "0" && args["code-mode"] !== "false" });
+  startServer({
+    port, host, account: auth.account, profileDir: auth.configDir, version: PKG.version,
+    codeMode: args["code-mode"] !== "0" && args["code-mode"] !== "false",
+    cacheLog: args["cache-log"] ?? process.env.CACHE_LOG,
+  });
 
   if (!args["no-self-update"] && process.env.CLAUDE_AGENT_API_NO_SELF_UPDATE !== "1") {
     startAutoUpdateLoop({
@@ -112,6 +116,9 @@ function cmdStartAll(args) {
       process.execPath,
       [join(__dirname, "cli.mjs"), "run", "--no-self-update", "--profile", p.configDir, "--port", String(p.port), "--host", p.host].concat(
         p.codeMode === false ? ["--code-mode", "0"] : [],
+      ).concat(
+        // boolean form so each child logs to its own <profileDir>/cache-log.jsonl
+        (args["cache-log"] || p.cacheLog) ? ["--cache-log"] : [],
       ),
       { stdio: ["ignore", "inherit", "inherit"], env: { ...process.env, CLAUDE_AGENT_API_NO_SELF_UPDATE: "1" } }
     );
@@ -289,7 +296,7 @@ function usage() {
   process.stdout.write(
     `claude-agent-api — expose the Claude Agent SDK as an Anthropic /v1/messages API\n\n` +
       `Usage:\n` +
-      `  claude-agent-api [run] --profile <configDir> --port <n> [--host h] [--token-file f] [--no-self-update]\n` +
+      `  claude-agent-api [run] --profile <configDir> --port <n> [--host h] [--token-file f] [--no-self-update] [--cache-log [path]]\n` +
       `  claude-agent-api start-all [--config profiles.json]\n` +
       `  claude-agent-api install   [--config profiles.json]\n` +
       `  claude-agent-api uninstall [--config profiles.json]\n` +

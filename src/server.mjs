@@ -56,6 +56,7 @@ import {
   codeToolInputShape,
   normalizeClientToolMeta,
 } from "./code-mode.mjs";
+import { initCacheLog, appendCacheLog, cacheLogEnabled, cacheLogPath, cacheCreationSplit } from "./cache-log.mjs";
 
 const HOME = homedir();
 const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS || process.env.ACP_SESSION_TTL_MS || 300000); // 5 min
@@ -564,16 +565,67 @@ function noteStreamTiming(session, ev) {
   }
 }
 
+// Fold one upstream message's usage (from message_start) into the global
+// counters and the active turn row. Output is tracked per-message and flushed
+// on the next message_start / at turn end (see logTurnDone), since each message
+// reports a cumulative output total of its own.
+function accumulateTurnUsage(session, rawUsage) {
+  const read = rawUsage?.cache_read_input_tokens || 0;
+  const { create5m, create1h } = cacheCreationSplit(rawUsage);
+  const input = rawUsage?.input_tokens || 0;
+  totalCacheReadTokens += read;
+  totalCacheCreationTokens += create5m + create1h;
+  const m = session.turnMetrics;
+  if (!m) return;
+  m.usage.input += input;
+  m.usage.read += read;
+  m.usage.create5m += create5m;
+  m.usage.create1h += create1h;
+  m.usage.output += m._curMsgOutput || 0; // flush prior message's final output
+  m._curMsgOutput = rawUsage?.output_tokens || 0;
+  m.messages += 1;
+}
+
 function logTurnDone(session) {
   const m = session.turnMetrics;
   if (!m) return;
+  m.usage.output += m._curMsgOutput || 0; // flush the last message's output
   const total = Date.now() - m.startedAt;
   const ttft = m.firstEventAt != null ? m.firstEventAt - m.startedAt : null;
   process.stderr.write(
     `${LOG_PREFIX} turn done key=${session.key.slice(0, 8)} action=${m.action}` +
       ` ttft_ms=${ttft ?? "?"} total_ms=${total} textDeltas=${m.textDeltas}\n`
   );
+  if (cacheLogEnabled()) {
+    const u = m.usage;
+    const create = u.create5m + u.create1h;
+    appendCacheLog({
+      ts: new Date().toISOString(),
+      conv: session.key,
+      bucket: session.bucket,
+      model: session.model,
+      codeMode: !!session.codeMode,
+      action: m.action,
+      input: u.input,
+      read: u.read,
+      create,
+      create5m: u.create5m,
+      create1h: u.create1h,
+      output: u.output,
+      messages: m.messages,
+      hit: read_hit_ratio(u.read, create),
+      codeSubCalls: m.codeSubCalls,
+      scriptOutBytes: m.scriptOutBytes,
+      ttftMs: ttft,
+      durationMs: total,
+    });
+  }
   session.turnMetrics = null;
+}
+
+function read_hit_ratio(read, create) {
+  const denom = read + create;
+  return denom > 0 ? Number((read / denom).toFixed(4)) : null;
 }
 
 function pushColdStartFrames(session, messages, last, lastIsToolResult) {
@@ -746,6 +798,7 @@ function expandCodeToolUse(session, codeToolUseId, input) {
 
   session.codeSubCalls = (session.codeSubCalls || 0) + calls.length;
   totalCodeSubCalls += calls.length;
+  if (session.turnMetrics) session.turnMetrics.codeSubCalls += calls.length;
 
   const expansionCalls = [];
   for (let i = 0; i < calls.length; i++) {
@@ -786,6 +839,7 @@ async function collapseAndResolveCode(session, codeToolUseId) {
     });
     collapsed = formatCodeResult(value, logs);
     const scriptOut = collapsed.content?.[0]?.text?.length ?? 0;
+    if (session.turnMetrics) session.turnMetrics.scriptOutBytes += scriptOut;
     process.stderr.write(
       `${LOG_PREFIX} code call ${codeToolUseId}: execute=${Date.now() - t0}ms scriptOut=${scriptOut} bytes\n`,
     );
@@ -991,17 +1045,17 @@ async function consumeSession(session) {
         if (ev.type === "message_start" && ev.message?.usage) {
           const u = normalizeUsage(ev.message.usage);
           if (u) session.lastUsage = u;
+          // message_start usage is authoritative for the prefill cache/input
+          // tokens of this upstream call; accumulate global counters and the
+          // per-turn row from it. (An HTTP turn may contain several upstream
+          // messages when code mode resolves internally and the SDK continues.)
+          accumulateTurnUsage(session, ev.message.usage);
         }
         if (ev.type === "message_delta" && ev.usage) {
-          // delta usage carries output (and cache) tokens; keep input from message_start.
-          if (ev.usage.output_tokens != null) session.lastUsage.output_tokens = ev.usage.output_tokens;
-          if (ev.usage.cache_read_input_tokens != null) {
-            session.lastUsage.cache_read_input_tokens = ev.usage.cache_read_input_tokens;
-            totalCacheReadTokens += ev.usage.cache_read_input_tokens;
-          }
-          if (ev.usage.cache_creation_input_tokens != null) {
-            session.lastUsage.cache_creation_input_tokens = ev.usage.cache_creation_input_tokens;
-            totalCacheCreationTokens += ev.usage.cache_creation_input_tokens;
+          // delta usage carries the running output total for the current message.
+          if (ev.usage.output_tokens != null) {
+            session.lastUsage.output_tokens = ev.usage.output_tokens;
+            if (session.turnMetrics) session.turnMetrics._curMsgOutput = ev.usage.output_tokens;
           }
         }
         if (session.codeMode) projectEvent(session, ev);
@@ -1218,7 +1272,11 @@ async function handleMessages(req, res) {
   // Attach this HTTP response as the session's current turn.
   let onClose;
   let heartbeat;
-  session.turnMetrics = { action, startedAt: Date.now(), firstEventAt: null, textDeltas: 0 };
+  session.turnMetrics = {
+    action, startedAt: Date.now(), firstEventAt: null, textDeltas: 0,
+    usage: { input: 0, read: 0, create5m: 0, create1h: 0, output: 0 },
+    messages: 0, _curMsgOutput: 0, codeSubCalls: 0, scriptOutBytes: 0,
+  };
   const turnPromise = new Promise((resolve, reject) => {
     session.currentTurn = { resolve, reject };
   });
@@ -1327,10 +1385,11 @@ async function handleMessages(req, res) {
 
 // Start the HTTP server. Auth (CLAUDE_CONFIG_DIR / token) must already be applied
 // to process.env by the caller (src/auth.mjs). Returns the http.Server.
-export function startServer({ port = 32809, host = "127.0.0.1", account = null, profileDir = process.env.CLAUDE_CONFIG_DIR, version = null, codeMode = true } = {}) {
+export function startServer({ port = 32809, host = "127.0.0.1", account = null, profileDir = process.env.CLAUDE_CONFIG_DIR, version = null, codeMode = true, cacheLog = process.env.CACHE_LOG } = {}) {
   serverProfileDir = profileDir || null;
   serverCodeMode = codeMode !== false;
   resumeIndexFile = defaultIndexPath();
+  initCacheLog(cacheLog, profileDir);
   const server = http.createServer(async (req, res) => {
     const url = req.url || "";
     if (req.method === "GET" && (url === "/healthz" || url === "/")) {
@@ -1349,6 +1408,7 @@ export function startServer({ port = 32809, host = "127.0.0.1", account = null, 
         codeErrors: totalCodeErrors,
         cacheReadTokens: totalCacheReadTokens,
         cacheCreationTokens: totalCacheCreationTokens,
+        cacheLog: cacheLogPath() || null,
       });
     }
     if (req.method === "POST" && (url === "/v1/messages" || url === "/v1/messages/")) {
