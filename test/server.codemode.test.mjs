@@ -161,6 +161,61 @@ test("buildCodeToolDescription lists client tools", () => {
   assert.match(d, /Glob/);
 });
 
+test("buildCodeToolDescription emits typed signatures with required/optional and enums", () => {
+  const d = buildCodeToolDescription(CLIENT_TOOLS);
+  // required fields have no ?, optional fields have ?
+  assert.match(d, /pattern: string/);
+  assert.match(d, /path: string/);
+  assert.match(d, /output_mode\?: "content" \| "files_with_matches" \| "count"/);
+  assert.match(d, /case_sensitive\?: boolean/);
+  // required pattern/folder/path must NOT be marked optional
+  assert.doesNotMatch(d, /pattern\?:/);
+  assert.doesNotMatch(d, /folder\?:/);
+  // headings + typed args signature in codex style
+  assert.match(d, /### Grep/);
+  assert.match(d, /Grep\(args: \{/);
+  // guidance to avoid dumping full contents
+  assert.match(d, /do not dump full file or search contents/);
+});
+
+test("buildCodeToolDescription renders the exact arg type that previously misfired (string, not object)", () => {
+  const tools = new Map([
+    ["AskUser", {
+      description: "Ask the user a question",
+      input_schema: {
+        type: "object",
+        properties: { questionnaire: { type: "string", description: "the question text" } },
+        required: ["questionnaire"],
+      },
+    }],
+  ]);
+  const d = buildCodeToolDescription(tools);
+  assert.match(d, /### AskUser/);
+  assert.match(d, /Ask the user a question/);
+  // questionnaire must be typed as a required string, with its description as a comment
+  assert.match(d, /\/\/ the question text/);
+  assert.match(d, /questionnaire: string;/);
+  assert.doesNotMatch(d, /questionnaire\?:/);
+});
+
+test("buildCodeToolDescription describes nested object and array arg types", () => {
+  const tools = new Map([
+    ["Batch", {
+      description: "batch",
+      input_schema: {
+        type: "object",
+        properties: {
+          items: { type: "array", items: { type: "string" } },
+          opts: { type: "object", properties: { a: { type: "number" } } },
+        },
+      },
+    }],
+  ]);
+  const d = buildCodeToolDescription(tools);
+  assert.match(d, /items\?: Array<string>/);
+  assert.match(d, /opts\?: \{ a\?: number; \}/);
+});
+
 test("expandCodeToolUse synthesizes N client tool_use blocks with mapping", () => {
   const events = [];
   const session = fakeCodeSession({

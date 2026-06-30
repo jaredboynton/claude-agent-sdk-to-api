@@ -44,19 +44,127 @@ function toolResultText(result) {
   return JSON.stringify(result);
 }
 
+const JS_IDENT_RE = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+
+function jsonLiteral(value) {
+  try { return JSON.stringify(value); } catch { return "unknown"; }
+}
+
+function propertyName(name) {
+  return JS_IDENT_RE.test(name) ? name : jsonLiteral(name);
+}
+
+/**
+ * Render a JSON Schema into a TypeScript type string. Ported from codex's
+ * code-mode description renderer: handles const/enum/anyOf/oneOf/allOf, type
+ * unions, arrays, nested objects, and property-level description comments.
+ */
+function jsonSchemaToTs(schema, indent = "") {
+  if (schema === true || schema == null) return "unknown";
+  if (schema === false) return "never";
+  if (typeof schema !== "object") return "unknown";
+
+  if ("const" in schema) return jsonLiteral(schema.const);
+
+  if (Array.isArray(schema.enum) && schema.enum.length) {
+    return schema.enum.map(jsonLiteral).join(" | ");
+  }
+
+  for (const key of ["anyOf", "oneOf"]) {
+    if (Array.isArray(schema[key]) && schema[key].length) {
+      return schema[key].map((s) => jsonSchemaToTs(s, indent)).join(" | ");
+    }
+  }
+  if (Array.isArray(schema.allOf) && schema.allOf.length) {
+    return schema.allOf.map((s) => jsonSchemaToTs(s, indent)).join(" & ");
+  }
+
+  const t = schema.type;
+  if (Array.isArray(t)) {
+    return t.map((tt) => renderTypeKeyword(schema, tt, indent)).join(" | ");
+  }
+  if (typeof t === "string") return renderTypeKeyword(schema, t, indent);
+
+  if ("properties" in schema || "additionalProperties" in schema || "required" in schema) {
+    return renderObject(schema, indent);
+  }
+  if ("items" in schema || "prefixItems" in schema) return renderArray(schema, indent);
+  return "unknown";
+}
+
+function renderTypeKeyword(schema, t, indent) {
+  switch (t) {
+    case "string": return "string";
+    case "number": case "integer": return "number";
+    case "boolean": return "boolean";
+    case "null": return "null";
+    case "array": return renderArray(schema, indent);
+    case "object": return renderObject(schema, indent);
+    default: return "unknown";
+  }
+}
+
+function renderArray(schema, indent) {
+  if (schema.items != null) return `Array<${jsonSchemaToTs(schema.items, indent)}>`;
+  if (Array.isArray(schema.prefixItems) && schema.prefixItems.length) {
+    return `[${schema.prefixItems.map((s) => jsonSchemaToTs(s, indent)).join(", ")}]`;
+  }
+  return "unknown[]";
+}
+
+function renderObject(schema, indent) {
+  const required = new Set(Array.isArray(schema.required) ? schema.required : []);
+  const props = schema.properties && typeof schema.properties === "object" ? schema.properties : {};
+  const names = Object.keys(props).sort();
+  const hasDescriptions = names.some((n) => typeof props[n]?.description === "string" && props[n].description.trim());
+
+  const renderProp = (name) => {
+    const opt = required.has(name) ? "" : "?";
+    return `${propertyName(name)}${opt}: ${jsonSchemaToTs(props[name], hasDescriptions ? indent + "  " : indent)};`;
+  };
+
+  if (hasDescriptions) {
+    const inner = indent + "  ";
+    const lines = ["{"];
+    for (const name of names) {
+      const desc = typeof props[name]?.description === "string" ? props[name].description : "";
+      for (const dl of desc.split("\n").map((l) => l.trim()).filter(Boolean)) {
+        lines.push(`${inner}// ${dl}`);
+      }
+      lines.push(`${inner}${renderProp(name)}`);
+    }
+    if (schema.additionalProperties === true) lines.push(`${inner}[key: string]: unknown;`);
+    lines.push(`${indent}}`);
+    return lines.join("\n");
+  }
+
+  const parts = names.map(renderProp);
+  if (schema.additionalProperties === true) parts.push("[key: string]: unknown;");
+  return parts.length ? `{ ${parts.join(" ")} }` : "{}";
+}
+
+/** Build a typed declaration block for one client tool (codex-style). */
+function describeClientTool(name, meta) {
+  const argsType = jsonSchemaToTs(meta?.input_schema || { type: "object", properties: {} });
+  const desc = typeof meta?.description === "string" ? meta.description.trim() : "";
+  const heading = `### ${name}`;
+  const sig = `${name}(args: ${argsType})`;
+  return desc ? `${heading}\n${desc}\n${sig}` : `${heading}\n${sig}`;
+}
+
 /** Build dynamic description for the single `code` MCP tool. */
 export function buildCodeToolDescription(clientTools) {
   const entries = [...(clientTools instanceof Map ? clientTools.entries() : Object.entries(clientTools || {}))];
-  const toolLines = entries.map(([name, meta]) => {
-    const props = Object.keys(meta?.input_schema?.properties || {}).join(",");
-    return `${name}({${props}})`;
-  });
+  const toolBlocks = entries.map(([name, meta]) => describeClientTool(name, meta));
   return (
     "Run multiple client tools with one model-visible tool call. "
-    + "Declare every client tool invocation in calls[] up front with unique id, tool name, and args. "
+    + "Declare every client tool invocation in calls[] up front, each as { id, tool, args }. "
+    + "args MUST match the TypeScript signature for that tool below: a trailing ? marks an optional field, "
+    + "\"a\" | \"b\" lists the allowed literal values, and Array<T> is an array. "
     + "The bridge executes all calls for the client in parallel, then runs script with a results object keyed by call id. "
-    + "Return the final output from script — only the returned value is seen by the assistant. "
-    + `Available tools: ${toolLines.join(", ") || "(none)"}`
+    + "Return only the data you actually need from script — do not dump full file or search contents — "
+    + "since only the script's return value is seen by the assistant.\n\n"
+    + (toolBlocks.length ? `Available tools:\n\n${toolBlocks.join("\n\n")}` : "Available tools: (none)")
   );
 }
 
