@@ -72,6 +72,35 @@ const CODE_MAX_WAVES = Number(process.env.CODE_MAX_WAVES || 32);
 const CODE_MAX_CALLS = Number(process.env.CODE_MAX_CALLS || 64);
 const LOG_PREFIX = "[claude-agent-api]";
 
+// Models surfaced via the /v1/models catalog so Claude Code's startup model
+// validation succeeds. The SDK is the real source of truth at query time; this
+// is just a "yes, that model is available" catalog.
+const KNOWN_MODELS = [
+  "claude-opus-4-8",
+  "claude-sonnet-4-6",
+  "claude-haiku-4-5",
+  "claude-opus-4-1-20250805",
+  "claude-sonnet-4-5-20250929",
+];
+
+// Claude Code decorates model ids with context-window suffixes like
+// "claude-opus-4-8[1m]" (1M context). The Anthropic API / SDK do not accept
+// the bracketed suffix, so strip it before handing the id to query().
+function normalizeModel(model) {
+  if (typeof model !== "string") return model;
+  return model.replace(/\[[^\]]*\]\s*$/, "").trim();
+}
+
+function modelObject(id) {
+  const base = normalizeModel(id) || id;
+  return {
+    type: "model",
+    id,
+    display_name: base,
+    created_at: "2025-01-01T00:00:00Z",
+  };
+}
+
 // Race an HTTP turn promise against a wall-clock timeout. Resolves with the
 // turn's value if it settles in time; otherwise rejects with a typed timeout
 // error so the caller can failTurn + abandon the tool round + surface an error
@@ -1413,10 +1442,11 @@ async function handleMessages(req, res) {
     return jsonResp(res, 400, { type: "error", error: { type: "invalid_request_error", message: "invalid JSON body" } });
   }
 
-  const { model, messages, system, stream, tools } = reqBody;
-  if (!model || !Array.isArray(messages) || !messages.length) {
+  const { model: rawModel, messages, system, stream, tools } = reqBody;
+  if (!rawModel || !Array.isArray(messages) || !messages.length) {
     return jsonResp(res, 400, { type: "error", error: { type: "invalid_request_error", message: "model and messages are required" } });
   }
+  const model = normalizeModel(rawModel);
 
   const callerSystem = extractSystemText(system);
   const isStream = stream !== false;
@@ -1628,6 +1658,31 @@ export function startServer({ port = 32809, host = "127.0.0.1", account = null, 
         return;
       }
     }
+    // Claude Code validates the selected model at startup by hitting the models
+    // API; without these it shows "model may not exist or you may not have
+    // access". We answer affirmatively for any requested model (the SDK is the
+    // real source of truth at query time) and synthesize a minimal catalog.
+    if (req.method === "GET" && url === "/v1/models") {
+      return jsonResp(res, 200, { data: KNOWN_MODELS.map(modelObject), has_more: false, first_id: KNOWN_MODELS[0], last_id: KNOWN_MODELS[KNOWN_MODELS.length - 1] });
+    }
+    if (req.method === "GET" && url.startsWith("/v1/models/")) {
+      const id = decodeURIComponent(url.slice("/v1/models/".length).split("?")[0]);
+      return jsonResp(res, 200, modelObject(id));
+    }
+    // count_tokens: Claude Code (and the Anthropic SDK) may probe this. The SDK
+    // doesn't expose a token counter here, so return a cheap char-based estimate
+    // (~4 chars/token) so the client proceeds rather than erroring.
+    if (req.method === "POST" && (url === "/v1/messages/count_tokens" || url === "/v1/messages/count_tokens/")) {
+      try {
+        let body = "";
+        for await (const chunk of req) body += chunk;
+        const parsed = JSON.parse(body || "{}");
+        const text = JSON.stringify(parsed.messages || []) + JSON.stringify(parsed.system || "") + JSON.stringify(parsed.tools || []);
+        return jsonResp(res, 200, { input_tokens: Math.max(1, Math.ceil(text.length / 4)) });
+      } catch {
+        return jsonResp(res, 200, { input_tokens: 1 });
+      }
+    }
     jsonResp(res, 404, { type: "error", error: { type: "not_found_error", message: `unknown route: ${req.method} ${url}` } });
   });
 
@@ -1694,6 +1749,8 @@ export {
   accumulateStreamEvent,
   emitClientToolUse,
   serverCodeMode,
+  normalizeModel,
+  modelObject,
   totalCodeCalls,
   totalCodeSubCalls,
   totalCodeErrors,

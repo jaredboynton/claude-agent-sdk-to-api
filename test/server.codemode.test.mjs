@@ -39,6 +39,8 @@ import {
   toCallToolResult,
   buildParkingMcpServer,
   hasActiveToolRound,
+  normalizeModel,
+  modelObject,
 } from "../src/server.mjs";
 import { z } from "../src/sdk.mjs";
 
@@ -381,6 +383,24 @@ test("runCodeScriptDynamic: denies require/process/setTimeout", async () => {
 test("syntheticIdFor includes wave sequence", () => {
   const id = syntheticIdFor("toolu_abc12345", 1, 0);
   assert.match(id, /toolu_code_abc12345_w1_0/);
+});
+
+// ---------------------------------------------------------------------------
+// normalizeModel / modelObject (Claude Code [1m] suffix + /v1/models catalog)
+// ---------------------------------------------------------------------------
+
+test("normalizeModel strips Claude Code context-window suffix", () => {
+  assert.equal(normalizeModel("claude-opus-4-8[1m]"), "claude-opus-4-8");
+  assert.equal(normalizeModel("claude-opus-4-8"), "claude-opus-4-8");
+  assert.equal(normalizeModel("claude-sonnet-4-6 [1m]"), "claude-sonnet-4-6");
+  assert.equal(normalizeModel(undefined), undefined);
+});
+
+test("modelObject preserves the requested id and reports a clean display name", () => {
+  const o = modelObject("claude-opus-4-8[1m]");
+  assert.equal(o.type, "model");
+  assert.equal(o.id, "claude-opus-4-8[1m]");
+  assert.equal(o.display_name, "claude-opus-4-8");
 });
 
 // ---------------------------------------------------------------------------
