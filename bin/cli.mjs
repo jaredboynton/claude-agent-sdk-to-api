@@ -73,7 +73,7 @@ function cmdRun(args) {
       (auth.account?.email ? ` account=${auth.account.email}` : "") +
       "\n"
   );
-  startServer({ port, host, account: auth.account, profileDir: auth.configDir, version: PKG.version });
+  startServer({ port, host, account: auth.account, profileDir: auth.configDir, version: PKG.version, codeMode: args["code-mode"] !== "0" && args["code-mode"] !== "false" });
 
   if (!args["no-self-update"] && process.env.CLAUDE_AGENT_API_NO_SELF_UPDATE !== "1") {
     startAutoUpdateLoop({
@@ -110,7 +110,9 @@ function cmdStartAll(args) {
   for (const p of config.profiles) {
     const child = spawn(
       process.execPath,
-      [join(__dirname, "cli.mjs"), "run", "--no-self-update", "--profile", p.configDir, "--port", String(p.port), "--host", p.host],
+      [join(__dirname, "cli.mjs"), "run", "--no-self-update", "--profile", p.configDir, "--port", String(p.port), "--host", p.host].concat(
+        p.codeMode === false ? ["--code-mode", "0"] : [],
+      ),
       { stdio: ["ignore", "inherit", "inherit"], env: { ...process.env, CLAUDE_AGENT_API_NO_SELF_UPDATE: "1" } }
     );
     process.stderr.write(`claude-agent-api: [${p.name}] pid=${child.pid} port=${p.port} configDir=${p.configDir}\n`);

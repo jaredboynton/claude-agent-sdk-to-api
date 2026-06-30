@@ -59,6 +59,7 @@ export function validateProfilesConfig(obj, { home = homedir() } = {}) {
       configDir: expandHome(configDir, home),
       port,
       host: typeof p.host === "string" ? p.host : "127.0.0.1",
+      codeMode: p.codeMode === false ? false : true,
     };
   });
 

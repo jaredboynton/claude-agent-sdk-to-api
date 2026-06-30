@@ -37,6 +37,24 @@ import { homedir } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { query, createSdkMcpServer, z } from "./sdk.mjs";
+import {
+  profileKey,
+  defaultIndexPath,
+  loadResumeIndex,
+  saveResumeIndex,
+  findResumeCandidate,
+  upsertResumeEntry,
+  buildResumeCatchupFrames,
+} from "./resume-index.mjs";
+import {
+  CODE_MODE_APPEND,
+  CodeValidationError,
+  validateCodeInput,
+  runCodeScript,
+  buildCodeToolDescription,
+  formatCodeResult,
+  codeToolInputShape,
+} from "./code-mode.mjs";
 
 const HOME = homedir();
 const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS || process.env.ACP_SESSION_TTL_MS || 300000); // 5 min
@@ -301,8 +319,65 @@ function claimStreamedToolUse(session, name, args, idHint = null) {
 // that already arrived, or returns a promise that the bridge resolves when the
 // client POSTs the matching tool_result. A watchdog timeout returns {isError:true}
 // so the SDK agent loop survives a never-delivered tool result.
+//
+// In code mode, client tools are NOT registered — only the `code` meta-tool is.
+// Client tool schemas are stored on session.clientTools for validation/expansion.
 function buildParkingMcpServer(tools, session, createServer = createSdkMcpServer) {
   if (!tools || !tools.length) return null;
+
+  const makeHandler = (originalName) => async (args, extra) => {
+    const idHint = extractIdHint(session, extra);
+    const entry = claimStreamedToolUse(session, originalName, args, idHint);
+    const id = entry?.id;
+
+    if (id && session.resolvedResults.has(id)) {
+      const r = session.resolvedResults.get(id);
+      session.resolvedResults.delete(id);
+      return r;
+    }
+
+    return new Promise((resolve) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          if (id) session.pendingTools.delete(id);
+          process.stderr.write(`${LOG_PREFIX} tool ${id ?? originalName} park timeout after ${TOOL_TIMEOUT_MS}ms; returning isError\n`);
+          resolve({ content: [{ type: "text", text: `Tool result was not provided within ${TOOL_TIMEOUT_MS}ms` }], isError: true });
+        }
+      }, TOOL_TIMEOUT_MS);
+
+      const wrappedResolve = (result) => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timer);
+          resolve(result);
+        }
+      };
+
+      if (id) session.pendingTools.set(id, wrappedResolve);
+      else session.orphanResolvers.push(wrappedResolve);
+    });
+  };
+
+  if (session.codeMode) {
+    session.clientTools = session.clientTools || new Map();
+    for (const t of tools) {
+      session.clientTools.set(t.name, {
+        description: t.description || "",
+        input_schema: t.input_schema || { type: "object", properties: {} },
+      });
+    }
+    const codeShape = codeToolInputShape(z);
+    const codeTool = {
+      name: "code",
+      description: buildCodeToolDescription(session.clientTools),
+      inputSchema: codeShape,
+      handler: makeHandler("code"),
+    };
+    return createServer({ name: "bridge", tools: [codeTool], alwaysLoad: true });
+  }
+
   const mcpTools = tools.map((t) => {
     const shape = toolInputShape(t.input_schema || { type: "object", properties: {} });
     // Capture a canonical parser mirroring the MCP layer's validateToolInput so
@@ -318,41 +393,7 @@ function buildParkingMcpServer(tools, session, createServer = createSdkMcpServer
       name: t.name,
       description: t.description || "",
       inputSchema: shape,
-      handler: async (args, extra) => {
-        const originalName = t.name;
-        const idHint = extractIdHint(session, extra);
-        const entry = claimStreamedToolUse(session, originalName, args, idHint);
-        const id = entry?.id;
-
-        if (id && session.resolvedResults.has(id)) {
-          const r = session.resolvedResults.get(id);
-          session.resolvedResults.delete(id);
-          return r;
-        }
-
-        return new Promise((resolve) => {
-          let settled = false;
-          const timer = setTimeout(() => {
-            if (!settled) {
-              settled = true;
-              if (id) session.pendingTools.delete(id);
-              process.stderr.write(`${LOG_PREFIX} tool ${id ?? originalName} park timeout after ${TOOL_TIMEOUT_MS}ms; returning isError\n`);
-              resolve({ content: [{ type: "text", text: `Tool result was not provided within ${TOOL_TIMEOUT_MS}ms` }], isError: true });
-            }
-          }, TOOL_TIMEOUT_MS);
-
-          const wrappedResolve = (result) => {
-            if (!settled) {
-              settled = true;
-              clearTimeout(timer);
-              resolve(result);
-            }
-          };
-
-          if (id) session.pendingTools.set(id, wrappedResolve);
-          else session.orphanResolvers.push(wrappedResolve);
-        });
-      },
+      handler: makeHandler(t.name),
     };
   });
   return createServer({ name: "bridge", tools: mcpTools, alwaysLoad: true });
@@ -456,6 +497,74 @@ const sessions = new Map(); // key (UUID) -> Session
 // FIFO fallback. Surfaced in /healthz so a correlation regression is a visible
 // metric instead of a silent 4.5-minute park timeout.
 let totalFifoFallbacks = 0;
+let totalCodeCalls = 0;
+let totalCodeSubCalls = 0;
+let totalCodeErrors = 0;
+let totalCacheReadTokens = 0;
+let totalCacheCreationTokens = 0;
+
+// Default code mode (opt-out: true unless profile/header disables).
+let serverCodeMode = true;
+
+// Set by startServer(); used for disk-backed SDK session resume after cold start.
+let serverProfileDir = null;
+let resumeIndexFile = defaultIndexPath();
+
+function persistResumeIndex(session, model, system, messages) {
+  if (!session.sdkSessionId || !serverProfileDir || session.codeMode) return;
+  try {
+    const index = loadResumeIndex(resumeIndexFile);
+    const updated = upsertResumeEntry(index, {
+      profileKey: profileKey(serverProfileDir),
+      bucket: bucketKey(system, messages),
+      seenCount: session.seenCount,
+      seenHash: session.seenHash,
+      sdkSessionId: session.sdkSessionId,
+      model,
+    });
+    saveResumeIndex(updated, resumeIndexFile);
+  } catch (e) {
+    process.stderr.write(`${LOG_PREFIX} resume index write failed: ${e?.message || e}\n`);
+  }
+}
+
+function noteStreamTiming(session, ev) {
+  const m = session.turnMetrics;
+  if (!m) return;
+  if (!m.firstEventAt && (ev.type === "message_start" || ev.type === "content_block_delta")) {
+    m.firstEventAt = Date.now();
+  }
+  if (ev.type === "content_block_delta" && ev.delta?.type === "text_delta") {
+    m.textDeltas++;
+  }
+}
+
+function logTurnDone(session) {
+  const m = session.turnMetrics;
+  if (!m) return;
+  const total = Date.now() - m.startedAt;
+  const ttft = m.firstEventAt != null ? m.firstEventAt - m.startedAt : null;
+  process.stderr.write(
+    `${LOG_PREFIX} turn done key=${session.key.slice(0, 8)} action=${m.action}` +
+      ` ttft_ms=${ttft ?? "?"} total_ms=${total} textDeltas=${m.textDeltas}\n`
+  );
+  session.turnMetrics = null;
+}
+
+function pushColdStartFrames(session, messages, last, lastIsToolResult) {
+  if (lastIsToolResult) {
+    session.input.push(toUserFrame({
+      role: "user",
+      content: [{ type: "text", text: `Continue this conversation from where it left off. Full prior context:\n\n${renderTranscript(messages)}` }],
+    }));
+    return;
+  }
+  session.input.push(toUserFrame({
+    role: "user",
+    content: [{ type: "text", text: `Continue this conversation. Full prior context:\n\n${renderTranscript(messages.slice(0, -1))}` }],
+  }));
+  session.input.push(toUserFrame(last));
+}
 
 // Find the live session this request belongs to: same bucket, not closed, not
 // mid-turn (a mid-turn match means a genuinely concurrent request -> fork a new
@@ -500,7 +609,230 @@ function makeInputQueue() {
   };
 }
 
-function createSession(key, model, tools, callerSystem, bucket) {
+function initMessageProjection(session) {
+  session._proj = {
+    clientIndex: 0,
+    sdkToClient: new Map(),
+    syntheticCount: 0,
+    hadCode: false,
+  };
+}
+
+function clearCodeExpansion(session, codeToolUseId) {
+  const exp = session.codeExpansions?.get(codeToolUseId);
+  if (exp) {
+    for (const c of exp.calls) session.syntheticToCode?.delete(c.syntheticId);
+  }
+  session.codeExpansions?.delete(codeToolUseId);
+  session.codePendingResults?.delete(codeToolUseId);
+}
+
+function clearAllCodeState(session) {
+  session.codeExpansions?.clear();
+  session.syntheticToCode?.clear();
+  session.codePendingResults?.clear();
+  session.suppressEndTurn = false;
+}
+
+function syntheticIdFor(codeToolUseId, idx) {
+  const short = String(codeToolUseId || "code").replace(/^toolu_/, "").slice(0, 8);
+  return `toolu_code_${short}_${idx}`;
+}
+
+function emitClientToolUse(session, { syntheticId, tool, args }) {
+  const p = session._proj;
+  const idx = p.clientIndex++;
+  const start = {
+    type: "content_block_start",
+    index: idx,
+    content_block: { type: "tool_use", id: syntheticId, name: tool, input: {} },
+  };
+  const delta = {
+    type: "content_block_delta",
+    index: idx,
+    delta: { type: "input_json_delta", partial_json: JSON.stringify(args) },
+  };
+  const stop = { type: "content_block_stop", index: idx };
+  writeEvent(session, start);
+  writeEvent(session, delta);
+  writeEvent(session, stop);
+  p.syntheticCount++;
+  return idx;
+}
+
+function internalResolveCode(session, codeToolUseId, result) {
+  resolveTool(session, codeToolUseId, result);
+  session.suppressEndTurn = true;
+}
+
+function expandCodeToolUse(session, codeToolUseId, input) {
+  const t0 = Date.now();
+  let normalized;
+  try {
+    normalized = validateCodeInput(input, session.clientTools, { toolInputShape, z });
+  } catch (e) {
+    session.codeErrors = (session.codeErrors || 0) + 1;
+    totalCodeErrors++;
+    const msg = e instanceof CodeValidationError ? e.message : String(e?.message || e);
+    internalResolveCode(session, codeToolUseId, {
+      content: [{ type: "text", text: `code validation error: ${msg}` }],
+      isError: true,
+    });
+    process.stderr.write(`${LOG_PREFIX} code call ${codeToolUseId}: validation failed (${msg})\n`);
+    return;
+  }
+
+  const { script, calls } = normalized;
+  session.codeCalls = (session.codeCalls || 0) + 1;
+  totalCodeCalls++;
+
+  if (calls.length === 0) {
+    runCodeScript(script, { calls: [], results: {} })
+      .then(({ value, logs }) => {
+        internalResolveCode(session, codeToolUseId, formatCodeResult(value, logs));
+        process.stderr.write(`${LOG_PREFIX} code call ${codeToolUseId}: 0 sub-calls (pure script), execute=ok\n`);
+      })
+      .catch((e) => {
+        session.codeErrors = (session.codeErrors || 0) + 1;
+        totalCodeErrors++;
+        internalResolveCode(session, codeToolUseId, {
+          content: [{ type: "text", text: `code script error: ${e?.message || e}` }],
+          isError: true,
+        });
+      });
+    return;
+  }
+
+  session.codeSubCalls = (session.codeSubCalls || 0) + calls.length;
+  totalCodeSubCalls += calls.length;
+
+  const expansionCalls = [];
+  for (let i = 0; i < calls.length; i++) {
+    const { id: userId, tool, args } = calls[i];
+    const syntheticId = syntheticIdFor(codeToolUseId, i);
+    expansionCalls.push({ syntheticId, userId, tool, args });
+    session.syntheticToCode.set(syntheticId, codeToolUseId);
+    emitClientToolUse(session, { syntheticId, tool, args });
+  }
+
+  session.codeExpansions.set(codeToolUseId, { script, calls: expansionCalls });
+  if (!session.codePendingResults.has(codeToolUseId)) {
+    session.codePendingResults.set(codeToolUseId, new Map());
+  }
+
+  const validateMs = Date.now() - t0;
+  process.stderr.write(
+    `${LOG_PREFIX} code call ${codeToolUseId}: ${calls.length} sub-calls (tools: ${calls.map((c) => c.tool).join(",")}), validate=${validateMs}ms\n`,
+  );
+}
+
+async function collapseAndResolveCode(session, codeToolUseId) {
+  const expansion = session.codeExpansions.get(codeToolUseId);
+  const pending = session.codePendingResults.get(codeToolUseId);
+  if (!expansion || !pending) return;
+
+  const results = {};
+  for (const { syntheticId, userId } of expansion.calls) {
+    results[userId] = pending.get(syntheticId);
+  }
+
+  const t0 = Date.now();
+  let collapsed;
+  try {
+    const { value, logs } = await runCodeScript(expansion.script, {
+      calls: expansion.calls.map(({ userId, tool, args }) => ({ id: userId, tool, args })),
+      results,
+    });
+    collapsed = formatCodeResult(value, logs);
+    const scriptOut = collapsed.content?.[0]?.text?.length ?? 0;
+    process.stderr.write(
+      `${LOG_PREFIX} code call ${codeToolUseId}: execute=${Date.now() - t0}ms scriptOut=${scriptOut} bytes\n`,
+    );
+  } catch (e) {
+    session.codeErrors = (session.codeErrors || 0) + 1;
+    totalCodeErrors++;
+    collapsed = {
+      content: [{ type: "text", text: `code script error: ${e?.message || e}` }],
+      isError: true,
+    };
+    process.stderr.write(`${LOG_PREFIX} code call ${codeToolUseId}: script failed (${e?.message || e})\n`);
+  }
+
+  clearCodeExpansion(session, codeToolUseId);
+  resolveTool(session, codeToolUseId, collapsed);
+}
+
+function remapIndex(session, sdkIndex) {
+  const mapped = session._proj?.sdkToClient.get(sdkIndex);
+  return mapped ?? sdkIndex;
+}
+
+function projectEvent(session, ev) {
+  if (!session.codeMode) {
+    writeEvent(session, ev);
+    return;
+  }
+
+  const p = session._proj;
+  if (!p) return;
+
+  switch (ev.type) {
+    case "message_start":
+      writeEvent(session, ev);
+      break;
+    case "content_block_start": {
+      const cb = ev.content_block;
+      if (cb?.type === "tool_use" && cb.name === "code") {
+        p.hadCode = true;
+        return; // suppress code block from client stream
+      }
+      const idx = p.clientIndex++;
+      p.sdkToClient.set(ev.index, idx);
+      writeEvent(session, { ...ev, index: idx });
+      break;
+    }
+    case "content_block_delta": {
+      if (session.toolUseAccum.has(ev.index)) {
+        const acc = session.toolUseAccum.get(ev.index);
+        if (acc?.name === "code") return;
+      }
+      writeEvent(session, { ...ev, index: remapIndex(session, ev.index) });
+      break;
+    }
+    case "content_block_stop": {
+      if (session.toolUseAccum.has(ev.index)) {
+        // toolUseAccum cleared before this in consumeSession — check streamed last entry
+      }
+      const mapped = p.sdkToClient.get(ev.index);
+      if (mapped === undefined) {
+        // code block or unmapped — handled in consumeSession expand hook
+        return;
+      }
+      writeEvent(session, { ...ev, index: mapped });
+      break;
+    }
+    case "message_delta": {
+      const out = { ...ev };
+      if (p.syntheticCount > 0 && out.delta) {
+        out.delta = { ...out.delta, stop_reason: "tool_use" };
+      }
+      writeEvent(session, out);
+      break;
+    }
+    case "message_stop": {
+      const out = { ...ev };
+      if (p.syntheticCount > 0 && out.message?.stop_reason) {
+        out.message = { ...out.message, stop_reason: "tool_use" };
+      }
+      writeEvent(session, out);
+      break;
+    }
+    default:
+      writeEvent(session, ev);
+  }
+}
+
+function createSession(key, model, tools, callerSystem, bucket, { resume, codeMode = serverCodeMode } = {}) {
   const input = makeInputQueue();
   const abortController = new AbortController();
   const session = {
@@ -508,8 +840,14 @@ function createSession(key, model, tools, callerSystem, bucket) {
     bucket,                       // hash(system + first user msg) for candidate grouping
     seenCount: 0,                 // messages already processed by this session
     seenHash: hashMessages([], 0),// hash of that processed prefix (prefix-match guard)
+    sdkSessionId: resume || null, // SDK-persisted session id for resume after cold start
     model,
-    originalNames: new Set((tools || []).map((t) => t && t.name).filter(Boolean)),
+    codeMode: !!codeMode,
+    originalNames: new Set(
+      codeMode
+        ? ["code"]
+        : (tools || []).map((t) => t && t.name).filter(Boolean),
+    ),
     input,
     abortController,
     pendingTools: new Map(),      // toolUseId -> resolve(CallToolResult)
@@ -519,30 +857,39 @@ function createSession(key, model, tools, callerSystem, bucket) {
     toolUseAccum: new Map(),      // stream index -> {id,name,partial} (input JSON assembled across deltas)
     inputParsers: new Map(),      // toolName -> z.object(shape); canonical parser mirroring MCP validateToolInput
     fifoFallbacks: 0,             // per-session count of correlation FIFO fallbacks (observable)
+    clientTools: new Map(),       // code mode: name -> {description, input_schema}
+    codeExpansions: new Map(),    // codeToolUseId -> { script, calls: [{syntheticId,userId,tool,args}] }
+    syntheticToCode: new Map(),   // syntheticId -> codeToolUseId
+    codePendingResults: new Map(),// codeToolUseId -> Map(syntheticId -> CallToolResult)
+    suppressEndTurn: false,
+    codeCalls: 0,
+    codeSubCalls: 0,
+    codeErrors: 0,
     currentTurn: null,            // { resolve } deferred for the active HTTP turn
     res: null,                    // current streaming HTTP response
     nonStream: null,              // { blocks, stopReason } when buffering for non-stream
     lastUsage: { input_tokens: 0, output_tokens: 0 },
     lastActivity: Date.now(),
     closed: false,
+    turnMetrics: null,
   };
 
+  const systemAppend = codeMode ? callerSystem + CODE_MODE_APPEND : callerSystem;
   const mcpServer = buildParkingMcpServer(tools, session);
-  session.query = query({
-    prompt: input.iterable,
-    options: {
-      model,
-      systemPrompt: { type: "preset", preset: "claude_code", append: callerSystem },
-      settingSources: [],
-      tools: [],
-      mcpServers: mcpServer ? [mcpServer] : [],
-      strictMcpConfig: true,
-      permissionMode: "bypassPermissions", // MCP handlers (our parking tools) must run without prompts
-      cwd: HOME,
-      includePartialMessages: true,
-      abortController,
-    },
-  });
+  const queryOptions = {
+    model,
+    systemPrompt: { type: "preset", preset: "claude_code", append: systemAppend },
+    settingSources: [],
+    tools: [],
+    mcpServers: mcpServer ? [mcpServer] : [],
+    strictMcpConfig: true,
+    permissionMode: "bypassPermissions", // MCP handlers (our parking tools) must run without prompts
+    cwd: HOME,
+    includePartialMessages: true,
+    abortController,
+  };
+  if (resume) queryOptions.resume = resume;
+  session.query = query({ prompt: input.iterable, options: queryOptions });
 
   consumeSession(session);
   sessions.set(key, session);
@@ -555,8 +902,10 @@ async function consumeSession(session) {
   try {
     for await (const msg of session.query) {
       session.lastActivity = Date.now();
+      if (msg.session_id) session.sdkSessionId = msg.session_id;
       if (msg.type === "stream_event" && msg.event) {
         const ev = msg.event;
+        noteStreamTiming(session, ev);
         // A new assistant message begins a fresh tool round. Clear the per-message
         // correlation buffers so a tool_use streamed but never executed in a prior
         // message (e.g. an interleaved-thinking speculative call, or a round the
@@ -568,6 +917,7 @@ async function consumeSession(session) {
           session.streamedToolUses.length = 0;
           session.toolUseAccum.clear();
           session.resolvedResults.clear();
+          if (session.codeMode) initMessageProjection(session);
         }
         // Assemble each streamed tool_use into a complete {id,name,input} record.
         // The id+name arrive on content_block_start; input streams as
@@ -588,6 +938,9 @@ async function consumeSession(session) {
             let input = {};
             try { input = JSON.parse(a.partial || "{}"); } catch { input = {}; }
             session.streamedToolUses.push({ id: a.id, name: a.name, input });
+            if (session.codeMode && a.name === "code") {
+              expandCodeToolUse(session, a.id, input);
+            }
             session.toolUseAccum.delete(ev.index);
           }
         }
@@ -601,10 +954,17 @@ async function consumeSession(session) {
         if (ev.type === "message_delta" && ev.usage) {
           // delta usage carries output (and cache) tokens; keep input from message_start.
           if (ev.usage.output_tokens != null) session.lastUsage.output_tokens = ev.usage.output_tokens;
-          if (ev.usage.cache_read_input_tokens != null) session.lastUsage.cache_read_input_tokens = ev.usage.cache_read_input_tokens;
-          if (ev.usage.cache_creation_input_tokens != null) session.lastUsage.cache_creation_input_tokens = ev.usage.cache_creation_input_tokens;
+          if (ev.usage.cache_read_input_tokens != null) {
+            session.lastUsage.cache_read_input_tokens = ev.usage.cache_read_input_tokens;
+            totalCacheReadTokens += ev.usage.cache_read_input_tokens;
+          }
+          if (ev.usage.cache_creation_input_tokens != null) {
+            session.lastUsage.cache_creation_input_tokens = ev.usage.cache_creation_input_tokens;
+            totalCacheCreationTokens += ev.usage.cache_creation_input_tokens;
+          }
         }
-        writeEvent(session, ev);
+        if (session.codeMode) projectEvent(session, ev);
+        else writeEvent(session, ev);
         if (ev.type === "message_stop") endTurn(session);
       } else if (msg.type === "result") {
         if (msg.usage) {
@@ -662,6 +1022,7 @@ function abandonToolRound(session) {
   session.streamedToolUses.length = 0;
   session.orphanResolvers.length = 0;
   session.toolUseAccum.clear();
+  if (session.codeMode) clearAllCodeState(session);
 }
 
 // Ending a streamed turn flushes the HTTP response to the client, but the tool
@@ -670,6 +1031,11 @@ function abandonToolRound(session) {
 // touches tool state. message_start clears the per-message correlation buffers;
 // the watchdog and resolveTool clear pendingTools.
 function endTurn(session) {
+  if (session.suppressEndTurn) {
+    session.suppressEndTurn = false;
+    return;
+  }
+  logTurnDone(session);
   const turn = session.currentTurn;
   if (turn) { session.currentTurn = null; turn.resolve(); }
 }
@@ -714,6 +1080,24 @@ sweeper.unref?.();
 // Request handling.
 // ----------------------------------------------------------------------------
 
+async function resolveCodeModeToolResults(session, toolResults) {
+  for (const tr of toolResults) {
+    const codeId = session.syntheticToCode.get(tr.tool_use_id);
+    if (codeId) {
+      if (!session.codePendingResults.has(codeId)) {
+        session.codePendingResults.set(codeId, new Map());
+      }
+      session.codePendingResults.get(codeId).set(tr.tool_use_id, toCallToolResult(tr));
+      const expansion = session.codeExpansions.get(codeId);
+      if (expansion && session.codePendingResults.get(codeId).size === expansion.calls.length) {
+        await collapseAndResolveCode(session, codeId);
+      }
+    } else {
+      resolveTool(session, tr.tool_use_id, toCallToolResult(tr));
+    }
+  }
+}
+
 async function handleMessages(req, res) {
   let body = "";
   for await (const chunk of req) body += chunk;
@@ -731,15 +1115,21 @@ async function handleMessages(req, res) {
 
   const callerSystem = extractSystemText(system);
   const isStream = stream !== false;
+  const headerCode = req.headers["x-code-mode"];
+  let codeMode = serverCodeMode;
+  if (headerCode === "0" || headerCode === "false") codeMode = false;
+  else if (headerCode === "1" || headerCode === "true") codeMode = true;
   const last = messages[messages.length - 1];
   const toolResults = Array.isArray(last?.content) ? last.content.filter((b) => b.type === "tool_result") : [];
   const lastIsToolResult = toolResults.length > 0;
 
   let session = findSession(messages, system);
+  let resumeCatchupTail = null;
   // "resolve" => feed tool_result(s) to the parked handler of a matched session.
   // "push"    => push the latest user turn into a matched session.
-  // "cold"    => no matching live session but history exists (model swap / TTL
-  //              eviction / restart): new session primed with the full transcript.
+  // "resume"  => cold start recovered via SDK resume; push only the last user turn.
+  // "resume-catchup" => SDK resume + small unseen tail as narrative context.
+  // "cold"    => no matching live session and no resume index hit: narrative priming.
   // "new"     => brand-new conversation (single message): new session.
   let action;
   if (session && lastIsToolResult) {
@@ -747,18 +1137,42 @@ async function handleMessages(req, res) {
   } else if (session) {
     action = "push";
   } else if (messages.length > 1) {
-    session = createSession(randomUUID(), model, tools, callerSystem, bucketKey(system, messages));
-    action = "cold";
+    const b = bucketKey(system, messages);
+    if (!codeMode) {
+      const index = loadResumeIndex(resumeIndexFile);
+      const candidate = findResumeCandidate({
+        entries: index.entries,
+        model,
+        profileKey: profileKey(serverProfileDir),
+        bucket: b,
+        messages,
+        lastIsToolResult,
+        hashMessages,
+      });
+      if (candidate?.mode === "resume") {
+        session = createSession(randomUUID(), model, tools, callerSystem, b, { resume: candidate.sdkSessionId, codeMode });
+        action = "resume";
+      } else if (candidate?.mode === "resume-catchup") {
+        session = createSession(randomUUID(), model, tools, callerSystem, b, { resume: candidate.sdkSessionId, codeMode });
+        action = "resume-catchup";
+        resumeCatchupTail = candidate.tail;
+      }
+    }
+    if (!session) {
+      session = createSession(randomUUID(), model, tools, callerSystem, b, { codeMode });
+      action = "cold";
+    }
   } else {
-    session = createSession(randomUUID(), model, tools, callerSystem, bucketKey(system, messages));
+    session = createSession(randomUUID(), model, tools, callerSystem, bucketKey(system, messages), { codeMode });
     action = "new";
   }
 
-  process.stderr.write(`${LOG_PREFIX} request model=${model} stream=${isStream} key=${session.key.slice(0, 8)} action=${action} tools=${tools?.length || 0} msgs=${messages.length} [${summarizeMessages(messages)}]\n`);
+  process.stderr.write(`${LOG_PREFIX} request model=${model} stream=${isStream} codeMode=${codeMode} key=${session.key.slice(0, 8)} action=${action} tools=${tools?.length || 0} msgs=${messages.length} [${summarizeMessages(messages)}]\n`);
 
   // Attach this HTTP response as the session's current turn.
   let onClose;
   let heartbeat;
+  session.turnMetrics = { action, startedAt: Date.now(), firstEventAt: null, textDeltas: 0 };
   const turnPromise = new Promise((resolve, reject) => {
     session.currentTurn = { resolve, reject };
   });
@@ -768,6 +1182,9 @@ async function handleMessages(req, res) {
     res.flushHeaders?.();
     session.res = res;
     session.nonStream = null;
+    if (action === "cold" || action === "resume" || action === "resume-catchup") {
+      res.write(": warming up\n\n");
+    }
     heartbeat = setInterval(() => { if (!res.writableEnded) res.write(`: keep-alive\n\n`); }, HEARTBEAT_MS);
     // Client disconnect detaches the response but must NOT kill the session —
     // the client reconnects with the next POST.
@@ -780,28 +1197,22 @@ async function handleMessages(req, res) {
 
   // Drive the turn.
   if (action === "resolve") {
-    for (const tr of toolResults) resolveTool(session, tr.tool_use_id, toCallToolResult(tr));
-  } else if (action === "cold") {
-    // Recover full context: prime the fresh session with the prior transcript,
-    // then push the actionable last turn. The live loop still drives all NEW
-    // tool calls, so prior tool calls are narrative context only.
-    if (lastIsToolResult) {
-      // Evicted mid tool-loop: a raw tool_result has no matching tool_use in the
-      // fresh session, so fold the whole transcript into narrative and ask the
-      // model to continue from it.
-      session.input.push(toUserFrame({
-        role: "user",
-        content: [{ type: "text", text: `Continue this conversation from where it left off. Full prior context:\n\n${renderTranscript(messages)}` }],
-      }));
-    } else {
-      session.input.push(toUserFrame({
-        role: "user",
-        content: [{ type: "text", text: `Continue this conversation. Full prior context:\n\n${renderTranscript(messages.slice(0, -1))}` }],
-      }));
-      session.input.push(toUserFrame(last));
+    if (session.codeMode) await resolveCodeModeToolResults(session, toolResults);
+    else for (const tr of toolResults) resolveTool(session, tr.tool_use_id, toCallToolResult(tr));
+  } else if (action === "resume") {
+    session.input.push(toUserFrame(last));
+  } else if (action === "resume-catchup") {
+    for (const frame of buildResumeCatchupFrames(resumeCatchupTail || [], {
+      renderTranscript,
+      toUserFrame,
+      lastIsToolResult,
+    })) {
+      session.input.push(frame);
     }
+  } else if (action === "cold") {
+    pushColdStartFrames(session, messages, last, lastIsToolResult);
   } else {
-    // action === "push": a fresh user turn on a live session. If the prior turn
+    // action === "push" or "new": a fresh user turn on a live session. If the prior turn
     // left a tool round parked (the caller interjected text instead of returning
     // a tool_result), abandon it so the new turn is not stuck behind a handler
     // that will never be resolved.
@@ -844,6 +1255,8 @@ async function handleMessages(req, res) {
   if (heartbeat) clearInterval(heartbeat);
   if (onClose) req.off("close", onClose);
 
+  persistResumeIndex(session, model, system, messages);
+
   if (isStream) {
     if (session.res === res) session.res = null;
     if (!res.writableEnded) res.end();
@@ -868,7 +1281,10 @@ async function handleMessages(req, res) {
 
 // Start the HTTP server. Auth (CLAUDE_CONFIG_DIR / token) must already be applied
 // to process.env by the caller (src/auth.mjs). Returns the http.Server.
-export function startServer({ port = 32809, host = "127.0.0.1", account = null, profileDir = process.env.CLAUDE_CONFIG_DIR, version = null } = {}) {
+export function startServer({ port = 32809, host = "127.0.0.1", account = null, profileDir = process.env.CLAUDE_CONFIG_DIR, version = null, codeMode = true } = {}) {
+  serverProfileDir = profileDir || null;
+  serverCodeMode = codeMode !== false;
+  resumeIndexFile = defaultIndexPath();
   const server = http.createServer(async (req, res) => {
     const url = req.url || "";
     if (req.method === "GET" && (url === "/healthz" || url === "/")) {
@@ -881,6 +1297,12 @@ export function startServer({ port = 32809, host = "127.0.0.1", account = null, 
         account: account?.email || null,
         sessions: sessions.size,
         fifoFallbacks: totalFifoFallbacks,
+        codeMode: serverCodeMode,
+        codeCalls: totalCodeCalls,
+        codeSubCalls: totalCodeSubCalls,
+        codeErrors: totalCodeErrors,
+        cacheReadTokens: totalCacheReadTokens,
+        cacheCreationTokens: totalCacheCreationTokens,
       });
     }
     if (req.method === "POST" && (url === "/v1/messages" || url === "/v1/messages/")) {
@@ -933,4 +1355,31 @@ export {
   abandonToolRound,
   buildParkingMcpServer,
   raceTurn,
+  pushColdStartFrames,
+  noteStreamTiming,
+  persistResumeIndex,
+  profileKey,
+  findResumeCandidate,
+  upsertResumeEntry,
+  buildResumeCatchupFrames,
+  loadResumeIndex,
+  createSession,
+  expandCodeToolUse,
+  collapseAndResolveCode,
+  resolveCodeModeToolResults,
+  projectEvent,
+  initMessageProjection,
+  clearAllCodeState,
+  clearCodeExpansion,
+  syntheticIdFor,
+  internalResolveCode,
+  endTurn,
+  resolveTool,
+  writeEvent,
+  accumulateStreamEvent,
+  emitClientToolUse,
+  serverCodeMode,
+  totalCodeCalls,
+  totalCodeSubCalls,
+  totalCodeErrors,
 };
