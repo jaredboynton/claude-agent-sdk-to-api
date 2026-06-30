@@ -60,6 +60,7 @@ export function validateProfilesConfig(obj, { home = homedir() } = {}) {
       port,
       host: typeof p.host === "string" ? p.host : "127.0.0.1",
       codeMode: p.codeMode === false ? false : true,
+      anchorEdit: p.anchorEdit === false ? false : true,
       cacheLog: p.cacheLog === true,
     };
   });

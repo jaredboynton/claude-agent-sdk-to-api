@@ -86,6 +86,20 @@ Add a custom model pointing at the bridge port (see `examples/factory-model.json
 
 See `examples/curl-and-client.mjs` for a complete tool round-trip: POST a message, get a `tool_use` back, execute it, POST the `tool_result`, and let the live session continue.
 
+## Working directory (`x-claude-cwd`)
+
+The `Working directory: …` / git-repo / directory-structure context the model sees is generated **server-side**, inside the SDK's Claude Code engine, from that engine's cwd — the client never sends it in the request body. Because this bridge is one long-lived daemon serving many projects, it can't know any client's directory on its own. So each request may carry an `x-claude-cwd` header naming the absolute working directory; the bridge validates it (must be an existing absolute dir), bakes it into that session's SDK `query()`, and includes it in session identity so two projects never share a session. Mid-session `cd` drift self-corrects — the SDK session's own Bash tool tracks cwd from there.
+
+Point Claude Code at the bridge and forward your shell's cwd:
+
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:32809
+export ANTHROPIC_CUSTOM_HEADERS="x-claude-cwd: $PWD"
+claude
+```
+
+Without the header, the bridge falls back to `CLAUDE_PROXY_CWD` (if set and valid), then the daemon's own `process.cwd()`. When the bridge runs as a launchd/systemd service that's usually `/`, so set the header (or `CLAUDE_PROXY_CWD` for a single-project daemon) to get correct directory awareness.
+
 ## Code mode (opt-out by default)
 
 When enabled (the default), the bridge exposes a single `code({ script })` meta-tool to the model. The model writes an async JavaScript script that calls the client's tools via `await tools.<Name>(args)` (or `await callTool(name, args)`). The bridge runs the script inside a Worker-contained `node:vm` sandbox; each `await`ed tool call becomes a wave of synthetic `tool_use` blocks for the unchanged client, and only the script's return value enters the model's context. This collapses multi-step dependent tool chains (read → decide → grep → read) into **one model round-trip** — tool waves inside `code` cost zero model cache reads.
@@ -103,6 +117,19 @@ Live validation (requires a running bridge):
 - `node scripts/live-code-mode.mjs <port>` — smoke test: one wave (Grep+Glob via `Promise.all`) with mocked tool results; confirms the client stream is transparent (no `code` block) and the script completes without a park timeout.
 - `node scripts/live-code-mode-agent-task.mjs <port>` — thorough agent workflow: drives a real research-to-code-to-validate task (web search, multi-file generation in a temp project, allowlisted command validation, iterative fixes) and asserts code mode stayed transparent under a multi-turn, multi-tool workload, including a dependent-chain assertion that one `code` call drove multiple waves. Requires network for `WebSearch`. Env: `MAX_TURNS`, `KEEP_CODE_MODE_FIXTURE=1`, `MODEL`.
 
+## Anchor editing (opt-out by default)
+
+The #1 cause of failed `Edit`/`MultiEdit` calls is an `old_string` that doesn't byte-match the file (the model retypes whitespace or indentation from memory). The bridge already caches the exact bytes the model reads (the client executes `Read` and POSTs the result back through us), so it can free the model from reproducing `old_string` at all.
+
+When enabled (the default), every `Read` result is annotated with a stable per-line anchor token (`⟦a5⟧…`) and the exact gutter-stripped bytes are cached per session. The model points an edit at a line range by anchor instead of pasting source, and the bridge reconstructs a byte-exact `old_string`/`new_string` from the cached snapshot before the `tool_use` reaches the client — so the client still executes a perfectly ordinary native `Edit`.
+
+- **Native mode:** `Edit`/`MultiEdit` are advertised with an anchor-shaped schema (`start_anchor`, `end_anchor`, `new_string`). The bridge buffers the streamed `tool_use` input and re-emits a translated native input at `content_block_stop`.
+- **Code mode:** each tool result also carries an `.anchored` view (the same text with anchor tokens) and the `Edit`/`MultiEdit` signatures gain **optional** anchor fields. Scripts may pass `start_anchor`/`end_anchor` (translated to native `old_string` before the wave fabricates a client call) **or** keep deriving `old_string` from the bytes they just read — both work.
+- **Live re-anchoring (Dirac-style):** after the client confirms an edit, the bridge applies it to the cached snapshot and re-anchors only the changed lines (unchanged lines keep their tokens). So an edit near the top of a file does not invalidate the anchors below it, and several sequential edits to the same file work without re-reading. A `MultiEdit` resolves all of its ranges against one snapshot, so its edits may be supplied in **any order** (they are sorted and applied ascending); only genuinely overlapping ranges are rejected.
+- If an anchor is unknown or stale (no cached snapshot), translation fails gracefully: native mode forwards the original input (the client errors and the model re-reads), code mode returns an inline error to the script.
+
+**Opt out:** set `"anchorEdit": false` on a profile in `profiles.json`, pass `--anchor-edit 0` to `claude-agent-api run`, or send `X-Anchor-Edit: 0` on a request.
+
 ## Environment knobs
 
 | Variable | Default | Meaning |
@@ -117,6 +144,8 @@ Live validation (requires a running bridge):
 | `CODE_MAX_WAVES` | `0` (unlimited) | Optional cap on tool-call waves per `code` run; `0` = unlimited |
 | `CODE_MAX_CALLS` | `0` (unlimited) | Optional cap on total tool calls per `code` run; `0` = unlimited |
 | `X-Code-Mode` | (default on) | Per-request header: `0` disables, `1` enables code mode |
+| `x-claude-cwd` | (header) | Per-request working directory baked into the SDK env block; must be an existing absolute dir |
+| `CLAUDE_PROXY_CWD` | `process.cwd()` | Daemon-wide working-directory fallback when no valid `x-claude-cwd` header is sent |
 | `CACHE_LOG` | (off) | `1`/`true` → append a per-turn usage row to `<profileDir>/cache-log.jsonl`; or set a path. Also `--cache-log [path]` on `run`, or `"cacheLog": true` per profile |
 
 ## Cache log (per-turn usage receipts)

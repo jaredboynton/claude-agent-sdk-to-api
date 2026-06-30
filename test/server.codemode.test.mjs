@@ -576,18 +576,10 @@ test("hasActiveToolRound includes code run and codeDriving", () => {
 // persistResumeIndex (no-op for code mode)
 // ---------------------------------------------------------------------------
 
-// Code-mode sessions now DO persist resume entries (gated on a clean tool-round
-// boundary; see resume-index.test.mjs). With no profile dir configured the call
-// is a safe no-op, and a mid-wave session must never be checkpointed.
-test("persistResumeIndex is a safe no-op without a configured profile dir", () => {
+// Code-mode SDK resume is disabled, so persistResumeIndex is a no-op for
+// code-mode sessions (it returns before touching the index).
+test("persistResumeIndex is no-op for code-mode sessions", () => {
   const session = { codeMode: true, sdkSessionId: "sdk-1", seenCount: 2, seenHash: "abc" };
-  persistResumeIndex(session, "model", "sys", []);
-});
-
-test("persistResumeIndex skips checkpoint while a code wave is active", () => {
-  // hasActiveToolRound true via codeRun => must early-return even with a profile,
-  // proven here by the absence of any throw and no state mutation.
-  const session = { codeMode: true, sdkSessionId: "sdk-1", seenCount: 2, seenHash: "abc", codeRun: {}, syntheticToCode: new Map() };
   persistResumeIndex(session, "model", "sys", []);
 });
 

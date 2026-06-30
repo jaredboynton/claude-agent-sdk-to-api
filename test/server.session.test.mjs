@@ -26,6 +26,8 @@ import {
   noteStreamTiming,
   raceTurn,
   toolInputShape,
+  resolveCwd,
+  isValidCwd,
 } from "../src/server.mjs";
 import { z } from "../src/sdk.mjs";
 
@@ -73,6 +75,44 @@ test("bucketKey uses convId when provided, ignoring content", () => {
   assert.notEqual(bucketKey("sys", a, "conv-1"), bucketKey("sys", a, "conv-2"));
 });
 
+test("bucketKey isolates the same conversation across different cwds", () => {
+  const a = [{ role: "user", content: "same task" }];
+  // Content path: identical system+message in two dirs must not share a session.
+  assert.notEqual(bucketKey("sys", a, null, "/a"), bucketKey("sys", a, null, "/b"));
+  // convId path: same convId in two dirs must not share a session either.
+  assert.notEqual(bucketKey("sys", a, "conv-1", "/a"), bucketKey("sys", a, "conv-1", "/b"));
+  // Same cwd => same bucket (deterministic).
+  assert.equal(bucketKey("sys", a, null, "/a"), bucketKey("sys", a, null, "/a"));
+  assert.equal(bucketKey("sys", a, "conv-1", "/a"), bucketKey("sys", a, "conv-1", "/a"));
+});
+
+test("bucketKey convId format is unchanged when cwd is empty (back-compat)", () => {
+  const a = [{ role: "user", content: "hi" }];
+  assert.equal(bucketKey("", a, "conv-1"), "cc:conv-1");
+  assert.equal(bucketKey("", a, "conv-1", ""), "cc:conv-1");
+});
+
+test("isValidCwd accepts an existing absolute directory, rejects others", () => {
+  assert.equal(isValidCwd(process.cwd()), true);
+  assert.equal(isValidCwd("relative/path"), false);
+  assert.equal(isValidCwd("/definitely/not/a/real/dir/xyz123"), false);
+  assert.equal(isValidCwd(""), false);
+  assert.equal(isValidCwd(null), false);
+  assert.equal(isValidCwd(undefined), false);
+});
+
+test("resolveCwd uses a valid header value and falls back when invalid/absent", () => {
+  // Valid header wins.
+  assert.equal(resolveCwd(process.cwd()), process.cwd());
+  // Array header (Node may pass arrays): first element is used.
+  assert.equal(resolveCwd([process.cwd()]), process.cwd());
+  // Invalid/absent -> fallback (process.cwd() unless CLAUDE_PROXY_CWD is set).
+  const fallback = resolveCwd(undefined);
+  assert.equal(typeof fallback, "string");
+  assert.equal(resolveCwd("/nope/not/real/xyz"), fallback);
+  assert.equal(resolveCwd(""), fallback);
+});
+
 test("findSession separates parallel conversations with identical prefix by convId", () => {
   sessions.clear();
   const sys = "sys";
@@ -97,6 +137,22 @@ test("findSession falls back to content bucket when no convId (Droid path)", () 
   const s = { key: "k", bucket: bucketKey(sys, [first]), seenCount: 0, seenHash: hashMessages([], 0), closed: false, currentTurn: null };
   sessions.set("k", s); markSeen(s, [first]);
   assert.equal(findSession([first], sys)?.key, "k");
+  sessions.clear();
+});
+
+test("findSession isolates identical conversations running in different cwds", () => {
+  sessions.clear();
+  const sys = "sys";
+  const first = { role: "user", content: [{ type: "text", text: "same task" }] };
+  const sA = { key: "A", bucket: bucketKey(sys, [first], null, "/proj/a"), seenCount: 0, seenHash: hashMessages([], 0), closed: false, currentTurn: null };
+  const sB = { key: "B", bucket: bucketKey(sys, [first], null, "/proj/b"), seenCount: 0, seenHash: hashMessages([], 0), closed: false, currentTurn: null };
+  sessions.set("A", sA); markSeen(sA, [first]);
+  sessions.set("B", sB); markSeen(sB, [first]);
+  // Same content + same convId-less path, but each cwd resolves to its own session.
+  assert.equal(findSession([first], sys, null, "/proj/a")?.key, "A");
+  assert.equal(findSession([first], sys, null, "/proj/b")?.key, "B");
+  // A request from a third, unseen cwd matches neither.
+  assert.equal(findSession([first], sys, null, "/proj/c"), null);
   sessions.clear();
 });
 

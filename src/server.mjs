@@ -33,9 +33,10 @@
 // de-namespaced from the SDK's mcp__<id>__ prefix).
 
 import http from "node:http";
-import { homedir } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
+import { statSync } from "node:fs";
+import { isAbsolute } from "node:path";
 import { query, createSdkMcpServer, z } from "./sdk.mjs";
 import {
   profileKey,
@@ -57,8 +58,20 @@ import {
   normalizeClientToolMeta,
 } from "./code-mode.mjs";
 import { initCacheLog, appendCacheLog, cacheLogEnabled, cacheLogPath, cacheCreationSplit } from "./cache-log.mjs";
+import {
+  createAnchorState,
+  annotateReadResult,
+  translateEditInput,
+  reconcileEdit,
+  patchEditSchema,
+  patchEditDescription,
+  mergeAnchorEditSchema,
+  patchCodeEditDescription,
+  hasAnchorFields,
+  ANCHORED_READ_TOOLS,
+  ANCHORED_EDIT_TOOLS,
+} from "./anchor-edit.mjs";
 
-const HOME = homedir();
 const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS || process.env.ACP_SESSION_TTL_MS || 300000); // 5 min
 const HEARTBEAT_MS = Number(process.env.HEARTBEAT_MS || process.env.ACP_HEARTBEAT_MS || 15000);
 const TOOL_TIMEOUT_MS = Number(process.env.TOOL_TIMEOUT_MS || process.env.ACP_TOOL_TIMEOUT_MS || 1800000); // 30 min; active tool rounds are retained past SESSION_TTL_MS
@@ -71,6 +84,45 @@ const CODE_SCRIPT_TIMEOUT_MS = Number(process.env.CODE_SCRIPT_TIMEOUT_MS || 0); 
 const CODE_MAX_WAVES = Number(process.env.CODE_MAX_WAVES || 0); // 0 = unlimited
 const CODE_MAX_CALLS = Number(process.env.CODE_MAX_CALLS || 0); // 0 = unlimited
 const LOG_PREFIX = "[claude-agent-api]";
+
+// Per-request working directory.
+//
+// In real Claude Code, cwd is a per-process mutable value seeded from the launch
+// directory and read fresh into the `<env>Working directory: ...` block. This
+// proxy is a single long-lived daemon serving many clients in many projects, so
+// it has no inherent knowledge of any client's directory — `process.cwd()` is a
+// single global that can't represent N concurrent conversations. The client must
+// therefore tell us, per request, via the `x-claude-cwd` header (launch Claude
+// Code with ANTHROPIC_CUSTOM_HEADERS="x-claude-cwd: $PWD"). We validate it is an
+// existing absolute directory and fall back to CLAUDE_PROXY_CWD, then the
+// daemon's own process.cwd(). Mid-session `cd` drift self-corrects: the SDK
+// query() is itself a real Claude Code engine whose Bash tool tracks cwd within
+// the session — we only need the initial dir right.
+const PROXY_CWD_FALLBACK = (() => {
+  const env = process.env.CLAUDE_PROXY_CWD;
+  if (env && isValidCwd(env)) return env;
+  return process.cwd();
+})();
+
+function isValidCwd(p) {
+  if (typeof p !== "string" || !p.trim() || !isAbsolute(p)) return false;
+  try {
+    return statSync(p).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+// Resolve the working directory for a request: a valid x-claude-cwd header wins,
+// otherwise the daemon-wide fallback (CLAUDE_PROXY_CWD or process.cwd()).
+function resolveCwd(headerVal) {
+  const h = Array.isArray(headerVal) ? headerVal[0] : headerVal;
+  if (isValidCwd(h)) return h;
+  if (h != null && h !== "") {
+    process.stderr.write(`${LOG_PREFIX} ignoring invalid x-claude-cwd header (${String(h).slice(0, 120)}); using ${PROXY_CWD_FALLBACK}\n`);
+  }
+  return PROXY_CWD_FALLBACK;
+}
 
 // Models surfaced via the /v1/models catalog so Claude Code's startup model
 // validation succeeds. The SDK is the real source of truth at query time; this
@@ -162,10 +214,14 @@ function renderMsgText(message) {
 // directly — this deterministically separates parallel conversations that
 // share an identical system+first-user prefix (e.g. fan-out subagents), which
 // content hashing alone cannot. Falls back to hash(system + first user msg).
-function bucketKey(system, messages, convId = null) {
-  if (convId) return `cc:${convId}`;
+//
+// cwd is part of identity on BOTH paths: the same conversation id or content in
+// two different working directories must NOT share a session, because cwd is
+// baked into the SDK query()'s env block at creation and cannot change after.
+function bucketKey(system, messages, convId = null, cwd = "") {
+  if (convId) return cwd ? `cc:${cwd}\u0000${convId}` : `cc:${convId}`;
   const firstUser = (messages || []).find((m) => m.role === "user");
-  const text = extractSystemText(system) + "\u0000" + renderMsgText(firstUser);
+  const text = cwd + "\u0000" + extractSystemText(system) + "\u0000" + renderMsgText(firstUser);
   return createHash("sha256").update(text).digest("hex").slice(0, 32);
 }
 
@@ -426,6 +482,22 @@ function claimStreamedToolUse(session, name, args, idHint = null) {
 // In code mode, `code` is registered alongside the original tools. The model can
 // batch non-interactive work through `code`, while native client tools remain
 // available for interactive/approval/handoff flows with their real schemas.
+// Resolve the JSON schema + description to advertise for a tool. When anchor
+// editing is active on a native (non-code) session, Edit/MultiEdit get the
+// anchor-shaped schema so the model points at Read anchors instead of pasting
+// whitespace-perfect old_string; the proxy translates back before the tool_use
+// reaches the client. Code-mode sessions keep the native schema (their edits
+// route through the `code` tool and are translated separately).
+function advertisedToolSchema(session, t) {
+  if (session.anchorEdit && !session.codeMode && ANCHORED_EDIT_TOOLS.has(t.name)) {
+    return {
+      schema: patchEditSchema(t.name) || t.input_schema || { type: "object", properties: {} },
+      description: patchEditDescription(t.name, t.description || ""),
+    };
+  }
+  return { schema: t.input_schema || { type: "object", properties: {} }, description: t.description || "" };
+}
+
 function buildParkingMcpServer(tools, session, createServer = createSdkMcpServer) {
   if (!tools || !tools.length) return null;
 
@@ -476,9 +548,16 @@ function buildParkingMcpServer(tools, session, createServer = createSdkMcpServer
   if (session.codeMode) {
     session.clientTools = session.clientTools || new Map();
     for (const t of tools) {
+      // In code mode anchor editing is additive: the native old_string path
+      // still works (scripts derive bytes from the Read result), and anchor
+      // fields are merged in as OPTIONAL so the rendered `code` signature
+      // documents both. Translation back to native happens in dispatchCodeWave.
+      const anchorOn = session.anchorEdit && ANCHORED_EDIT_TOOLS.has(t.name);
       session.clientTools.set(t.name, normalizeClientToolMeta(t.name, {
-        description: t.description || "",
-        input_schema: t.input_schema || { type: "object", properties: {} },
+        description: anchorOn ? patchCodeEditDescription(t.name, t.description || "") : (t.description || ""),
+        input_schema: anchorOn
+          ? mergeAnchorEditSchema(t.name, t.input_schema || { type: "object", properties: {} })
+          : (t.input_schema || { type: "object", properties: {} }),
       }));
     }
     const codeShape = codeToolInputShape(z);
@@ -507,7 +586,8 @@ function buildParkingMcpServer(tools, session, createServer = createSdkMcpServer
   }
 
   const mcpTools = tools.map((t) => {
-    const shape = toolInputShape(t.input_schema || { type: "object", properties: {} });
+    const { schema: jsonSchema, description } = advertisedToolSchema(session, t);
+    const shape = toolInputShape(jsonSchema);
     // Capture a canonical parser mirroring the MCP layer's validateToolInput so
     // claimStreamedToolUse can normalize both the streamed raw input and the
     // handler's already-parsed args to the same form (defaults, coercions).
@@ -519,7 +599,7 @@ function buildParkingMcpServer(tools, session, createServer = createSdkMcpServer
     }
     return {
       name: t.name,
-      description: t.description || "",
+      description,
       inputSchema: shape,
       handler: makeHandler(t.name),
     };
@@ -536,6 +616,22 @@ function stripCacheControl(block) {
   const { cache_control, ...rest } = block;
   if (Array.isArray(rest.content)) rest.content = rest.content.map(stripCacheControl);
   return rest;
+}
+
+// When anchor editing is active, annotate a Read tool_result with per-line
+// anchor tokens (and cache its exact bytes) before the model sees it, so a
+// later Edit can point at anchors. No-op unless this id was a Read whose result
+// is plain guttered text. Returns the (possibly) rewritten CallToolResult.
+function maybeAnchorReadResult(session, toolUseId, result) {
+  if (!session.anchorEdit || !session.anchorState) return result;
+  const meta = session.toolMeta?.get(toolUseId);
+  if (!meta || !ANCHORED_READ_TOOLS.has(meta.name)) return result;
+  const filePath = meta.input?.file_path;
+  const block = result?.content?.[0];
+  if (!filePath || !block || block.type !== "text") return result;
+  const { text, anchored } = annotateReadResult(session.anchorState, filePath, block.text);
+  if (!anchored) return result;
+  return { ...result, content: [{ type: "text", text }, ...result.content.slice(1)] };
 }
 
 // Convert a client tool_result block into an MCP CallToolResult.
@@ -636,17 +732,19 @@ let totalMimicryDetections = 0;
 // Default code mode (opt-out: true unless profile/header disables).
 let serverCodeMode = true;
 
+// Default anchor-based editing (opt-out: true unless profile/header disables).
+let serverAnchorEdit = true;
+
 // Set by startServer(); used for disk-backed SDK session resume after cold start.
 let serverProfileDir = null;
 let resumeIndexFile = defaultIndexPath();
 
 function persistResumeIndex(session, model, system, messages) {
-  if (!session.sdkSessionId || !serverProfileDir) return;
-  // Never checkpoint mid tool-round: a code-mode wave parks on synthetic
-  // toolu_code_* ids that live only in this process's memory. Recording a
-  // seenCount in that state would let a later resume rehydrate an SDK session
-  // that cannot route the still-outstanding synthetic tool_results.
-  if (hasActiveToolRound(session, { includeCurrentTurn: false })) return;
+  // Code-mode SDK resume is intentionally disabled: resuming a code-mode
+  // session (synthetic toolu_code_* projection / waves) is unproven and can
+  // park a turn up to the watchdog. Only non-code sessions persist + resume;
+  // code mode recovers via the mimicry-safe cold priming instead.
+  if (!session.sdkSessionId || !serverProfileDir || session.codeMode) return;
   try {
     const index = loadResumeIndex(resumeIndexFile);
     const updated = upsertResumeEntry(index, {
@@ -656,7 +754,6 @@ function persistResumeIndex(session, model, system, messages) {
       seenHash: session.seenHash,
       sdkSessionId: session.sdkSessionId,
       model,
-      codeMode: !!session.codeMode,
     });
     saveResumeIndex(updated, resumeIndexFile);
   } catch (e) {
@@ -784,8 +881,8 @@ function pushColdStartFrames(session, messages, last, lastIsToolResult) {
 // session so we never clobber currentTurn/res), and whose already-processed
 // prefix the incoming history extends. Longest matching prefix wins (most
 // specific). Returns null on cold start (model swap / eviction / restart).
-function findSession(messages, system, convId = null) {
-  const b = bucketKey(system, messages, convId);
+function findSession(messages, system, convId = null, cwd = "") {
+  const b = bucketKey(system, messages, convId, cwd);
   let best = null;
   for (const s of sessions.values()) {
     if (s.bucket !== b || s.closed || s.currentTurn) continue;
@@ -1021,7 +1118,8 @@ async function dispatchCodeWave(session, codeToolUseId, waveNum, calls) {
   // to the script rather than fabricating an invalid client call.
   const validated = [];
   for (let i = 0; i < calls.length; i++) {
-    const { name, args } = calls[i];
+    const { name } = calls[i];
+    let { args } = calls[i];
     const meta = session.clientTools.get(name);
     if (!meta) {
       validated.push({
@@ -1031,6 +1129,25 @@ async function dispatchCodeWave(session, codeToolUseId, waveNum, calls) {
         inlineError: `unknown tool: ${name}`,
       });
       continue;
+    }
+    // Anchor editing in code mode: if the script passed anchor fields, translate
+    // them to byte-exact native old_string/new_string from the cached snapshot
+    // BEFORE schema validation (the native parser would otherwise reject the
+    // anchor shape). Native old_string args pass through untranslated.
+    let anchorPlan = null;
+    if (session.anchorEdit && ANCHORED_EDIT_TOOLS.has(name) && hasAnchorFields(name, args)) {
+      const t = translateEditInput(session.anchorState, name, args);
+      if (!t.ok) {
+        validated.push({
+          syntheticId: null,
+          tool: name,
+          args,
+          inlineError: `anchor edit translation failed for ${name}: ${t.reason}`,
+        });
+        continue;
+      }
+      args = t.input;
+      anchorPlan = t.plan;
     }
     const parser = session.inputParsers?.get(name);
     let syntheticArgs = args;
@@ -1049,7 +1166,7 @@ async function dispatchCodeWave(session, codeToolUseId, waveNum, calls) {
     }
     run.callCount++;
     const syntheticId = syntheticIdFor(codeToolUseId, waveNum, i);
-    validated.push({ syntheticId, tool: name, args: syntheticArgs, inlineError: null });
+    validated.push({ syntheticId, tool: name, args: syntheticArgs, inlineError: null, anchorPlan });
   }
 
   // If all calls in this wave are inline errors, return them directly without
@@ -1255,7 +1372,7 @@ function projectEvent(session, ev) {
   }
 }
 
-function createSession(key, model, tools, callerSystem, bucket, { resume, codeMode = serverCodeMode } = {}) {
+function createSession(key, model, tools, callerSystem, bucket, { resume, codeMode = serverCodeMode, anchorEdit = serverAnchorEdit, cwd = PROXY_CWD_FALLBACK } = {}) {
   const input = makeInputQueue();
   const abortController = new AbortController();
   const session = {
@@ -1265,7 +1382,14 @@ function createSession(key, model, tools, callerSystem, bucket, { resume, codeMo
     seenHash: hashMessages([], 0),// hash of that processed prefix (prefix-match guard)
     sdkSessionId: resume || null, // SDK-persisted session id for resume after cold start
     model,
+    cwd,                          // working directory baked into the SDK query() env block
     codeMode: !!codeMode,
+    anchorEdit: !!anchorEdit,      // anchor editing active (native rewrite + code-mode translation)
+    anchorState: anchorEdit ? createAnchorState() : null,
+    toolMeta: new Map(),          // tool_use id -> {name,input}; lets the resolve path anchor Read results
+    anchorRewrite: new Set(),     // content-block indices whose Edit input is being buffer-rewritten
+    anchorPendingInput: new Map(),// content-block index -> {name,input} captured for native rewrite
+    anchorEditPlans: new Map(),   // tool_use id -> reconcile plan; applied to the snapshot on client success
     originalNames: new Set(
       codeMode
         ? ["code", ...(tools || []).map((t) => t && t.name).filter(Boolean)]
@@ -1308,7 +1432,7 @@ function createSession(key, model, tools, callerSystem, bucket, { resume, codeMo
     mcpServers: mcpServer ? [mcpServer] : [],
     strictMcpConfig: true,
     permissionMode: "bypassPermissions", // MCP handlers (our parking tools) must run without prompts
-    cwd: HOME,
+    cwd,
     includePartialMessages: true,
     abortController,
   };
@@ -1341,6 +1465,12 @@ async function consumeSession(session) {
           session.streamedToolUses.length = 0;
           session.toolUseAccum.clear();
           session.resolvedResults.clear();
+          // Per-message anchor state. toolMeta/anchorPendingInput from the prior
+          // assistant message were already consumed (Read meta in the resolve
+          // path, Edit input in the native rewrite below) before this boundary.
+          session.toolMeta.clear();
+          session.anchorRewrite.clear();
+          session.anchorPendingInput.clear();
           if (session.codeMode) initMessageProjection(session);
         }
         // Assemble each streamed tool_use into a complete {id,name,input} record.
@@ -1362,6 +1492,12 @@ async function consumeSession(session) {
             let input = {};
             try { input = JSON.parse(a.partial || "{}"); } catch { input = {}; }
             session.streamedToolUses.push({ id: a.id, name: a.name, input });
+            // Record name+input so the resolve path can anchor Read results and
+            // the native rewrite below can translate Edit inputs at this stop.
+            session.toolMeta.set(a.id, { name: a.name, input });
+            if (session.anchorEdit && !session.codeMode && ANCHORED_EDIT_TOOLS.has(a.name)) {
+              session.anchorPendingInput.set(ev.index, { id: a.id, name: a.name, input });
+            }
             if (session.codeMode && a.name === "code") {
               startCodeRun(session, a.id, input);
             }
@@ -1388,7 +1524,7 @@ async function consumeSession(session) {
           }
         }
         if (session.codeMode) projectEvent(session, ev);
-        else writeEvent(session, ev);
+        else writeNativeEvent(session, ev);
         if (ev.type === "message_stop") endTurn(session);
       } else if (msg.type === "result") {
         if (msg.usage) {
@@ -1429,6 +1565,55 @@ function writeEvent(session, ev) {
   }
 }
 
+// Native-mode event writer with anchor rewrite. The model emits Edit/MultiEdit
+// in anchor shape, but the client executes the native shape. We withhold the
+// streamed input_json deltas for an anchored Edit block and re-emit a single
+// translated delta at content_block_stop, so the client receives byte-exact
+// old_string/new_string reconstructed from the cached Read snapshot. Everything
+// else passes straight through. The proxy's own correlation state
+// (streamedToolUses/toolMeta) keeps the original anchor input untouched.
+function writeNativeEvent(session, ev) {
+  if (!session.anchorEdit) return writeEvent(session, ev);
+
+  if (ev.type === "content_block_start" && ev.content_block?.type === "tool_use"
+      && ANCHORED_EDIT_TOOLS.has(ev.content_block.name)) {
+    session.anchorRewrite.add(ev.index);
+    return writeEvent(session, ev);
+  }
+
+  if (session.anchorRewrite.has(ev.index)) {
+    if (ev.type === "content_block_delta" && ev.delta?.type === "input_json_delta") {
+      return; // withheld; re-emitted translated at stop
+    }
+    if (ev.type === "content_block_stop") {
+      session.anchorRewrite.delete(ev.index);
+      const pending = session.anchorPendingInput.get(ev.index);
+      session.anchorPendingInput.delete(ev.index);
+      const name = pending?.name;
+      const input = pending?.input ?? {};
+      let finalInput = input;
+      if (name) {
+        const t = translateEditInput(session.anchorState, name, input);
+        if (t.ok) {
+          finalInput = t.input;
+          // Defer the snapshot reconcile until the client confirms success
+          // (resolveTool), so a failed edit never corrupts the live anchors.
+          if (pending?.id && t.plan) session.anchorEditPlans.set(pending.id, t.plan);
+        }
+        else process.stderr.write(`${LOG_PREFIX} anchor translate failed for ${name}: ${t.reason}; forwarding anchor input (client will error and model can re-read)\n`);
+      }
+      writeEvent(session, {
+        type: "content_block_delta",
+        index: ev.index,
+        delta: { type: "input_json_delta", partial_json: JSON.stringify(finalInput) },
+      });
+      return writeEvent(session, ev);
+    }
+  }
+
+  return writeEvent(session, ev);
+}
+
 // Abandon the current tool round: the parked handlers will never receive a
 // result (the query died, or the caller dropped the round by sending a fresh
 // user turn instead of a tool_result), so resolve each with isError to unblock
@@ -1447,6 +1632,10 @@ function abandonToolRound(session) {
   session.streamedToolUses.length = 0;
   session.orphanResolvers.length = 0;
   session.toolUseAccum.clear();
+  session.toolMeta?.clear();
+  session.anchorRewrite?.clear();
+  session.anchorPendingInput?.clear();
+  session.anchorEditPlans?.clear();
   if (session.codeMode) clearAllCodeState(session);
 }
 
@@ -1478,6 +1667,17 @@ function failTurn(session, err) {
 // parked yet).
 function resolveTool(session, toolUseId, result) {
   session.lastActivity = Date.now();
+  // Dirac-style reconcile: an edit the client confirmed (non-error) updates the
+  // cached snapshot so its anchors stay live for the next edit without a re-Read.
+  // A failed edit drops the plan untouched, leaving the prior snapshot intact.
+  if (session.anchorEdit && session.anchorState && session.anchorEditPlans?.has(toolUseId)) {
+    const plan = session.anchorEditPlans.get(toolUseId);
+    session.anchorEditPlans.delete(toolUseId);
+    if (!result?.isError) {
+      try { reconcileEdit(session.anchorState, plan); }
+      catch (e) { process.stderr.write(`${LOG_PREFIX} anchor reconcile failed for ${plan?.path}: ${String(e?.message || e).slice(0, 120)}\n`); }
+    }
+  }
   if (session.pendingTools.has(toolUseId)) {
     const resolve = session.pendingTools.get(toolUseId);
     session.pendingTools.delete(toolUseId);
@@ -1518,11 +1718,31 @@ async function resolveCodeModeToolResults(session, toolResults) {
       const result = toCallToolResult(tr);
       for (let i = 0; i < wave.calls.length; i++) {
         if (wave.calls[i].syntheticId === tr.tool_use_id) {
-          wave.results[i] = {
-            text: result.content?.[0]?.text || "",
+          const text = result.content?.[0]?.text || "";
+          const entry = {
+            text,
             raw: result,
             isError: !!result.isError,
           };
+          // Anchor editing: if this was a Read, cache the snapshot and expose an
+          // `.anchored` view (text with per-line anchor tokens) so the script can
+          // pass start_anchor/end_anchor to a later Edit. `.text` stays clean so
+          // scripts deriving old_string from raw bytes keep working unchanged.
+          // If this was a confirmed (non-error) anchored Edit, reconcile the
+          // snapshot so its anchors stay live for the next edit (Dirac-style),
+          // even within the same wave/script, without a re-Read.
+          if (session.anchorEdit && session.anchorState && !result.isError) {
+            const call = wave.calls[i];
+            if (call && ANCHORED_READ_TOOLS.has(call.tool) && call.args?.file_path) {
+              const { text: annotated, anchored } = annotateReadResult(session.anchorState, call.args.file_path, text);
+              if (anchored) entry.anchored = annotated;
+            }
+            if (call && call.anchorPlan) {
+              try { reconcileEdit(session.anchorState, call.anchorPlan); }
+              catch (e) { process.stderr.write(`${LOG_PREFIX} anchor reconcile failed for ${call.anchorPlan?.path}: ${String(e?.message || e).slice(0, 120)}\n`); }
+            }
+          }
+          wave.results[i] = entry;
           wave.pending.delete(tr.tool_use_id);
           session.syntheticToCode.delete(tr.tool_use_id);
           break;
@@ -1580,6 +1800,10 @@ async function handleMessages(req, res) {
   let codeMode = serverCodeMode;
   if (headerCode === "0" || headerCode === "false") codeMode = false;
   else if (headerCode === "1" || headerCode === "true") codeMode = true;
+  const headerAnchor = req.headers["x-anchor-edit"];
+  let anchorEdit = serverAnchorEdit;
+  if (headerAnchor === "0" || headerAnchor === "false") anchorEdit = false;
+  else if (headerAnchor === "1" || headerAnchor === "true") anchorEdit = true;
   const last = messages[messages.length - 1];
   const toolResults = Array.isArray(last?.content) ? last.content.filter((b) => b.type === "tool_result") : [];
   const lastIsToolResult = toolResults.length > 0;
@@ -1594,7 +1818,11 @@ async function handleMessages(req, res) {
     return typeof h === "string" && h.trim() ? h.trim() : null;
   })();
 
-  let session = findSession(messages, system, convId);
+  // Per-request working directory (see resolveCwd). Part of session identity so
+  // two projects never share a session; passed to the SDK query()'s env block.
+  const cwd = resolveCwd(req.headers["x-claude-cwd"]);
+
+  let session = findSession(messages, system, convId, cwd);
   let resumeCatchupTail = null;
   // "resolve" => feed tool_result(s) to the parked handler of a matched session.
   // "push"    => push the latest user turn into a matched session.
@@ -1608,8 +1836,11 @@ async function handleMessages(req, res) {
   } else if (session) {
     action = "push";
   } else if (messages.length > 1) {
-    const b = bucketKey(system, messages, convId);
-    {
+    const b = bucketKey(system, messages, convId, cwd);
+    // Resume is enabled for non-code sessions only; code-mode SDK resume is
+    // disabled (unproven, can park a turn to the watchdog). Code mode cold-starts
+    // into mimicry-safe narrative priming instead.
+    if (!codeMode) {
       const index = loadResumeIndex(resumeIndexFile);
       const candidate = findResumeCandidate({
         entries: index.entries,
@@ -1622,24 +1853,24 @@ async function handleMessages(req, res) {
         hashMessages,
       });
       if (candidate?.mode === "resume") {
-        session = createSession(randomUUID(), model, tools, callerSystem, b, { resume: candidate.sdkSessionId, codeMode });
+        session = createSession(randomUUID(), model, tools, callerSystem, b, { resume: candidate.sdkSessionId, codeMode, anchorEdit, cwd });
         action = "resume";
       } else if (candidate?.mode === "resume-catchup") {
-        session = createSession(randomUUID(), model, tools, callerSystem, b, { resume: candidate.sdkSessionId, codeMode });
+        session = createSession(randomUUID(), model, tools, callerSystem, b, { resume: candidate.sdkSessionId, codeMode, anchorEdit, cwd });
         action = "resume-catchup";
         resumeCatchupTail = candidate.tail;
       }
     }
     if (!session) {
-      session = createSession(randomUUID(), model, tools, callerSystem, b, { codeMode });
+      session = createSession(randomUUID(), model, tools, callerSystem, b, { codeMode, anchorEdit, cwd });
       action = "cold";
     }
   } else {
-    session = createSession(randomUUID(), model, tools, callerSystem, bucketKey(system, messages, convId), { codeMode });
+    session = createSession(randomUUID(), model, tools, callerSystem, bucketKey(system, messages, convId, cwd), { codeMode, anchorEdit, cwd });
     action = "new";
   }
 
-  process.stderr.write(`${LOG_PREFIX} request model=${model} stream=${isStream} codeMode=${codeMode} key=${session.key.slice(0, 8)} action=${action} tools=${tools?.length || 0} msgs=${messages.length} [${summarizeMessages(messages)}]\n`);
+  process.stderr.write(`${LOG_PREFIX} request model=${model} stream=${isStream} codeMode=${codeMode} anchorEdit=${session.anchorEdit} key=${session.key.slice(0, 8)} action=${action} cwd=${session.cwd} tools=${tools?.length || 0} msgs=${messages.length} [${summarizeMessages(messages)}]\n`);
   session.lastActivity = Date.now();
 
   // Attach this HTTP response as the session's current turn.
@@ -1675,7 +1906,7 @@ async function handleMessages(req, res) {
   // Drive the turn.
   if (action === "resolve") {
     if (session.codeMode) await resolveCodeModeToolResults(session, toolResults);
-    else for (const tr of toolResults) resolveTool(session, tr.tool_use_id, toCallToolResult(tr));
+    else for (const tr of toolResults) resolveTool(session, tr.tool_use_id, maybeAnchorReadResult(session, tr.tool_use_id, toCallToolResult(tr)));
   } else if (action === "resume") {
     session.input.push(toUserFrame(last));
   } else if (action === "resume-catchup") {
@@ -1759,9 +1990,10 @@ async function handleMessages(req, res) {
 
 // Start the HTTP server. Auth (CLAUDE_CONFIG_DIR / token) must already be applied
 // to process.env by the caller (src/auth.mjs). Returns the http.Server.
-export function startServer({ port = 32809, host = "127.0.0.1", account = null, profileDir = process.env.CLAUDE_CONFIG_DIR, version = null, codeMode = true, cacheLog = process.env.CACHE_LOG } = {}) {
+export function startServer({ port = 32809, host = "127.0.0.1", account = null, profileDir = process.env.CLAUDE_CONFIG_DIR, version = null, codeMode = true, anchorEdit = true, cacheLog = process.env.CACHE_LOG } = {}) {
   serverProfileDir = profileDir || null;
   serverCodeMode = codeMode !== false;
+  serverAnchorEdit = anchorEdit !== false;
   resumeIndexFile = defaultIndexPath();
   initCacheLog(cacheLog, profileDir);
   const server = http.createServer(async (req, res) => {
@@ -1780,6 +2012,7 @@ export function startServer({ port = 32809, host = "127.0.0.1", account = null, 
         sessions: sessions.size,
         fifoFallbacks: totalFifoFallbacks,
         codeMode: serverCodeMode,
+        anchorEdit: serverAnchorEdit,
         codeCalls: totalCodeCalls,
         codeSubCalls: totalCodeSubCalls,
         codeErrors: totalCodeErrors,
@@ -1890,11 +2123,16 @@ export {
   endTurn,
   resolveTool,
   writeEvent,
+  writeNativeEvent,
+  maybeAnchorReadResult,
+  advertisedToolSchema,
   accumulateStreamEvent,
   emitClientToolUse,
   serverCodeMode,
   normalizeModel,
   modelObject,
+  resolveCwd,
+  isValidCwd,
   totalCodeCalls,
   totalCodeSubCalls,
   totalCodeErrors,
