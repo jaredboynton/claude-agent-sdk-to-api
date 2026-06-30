@@ -9,6 +9,9 @@ import {
   hashMessages,
   renderMsgText,
   renderTranscript,
+  renderMsgPriming,
+  renderPrimingTranscript,
+  primingFrameText,
   findSession,
   markSeen,
   sessions,
@@ -20,6 +23,7 @@ import {
   normalizeToolInput,
   extractIdHint,
   abandonToolRound,
+  noteStreamTiming,
   raceTurn,
   toolInputShape,
 } from "../src/server.mjs";
@@ -215,6 +219,77 @@ test("renderTranscript labels roles and includes tool_result content", () => {
   assert.match(t, /User: /);
   assert.match(t, /Assistant: /);
   assert.match(t, /FILE BODY/);
+});
+
+test("renderMsgText (identity) keeps the literal tool grammar stable", () => {
+  // bucketKey/hashMessages depend on this exact format; it must NOT change.
+  const m = {
+    role: "assistant",
+    content: [
+      { type: "tool_use", name: "Read", input: { path: "a.txt" } },
+      { type: "thinking", thinking: "secret reasoning" },
+    ],
+  };
+  assert.equal(renderMsgText(m), '[tool_use Read] {"path":"a.txt"}\nsecret reasoning');
+});
+
+test("renderPrimingTranscript drops the mimicry grammar and thinking", () => {
+  const msgs = [
+    { role: "user", content: [{ type: "text", text: "edit the PRs" }] },
+    {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "internal plan that must not leak" },
+        { type: "text", text: "on it" },
+        { type: "tool_use", name: "Bash", input: { command: "gh pr edit 4" } },
+        { type: "tool_use", name: "Bash", input: { command: "gh pr edit 5" } },
+      ],
+    },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "https://example/pr/4" }] },
+  ];
+  const out = renderPrimingTranscript(msgs);
+  // No copyable tool-call grammar, no dialogue script, no leaked CoT.
+  assert.doesNotMatch(out, /\[tool_use /);
+  assert.doesNotMatch(out, /\[tool_result\]/);
+  assert.doesNotMatch(out, /^Assistant:/m);
+  assert.doesNotMatch(out, /^User:/m);
+  assert.doesNotMatch(out, /internal plan that must not leak/);
+  // Context is still conveyed.
+  assert.match(out, /gh pr edit 4/);
+  assert.match(out, /gh pr edit 5/);
+  assert.match(out, /example\/pr\/4/);
+  // Parallel calls collapse into a single clause (one "called the tools" phrase).
+  assert.equal(out.match(/called the tools/g).length, 1);
+});
+
+test("primingFrameText wraps in a read-only boundary with the instruction last", () => {
+  const t = primingFrameText("SUMMARY BODY");
+  assert.match(t, /^<prior_conversation_summary readonly="true">/);
+  assert.match(t, /SUMMARY BODY/);
+  assert.match(t, /issue real tool calls[^]*$/);
+  assert.ok(t.indexOf("SUMMARY BODY") < t.indexOf("issue real tool calls"));
+});
+
+test("renderMsgPriming returns null for empty/thinking-only messages", () => {
+  assert.equal(renderMsgPriming({ role: "assistant", content: [{ type: "thinking", thinking: "x" }] }), null);
+  assert.equal(renderMsgPriming(null), null);
+});
+
+test("noteStreamTiming flags tool-call mimicry in output text", () => {
+  const session = { key: "abc12345", turnMetrics: { action: "cold", firstEventAt: 1, textDeltas: 0 } };
+  const delta = (text) => ({ type: "content_block_delta", delta: { type: "text_delta", text } });
+  noteStreamTiming(session, delta("Sure, let me run "));
+  assert.ok(!session.turnMetrics.mimicry);
+  noteStreamTiming(session, delta("[tool_use Bash] {\"command\":\"ls\"}"));
+  assert.equal(session.turnMetrics.mimicry, true);
+});
+
+test("noteStreamTiming detects mimicry split across deltas", () => {
+  const session = { key: "abc12345", turnMetrics: { action: "cold", firstEventAt: 1, textDeltas: 0 } };
+  const delta = (text) => ({ type: "content_block_delta", delta: { type: "text_delta", text } });
+  noteStreamTiming(session, delta("...[tool_"));
+  noteStreamTiming(session, delta("use Read]"));
+  assert.equal(session.turnMetrics.mimicry, true);
 });
 
 test("toCallToolResult converts a tool_result to MCP shape", () => {

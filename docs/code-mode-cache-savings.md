@@ -1,6 +1,6 @@
 # Code Mode — Cache-Cost Savings Analysis
 
-_How the `code({ script })` meta-tool reduces Anthropic prompt-cache spend. Prices are the Opus 4.8 card ($/MTok): input $5.00, cache read $0.50 (0.1×), output $25.00, and cache write **$10.00 (1h, 2×)** — the bundled Claude Code (v2.1.196) puts SDK `querySource` on the `tengu_prompt_cache_1h_config` allowlist, so writes use the 1-hour TTL (5m at $6.25/1.25× applies only if forced via `FORCE_PROMPT_CACHING_5M`)._
+_How the `code({ script })` meta-tool reduces Anthropic prompt-cache spend. Prices are the Opus 4.8 card ($/MTok): input $5.00, cache read $0.50 (0.1×), **cache write $10.00 (1h TTL, 2×)**, output $25.00. Writes are priced at the 1-hour TTL throughout because the bundled Claude Code (v2.1.196) puts the SDK `querySource` on the `tengu_prompt_cache_1h_config` allowlist, so all SDK traffic uses 1h caching (the cheaper 5m write at $6.25/1.25× only applies if you force it via `FORCE_PROMPT_CACHING_5M`, which we don't), and the measured corpus confirms 99.7% of cache-creation tokens are 1h._
 
 > Status: **measured from receipts.** The code-mode figures below come from **594 code-mode turns across 64 conversations** captured by `--cache-log` (per-turn `read`/`create`/`input`/`output` + `codeWaves`/`codeSubCalls`/`scriptOutBytes`), priced with the Opus card. The normal-mode comparison baseline is **2,411 Claude Code sessions / 101,524 API responses** mined from local transcripts.
 
@@ -45,7 +45,7 @@ Normal-mode baseline mined from `~/.claude-/projects/**/*.jsonl` (2,411 sessions
 
 **Real Claude Code is serial.** Across 101,524 API responses, the model emits ~1 tool per turn and parallelizes only 7.3% of the time — so the round-trip lever (`p_n → p_c`) is ~2.5× (1.12 → 2.85 measured), roughly **double** an earlier per-line estimate (2.27) that was inflated by message splitting.
 
-**Cache TTL is 1h.** In the code-mode corpus, **99.7%** of cache-creation tokens are 1h (matching the normal-mode 92%), so writes are priced at $10/MTok (2×), not $6.25.
+**Cache TTL is 1h** (priced $10/MTok, 2× — see header). In the code-mode corpus, **99.7%** of cache-creation tokens are 1h, matching the normal-mode 92%.
 
 **Measured code-mode bill shape (594 turns / 64 conversations, $133 total spend):** cache **create 59%** / cache **read 31%** / output 9% / input 0.4% — cache ops = **90.5%** of the bill. read:create token ratio **10.7 : 1** (vs 23.6:1 normal mode — code mode roughly halves it). Mean cache **hit ratio 0.887**. Per conversation: mean **$2.08**, median **$1.40**, max $12.51.
 

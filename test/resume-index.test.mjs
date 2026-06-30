@@ -16,7 +16,7 @@ import {
   buildResumeCatchupFrames,
   MAX_CATCHUP_TAIL,
 } from "../src/resume-index.mjs";
-import { bucketKey, hashMessages, renderTranscript, toUserFrame, pushColdStartFrames } from "../src/server.mjs";
+import { bucketKey, hashMessages, renderPrimingTranscript, primingFrameText, toUserFrame, pushColdStartFrames } from "../src/server.mjs";
 
 const SYS = "you are helpful";
 const PK = profileKey("/Users/me/.claude");
@@ -170,22 +170,28 @@ test("buildResumeCatchupFrames summarizes prior tail and pushes last user", () =
     { role: "user", content: [{ type: "text", text: "u1" }] },
     { role: "user", content: [{ type: "text", text: "u2" }] },
   ];
-  const frames = buildResumeCatchupFrames(tail, { renderTranscript, toUserFrame, lastIsToolResult: false });
+  const frames = buildResumeCatchupFrames(tail, { renderTranscript: renderPrimingTranscript, wrap: primingFrameText, toUserFrame, lastIsToolResult: false });
   assert.equal(frames.length, 2);
-  assert.match(frames[0].message.content[0].text, /Context since your last saved state/);
+  assert.match(frames[0].message.content[0].text, /prior_conversation_summary readonly/);
   assert.match(frames[0].message.content[0].text, /u1/);
   assert.equal(frames[1].message.content[0].text, "u2");
 });
 
-test("buildResumeCatchupFrames for tool_result uses full tail narrative", () => {
+test("buildResumeCatchupFrames for tool_result uses mimicry-safe narrative", () => {
   const tail = [
     { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "Read", input: {} }] },
     { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "data" }] },
   ];
-  const frames = buildResumeCatchupFrames(tail, { renderTranscript, toUserFrame, lastIsToolResult: true });
+  const frames = buildResumeCatchupFrames(tail, { renderTranscript: renderPrimingTranscript, wrap: primingFrameText, toUserFrame, lastIsToolResult: true });
   assert.equal(frames.length, 1);
-  assert.match(frames[0].message.content[0].text, /Recent context/);
-  assert.match(frames[0].message.content[0].text, /tool_result/);
+  const text = frames[0].message.content[0].text;
+  assert.match(text, /prior_conversation_summary readonly/);
+  assert.match(text, /data/);
+  // The summary body (inside the boundary) must not carry the copyable grammar;
+  // the trailing instruction intentionally names the forbidden token.
+  const body = text.slice(0, text.indexOf("</prior_conversation_summary>"));
+  assert.doesNotMatch(body, /\[tool_use /);
+  assert.doesNotMatch(body, /\[tool_result\]/);
 });
 
 test("upsertResumeEntry round-trips through save and load", () => {
@@ -207,7 +213,7 @@ test("upsertResumeEntry round-trips through save and load", () => {
   assert.equal(loaded.entries[0].sdkSessionId, "sdk-abc");
 });
 
-test("pushColdStartFrames produces full-transcript priming plus last user", () => {
+test("pushColdStartFrames produces mimicry-safe priming plus last user", () => {
   const pushed = [];
   const messages = [
     { role: "user", content: [{ type: "text", text: "a" }] },
@@ -216,6 +222,105 @@ test("pushColdStartFrames produces full-transcript priming plus last user", () =
   const last = { role: "user", content: [{ type: "text", text: "c" }] };
   pushColdStartFrames({ input: { push: (m) => pushed.push(m) } }, [...messages, last], last, false);
   assert.equal(pushed.length, 2);
-  assert.match(pushed[0].message.content[0].text, /Full prior context/);
+  assert.match(pushed[0].message.content[0].text, /prior_conversation_summary readonly/);
+  assert.match(pushed[0].message.content[0].text, /issue real tool calls/);
   assert.equal(pushed[1].message.content[0].text, "c");
+});
+
+function codeEntry(seenCount, messages, sdkSessionId = "sdk-code-1") {
+  return { ...entry(seenCount, messages, sdkSessionId), codeMode: true };
+}
+
+test("findResumeCandidate accepts clean user tail for code mode", () => {
+  const base = [
+    { role: "user", content: [{ type: "text", text: "start" }] },
+    { role: "assistant", content: [{ type: "text", text: "ok" }] },
+  ];
+  const incoming = [...base, { role: "user", content: [{ type: "text", text: "next" }] }];
+  const cand = findResumeCandidate({
+    entries: [codeEntry(2, incoming)],
+    model: "claude-opus-4-8",
+    profileKey: PK,
+    bucket: BUCKET,
+    messages: incoming,
+    lastIsToolResult: false,
+    codeMode: true,
+    hashMessages,
+  });
+  assert.equal(cand?.mode, "resume");
+  assert.equal(cand?.sdkSessionId, "sdk-code-1");
+});
+
+test("findResumeCandidate refuses tool_result tail for code mode (synthetic ids)", () => {
+  const base = [
+    { role: "user", content: [{ type: "text", text: "start" }] },
+    { role: "assistant", content: [{ type: "text", text: "ok" }] },
+  ];
+  const incoming = [...base, { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_code_x_w0_0", content: "data" }] }];
+  const cand = findResumeCandidate({
+    entries: [codeEntry(2, incoming)],
+    model: "claude-opus-4-8",
+    profileKey: PK,
+    bucket: BUCKET,
+    messages: incoming,
+    lastIsToolResult: true,
+    codeMode: true,
+    hashMessages,
+  });
+  assert.equal(cand, null);
+});
+
+test("findResumeCandidate refuses multi-message catchup tail for code mode", () => {
+  const incoming = [
+    { role: "user", content: [{ type: "text", text: "start" }] },
+    { role: "assistant", content: [{ type: "text", text: "a" }] },
+    { role: "user", content: [{ type: "text", text: "b" }] },
+    { role: "user", content: [{ type: "text", text: "c" }] },
+    { role: "user", content: [{ type: "text", text: "d" }] },
+  ];
+  const cand = findResumeCandidate({
+    entries: [codeEntry(2, incoming)],
+    model: "claude-opus-4-8",
+    profileKey: PK,
+    bucket: BUCKET,
+    messages: incoming,
+    lastIsToolResult: false,
+    codeMode: true,
+    hashMessages,
+  });
+  assert.equal(cand, null);
+});
+
+test("findResumeCandidate isolates code-mode and non-code entries", () => {
+  const base = [
+    { role: "user", content: [{ type: "text", text: "start" }] },
+    { role: "assistant", content: [{ type: "text", text: "ok" }] },
+  ];
+  const incoming = [...base, { role: "user", content: [{ type: "text", text: "next" }] }];
+  // A code-mode entry must not satisfy a non-code request.
+  const nonCode = findResumeCandidate({
+    entries: [codeEntry(2, incoming)],
+    model: "claude-opus-4-8",
+    profileKey: PK,
+    bucket: BUCKET,
+    messages: incoming,
+    lastIsToolResult: false,
+    codeMode: false,
+    hashMessages,
+  });
+  assert.equal(nonCode, null);
+});
+
+test("upsertResumeEntry persists the codeMode flag", () => {
+  const messages = [{ role: "user", content: [{ type: "text", text: "start" }] }];
+  const updated = upsertResumeEntry({ entries: [] }, {
+    profileKey: PK,
+    bucket: BUCKET,
+    seenCount: 1,
+    seenHash: hashMessages(messages, 1),
+    sdkSessionId: "sdk-code-2",
+    model: "claude-opus-4-8",
+    codeMode: true,
+  });
+  assert.equal(updated.entries[0].codeMode, true);
 });

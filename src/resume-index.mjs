@@ -62,6 +62,7 @@ function pruneEntries(entries, now = Date.now()) {
  * @param {object[]} opts.messages
  * @param {string} opts.system
  * @param {boolean} opts.lastIsToolResult
+ * @param {boolean} [opts.codeMode]
  * @param {(messages: object[], n: number) => string} opts.hashMessages
  * @param {(system: string, messages: object[]) => string} opts.bucketKey
  */
@@ -72,12 +73,14 @@ export function findResumeCandidate({
   bucket,
   messages,
   lastIsToolResult,
+  codeMode = false,
   hashMessages,
 }) {
   const now = Date.now();
   const candidates = pruneEntries(entries || [], now)
     .filter((e) => e.profileKey === profileKey && e.bucket === bucket)
     .filter((e) => !e.model || e.model === model)
+    .filter((e) => !!e.codeMode === !!codeMode)
     .filter((e) => messages.length >= e.seenCount)
     .filter((e) => hashMessages(messages, e.seenCount) === e.seenHash)
     .sort((a, b) => b.seenCount - a.seenCount);
@@ -87,6 +90,21 @@ export function findResumeCandidate({
 
   const tail = messages.slice(best.seenCount);
   if (tail.length === 0) return null;
+
+  // Code mode: ONLY clean user-turn resume is safe. A tool_result tail carries
+  // synthetic toolu_code_* ids that a freshly-resumed SDK session cannot route,
+  // and resume-catchup would re-render the tail as narrative (the very mimicry
+  // we are avoiding). Anything else falls through to cold + safe priming.
+  if (codeMode) {
+    if (lastIsToolResult) return null;
+    if (tail.length === 1 && tail[0]?.role === "user") {
+      return { mode: "resume", sdkSessionId: best.sdkSessionId, seenCount: best.seenCount, tail };
+    }
+    if (tail.length === 2 && tail[0]?.role === "assistant" && tail[1]?.role === "user") {
+      return { mode: "resume", sdkSessionId: best.sdkSessionId, seenCount: best.seenCount, tail };
+    }
+    return null;
+  }
 
   // Evicted mid tool-loop: only resume if tail is small; caller handles frames.
   if (lastIsToolResult) {
@@ -121,6 +139,7 @@ export function upsertResumeEntry(index, entry, now = Date.now()) {
     seenHash: entry.seenHash,
     sdkSessionId: entry.sdkSessionId,
     model: entry.model,
+    codeMode: !!entry.codeMode,
     updatedAt: now,
   };
   const idx = entries.findIndex(
@@ -134,12 +153,16 @@ export function upsertResumeEntry(index, entry, now = Date.now()) {
 /**
  * Build SDK input frames for resume-catchup (small unseen tail only).
  */
-export function buildResumeCatchupFrames(tail, { renderTranscript, toUserFrame, lastIsToolResult }) {
+// `renderTranscript` must be the mimicry-safe priming renderer and `wrap` must
+// wrap a summary in the read-only boundary + anti-mimicry instruction (both
+// supplied by the server) so catch-up frames cannot teach the model the literal
+// tool-call grammar.
+export function buildResumeCatchupFrames(tail, { renderTranscript, wrap, toUserFrame, lastIsToolResult }) {
   const frames = [];
   if (lastIsToolResult) {
     frames.push(toUserFrame({
       role: "user",
-      content: [{ type: "text", text: `Continue from where we left off. Recent context since your last saved state:\n\n${renderTranscript(tail)}` }],
+      content: [{ type: "text", text: wrap(renderTranscript(tail)) }],
     }));
     return frames;
   }
@@ -148,7 +171,7 @@ export function buildResumeCatchupFrames(tail, { renderTranscript, toUserFrame, 
   if (prior.length) {
     frames.push(toUserFrame({
       role: "user",
-      content: [{ type: "text", text: `Continue this conversation. Context since your last saved state:\n\n${renderTranscript(prior)}` }],
+      content: [{ type: "text", text: wrap(renderTranscript(prior)) }],
     }));
   }
   frames.push(toUserFrame(last));

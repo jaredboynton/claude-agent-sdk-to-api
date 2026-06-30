@@ -186,6 +186,71 @@ function renderTranscript(messages) {
     .join("\n\n");
 }
 
+// renderMsgText (above) is the IDENTITY renderer: it feeds bucketKey/hashMessages
+// and must stay byte-stable, so it keeps the literal `[tool_use X] {json}` /
+// `[tool_result] ...` grammar. That exact grammar, when fed back to the model as
+// cold-start priming, is a near-perfect few-shot template the model copies — it
+// emits literal `[tool_use ...]` text and fabricates `User: [tool_result]` turns
+// instead of native tool_use blocks. The renderers below are a SEPARATE priming
+// surface that deliberately destroys that grammar: prose only, no bracket tags,
+// no standalone JSON, no Assistant:/User: dialogue script, thinking dropped.
+
+function previewJson(value, max = 200) {
+  let s;
+  try { s = JSON.stringify(value ?? {}); } catch { s = String(value); }
+  if (s.length > max) s = `${s.slice(0, max)}\u2026`;
+  return s;
+}
+
+function summarizePrimingResult(b, max = 400) {
+  const inner = Array.isArray(b.content)
+    ? b.content.map((x) => (x?.type === "text" ? x.text : JSON.stringify(x))).join(" ")
+    : String(b.content ?? "");
+  const t = inner.length > max ? `${inner.slice(0, max)}\u2026` : inner;
+  return b.is_error ? `error: ${t}` : t;
+}
+
+// Prose summary of one message for priming. Collapses ALL of a turn's tool calls
+// into a single clause (the repeated [tool_use]\n[tool_use] pattern is what fuels
+// the mimicry), omits thinking, and never uses the bracket grammar.
+function renderMsgPriming(m) {
+  if (!m) return null;
+  const c = Array.isArray(m.content) ? m.content : [{ type: "text", text: String(m.content ?? "") }];
+  const texts = [];
+  const calls = [];
+  const results = [];
+  for (const b of c) {
+    if (!b || typeof b !== "object") continue;
+    if (b.type === "text") { if (b.text) texts.push(b.text.trim()); }
+    else if (b.type === "tool_use") calls.push(`${b.name} ${previewJson(b.input)}`);
+    else if (b.type === "tool_result") results.push(summarizePrimingResult(b));
+    // thinking intentionally dropped — raw chain-of-thought must not leak.
+  }
+  const isAsst = m.role === "assistant";
+  const parts = [];
+  if (texts.length) parts.push(`${isAsst ? "You wrote" : "The user wrote"}: ${texts.join(" ")}`);
+  if (calls.length) parts.push(`${isAsst ? "you" : "the user"} called the tools ${calls.join(", ")}`);
+  if (results.length) parts.push(`those calls returned: ${results.join(" || ")}`);
+  if (!parts.length) return null;
+  return `${parts.join("; ")}.`;
+}
+
+// Full prior-context summary for cold-start priming. Mimicry-safe by construction.
+function renderPrimingTranscript(messages) {
+  return (messages || []).map(renderMsgPriming).filter(Boolean).join("\n");
+}
+
+// Wrap a priming summary in an explicit read-only boundary with the actionable
+// instruction placed AFTER the (long) summary so recency keeps it salient.
+function primingFrameText(summary) {
+  return (
+    `<prior_conversation_summary readonly="true">\n${summary}\n</prior_conversation_summary>\n\n` +
+    "The block above is a READ-ONLY summary of earlier conversation context, provided only so you can continue. " +
+    'Do NOT reproduce its wording or format, do NOT emit text like "[tool_use ...]" or "[tool_result]", and do NOT fabricate user messages or tool results. ' +
+    "Continue the conversation now; if you need to act, issue real tool calls using your normal tool-calling mechanism."
+  );
+}
+
 // One-line message summary for debug logs (never sent to the model).
 function summarizeMessages(messages) {
   return (messages || [])
@@ -566,6 +631,7 @@ let totalCodeErrors = 0;
 let totalCodeWaves = 0;
 let totalCacheReadTokens = 0;
 let totalCacheCreationTokens = 0;
+let totalMimicryDetections = 0;
 
 // Default code mode (opt-out: true unless profile/header disables).
 let serverCodeMode = true;
@@ -575,7 +641,12 @@ let serverProfileDir = null;
 let resumeIndexFile = defaultIndexPath();
 
 function persistResumeIndex(session, model, system, messages) {
-  if (!session.sdkSessionId || !serverProfileDir || session.codeMode) return;
+  if (!session.sdkSessionId || !serverProfileDir) return;
+  // Never checkpoint mid tool-round: a code-mode wave parks on synthetic
+  // toolu_code_* ids that live only in this process's memory. Recording a
+  // seenCount in that state would let a later resume rehydrate an SDK session
+  // that cannot route the still-outstanding synthetic tool_results.
+  if (hasActiveToolRound(session, { includeCurrentTurn: false })) return;
   try {
     const index = loadResumeIndex(resumeIndexFile);
     const updated = upsertResumeEntry(index, {
@@ -585,6 +656,7 @@ function persistResumeIndex(session, model, system, messages) {
       seenHash: session.seenHash,
       sdkSessionId: session.sdkSessionId,
       model,
+      codeMode: !!session.codeMode,
     });
     saveResumeIndex(updated, resumeIndexFile);
   } catch (e) {
@@ -600,7 +672,32 @@ function noteStreamTiming(session, ev) {
   }
   if (ev.type === "content_block_delta" && ev.delta?.type === "text_delta") {
     m.textDeltas++;
+    detectToolCallMimicry(session, m, ev.delta.text);
   }
+}
+
+// Matches the literal text grammar the model emits when it parrots a primed
+// transcript instead of issuing native tool calls: `[tool_use Name]`,
+// `[tool_result]`, or a fabricated `User: [tool_result]` turn.
+const MIMICRY_RE = /\[tool_use\s|\[tool_result\]|User:\s*\[tool_result/;
+
+// Detector ONLY (no auto-conversion): there is no parked MCP handler to receive
+// a tool_result for a text-emitted call, so converting would wedge the turn.
+// Counting + a one-shot structured log makes regressions of the cold-priming
+// fix observable instead of silent.
+function detectToolCallMimicry(session, m, text) {
+  if (m.mimicry || typeof text !== "string" || !text) return;
+  const tail = (m._mimicTail || "") + text;
+  if (MIMICRY_RE.test(tail)) {
+    m.mimicry = true;
+    totalMimicryDetections++;
+    process.stderr.write(
+      `${LOG_PREFIX} WARNING tool-call mimicry in output key=${session.key.slice(0, 8)}` +
+        ` action=${m.action} (model emitted literal tool-call text instead of a native tool_use)\n`
+    );
+    return;
+  }
+  m._mimicTail = tail.slice(-24);
 }
 
 // Fold one upstream message's usage (from message_start) into the global
@@ -671,13 +768,13 @@ function pushColdStartFrames(session, messages, last, lastIsToolResult) {
   if (lastIsToolResult) {
     session.input.push(toUserFrame({
       role: "user",
-      content: [{ type: "text", text: `Continue this conversation from where it left off. Full prior context:\n\n${renderTranscript(messages)}` }],
+      content: [{ type: "text", text: primingFrameText(renderPrimingTranscript(messages)) }],
     }));
     return;
   }
   session.input.push(toUserFrame({
     role: "user",
-    content: [{ type: "text", text: `Continue this conversation. Full prior context:\n\n${renderTranscript(messages.slice(0, -1))}` }],
+    content: [{ type: "text", text: primingFrameText(renderPrimingTranscript(messages.slice(0, -1))) }],
   }));
   session.input.push(toUserFrame(last));
 }
@@ -1512,7 +1609,7 @@ async function handleMessages(req, res) {
     action = "push";
   } else if (messages.length > 1) {
     const b = bucketKey(system, messages, convId);
-    if (!codeMode) {
+    {
       const index = loadResumeIndex(resumeIndexFile);
       const candidate = findResumeCandidate({
         entries: index.entries,
@@ -1521,6 +1618,7 @@ async function handleMessages(req, res) {
         bucket: b,
         messages,
         lastIsToolResult,
+        codeMode,
         hashMessages,
       });
       if (candidate?.mode === "resume") {
@@ -1582,7 +1680,8 @@ async function handleMessages(req, res) {
     session.input.push(toUserFrame(last));
   } else if (action === "resume-catchup") {
     for (const frame of buildResumeCatchupFrames(resumeCatchupTail || [], {
-      renderTranscript,
+      renderTranscript: renderPrimingTranscript,
+      wrap: primingFrameText,
       toUserFrame,
       lastIsToolResult,
     })) {
@@ -1752,6 +1851,9 @@ export {
   hashMessages,
   renderMsgText,
   renderTranscript,
+  renderMsgPriming,
+  renderPrimingTranscript,
+  primingFrameText,
   findSession,
   markSeen,
   sessions,
