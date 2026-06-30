@@ -1,6 +1,6 @@
-// Worker-side code-mode sandbox. Loaded inside a Worker so the parent can
-// terminate us on wall-clock timeout (node:vm's timeout does NOT bound async
-// continuations after an await, so a main-thread vm would hang the process).
+// Worker-side code-mode sandbox. Loaded inside a Worker so the parent stays
+// responsive while a model script runs (and can terminate it on abort). The
+// script may run as long as it needs — no time/wave/call caps by default.
 //
 // Protocol with the parent:
 //   parent -> worker: { type: "run", script, toolNames, maxWaves, maxCalls, timeoutMs }
@@ -20,8 +20,8 @@ let pending = [];
 let flushing = false;
 let waveSeq = 0;
 let callCount = 0;
-let maxWaves = 32;
-let maxCalls = 64;
+let maxWaves = 0; // 0 = unlimited
+let maxCalls = 0; // 0 = unlimited
 let timedOut = false;
 
 const JS_IDENT_RE = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
@@ -35,8 +35,8 @@ function makeCallTool(name) {
 }
 
 function callTool(name, args) {
-  if (timedOut) return Promise.reject(new Error("code script timed out"));
-  if (callCount >= maxCalls) {
+  if (timedOut) return Promise.reject(new Error("code script aborted"));
+  if (maxCalls > 0 && callCount >= maxCalls) {
     return Promise.resolve({
       text: `code call limit reached (${maxCalls} calls)`,
       raw: null,
@@ -63,7 +63,7 @@ async function flush() {
   const batch = pending;
   pending = [];
   waveSeq++;
-  if (waveSeq > maxWaves) {
+  if (maxWaves > 0 && waveSeq > maxWaves) {
     for (const c of batch) c.__resolve({ text: `code wave limit reached (${maxWaves} waves)`, raw: null, isError: true });
     flushing = false;
     return;
@@ -171,7 +171,9 @@ async function runScript(script, toolNames) {
       throw new Error("dynamic import() is denied in code mode scripts");
     },
   });
-  const out = scriptObj.runInContext(context, { timeout: 30000 });
+  // No vm timeout: scripts may run as long as they need (long tool waves,
+  // big in-script aggregation). The bridge's session lifecycle is the backstop.
+  const out = scriptObj.runInContext(context);
   return out instanceof Promise ? await out : out;
 }
 
@@ -192,8 +194,8 @@ parentPort.on("message", async (msg) => {
     return;
   }
   if (msg?.type === "run") {
-    maxWaves = msg.maxWaves ?? 32;
-    maxCalls = msg.maxCalls ?? 64;
+    maxWaves = msg.maxWaves ?? 0;
+    maxCalls = msg.maxCalls ?? 0;
     try {
       const value = await runScript(msg.script, msg.toolNames || []);
       if (timedOut) return;

@@ -96,7 +96,7 @@ The original client tools are still exposed alongside `code`, so clients keep th
 
 **Opt out:** set `"codeMode": false` on a profile in `profiles.json`, pass `--code-mode 0` to `claude-agent-api run`, or send `X-Code-Mode: 0` on a request.
 
-**Security:** scripts run in `node:vm` inside a Worker (so the parent can enforce wall-clock termination — `vm` timeout alone does not bound async continuations after an `await`). `node:vm` is not a hard security boundary and the script now orchestrates real I/O via the client's tools; the daemon is local and the model is already authorized to request tools, but do not expose this to untrusted callers without hardening (e.g. `isolated-vm`).
+**Security:** scripts run in `node:vm` inside a Worker (which keeps the parent responsive and lets it terminate the run on abort). By default there are no time/wave/call caps — a `code` script may run as long as it needs and make as many tool waves as it needs (set `CODE_SCRIPT_TIMEOUT_MS`/`CODE_MAX_WAVES`/`CODE_MAX_CALLS` only if you want a ceiling). `node:vm` is not a hard security boundary and the script orchestrates real I/O via the client's tools; the daemon is local and the model is already authorized to request tools, but do not expose this to untrusted callers without hardening (e.g. `isolated-vm`).
 
 Live validation (requires a running bridge):
 
@@ -112,10 +112,10 @@ Live validation (requires a running bridge):
 | `SESSION_TTL_MS` | `300000` | Idle session eviction (matches Claude prompt cache) |
 | `TOOL_TIMEOUT_MS` | `1800000` | Parked-tool watchdog; returns an error result so the loop survives |
 | `HEARTBEAT_MS` | `15000` | SSE keep-alive interval |
-| `CODE_SCRIPT_TIMEOUT_MS` | `30000` | Code-mode script Worker wall-clock timeout (parent terminates the worker) |
+| `CODE_SCRIPT_TIMEOUT_MS` | `0` (no cap) | Optional Worker wall-clock cap on a `code` script's own compute; `0` = unlimited |
 | `CODE_SCRIPT_MAX_OUTPUT_BYTES` | `32768` | Maximum collapsed code result before returning a "summarize smaller" error |
-| `CODE_MAX_WAVES` | `32` | Max tool-call waves per `code` run (each wave = one client round-trip) |
-| `CODE_MAX_CALLS` | `64` | Max total tool calls per `code` run |
+| `CODE_MAX_WAVES` | `0` (unlimited) | Optional cap on tool-call waves per `code` run; `0` = unlimited |
+| `CODE_MAX_CALLS` | `0` (unlimited) | Optional cap on total tool calls per `code` run; `0` = unlimited |
 | `X-Code-Mode` | (default on) | Per-request header: `0` disables, `1` enables code mode |
 | `CACHE_LOG` | (off) | `1`/`true` → append a per-turn usage row to `<profileDir>/cache-log.jsonl`; or set a path. Also `--cache-log [path]` on `run`, or `"cacheLog": true` per profile |
 

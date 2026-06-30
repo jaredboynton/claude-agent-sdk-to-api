@@ -16,9 +16,13 @@ import { Worker } from "node:worker_threads";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
-const DEFAULT_SCRIPT_TIMEOUT_MS = Number(process.env.CODE_SCRIPT_TIMEOUT_MS || 30000);
-const DEFAULT_MAX_WAVES = Number(process.env.CODE_MAX_WAVES || 32);
-const DEFAULT_MAX_CALLS = Number(process.env.CODE_MAX_CALLS || 64);
+// No execution caps by default: a code script may run as long as it needs and
+// make as many tool waves/calls as it needs. The parked `code` MCP handler and
+// the bridge's own session lifecycle are the real backstops. Set the env vars
+// to a positive number only if you explicitly want a ceiling.
+const DEFAULT_SCRIPT_TIMEOUT_MS = Number(process.env.CODE_SCRIPT_TIMEOUT_MS || 0);
+const DEFAULT_MAX_WAVES = Number(process.env.CODE_MAX_WAVES || 0);
+const DEFAULT_MAX_CALLS = Number(process.env.CODE_MAX_CALLS || 0);
 const DEFAULT_SCRIPT_OUTPUT_MAX_BYTES = Number(process.env.CODE_SCRIPT_MAX_OUTPUT_BYTES || 32768);
 
 const WORKER_PATH = join(dirname(fileURLToPath(import.meta.url)), "code-mode-worker.mjs");
@@ -26,20 +30,34 @@ const WORKER_PATH = join(dirname(fileURLToPath(import.meta.url)), "code-mode-wor
 export const CODE_MODE_APPEND = `
 
 <tool_use_guidance>
-You have a single tool, \`code\`, that runs an async JavaScript program. Inside the program, call client tools with:
+You have one tool, \`code\`, that runs an async JavaScript program. Inside it, call the client's tools and return a small result:
 
 \`\`\`
-const r = await tools.<Name>(args);          // any client tool below
-const r = await tools["Some-Tool-Name"](args); // non-identifier names
+const r = await tools.<Name>(args);            // any client tool listed below
+const r = await tools["Some-Tool-Name"](args); // names that aren't JS identifiers
 const r = await callTool(name, args);          // generic form
 \`\`\`
 
-Each call returns \`{ text, raw, isError }\`. Use \`r.text\` (string) or \`JSON.parse(r.text)\` when the tool returns JSON.
+Each call returns \`{ text, raw, isError }\`; use \`r.text\`, or \`JSON.parse(r.text)\` for JSON tools. Only the script's return value reaches you — raw tool output never enters your context.
 
-WHY THIS BEATS ONE-TOOL-AT-A-TIME: every turn you take re-reads the entire cached conversation, so round-trips dominate cost. A \`code\` call is ONE round-trip no matter how many tools it touches or how much branching it does. Tool waves inside \`code\` cost ZERO model cache reads.
+<principle>
+Favor intelligent logic and maximum parallelism. Do as much as possible in one \`code\` call: gather everything you can in parallel, then branch, loop, and aggregate in JavaScript. One \`code\` call is a single model round-trip no matter how many tools it touches, and the tool waves inside it cost nothing against your context. There is no time, wave, or call limit. Return for another \`code\` call only when you must show the user intermediate output or get their input.
+</principle>
 
-DEFAULT TO BATCHING. Before you call a tool, ask: "what else will I need that does not depend on this result?" Issue all of those in the SAME wave with \`await Promise.all([...])\`. Independent reads/searches/commands should almost never be separate \`await\`s. Example: to understand a repo you need \`git status\`, \`git log\`, \`git diff\`, and \`git show\` — these are independent, so run them in ONE wave, not four.
+<calling_tools>
+- Independent calls run together in one wave with \`await Promise.all([...])\`. Sequential \`await\`s for calls that don't depend on each other are the main thing to avoid — each is a wasted client round-trip. To survey a repo, fetch \`git status\`, \`git log\`, and \`git diff\` in one wave, not three.
+- Dependent calls stay in the script: feed one call's output into the next call's args, loop over a discovered set, branch on a status, retry on failure. A dependency is a reason to write a few more lines here, not to split into another \`code\` call or model turn.
+- Calls in one wave run in parallel with no ordering guarantee. Sequence steps that depend on each other's side effects (create a dir, then write into it) with separate \`await\`s.
+</calling_tools>
 
+<working_with_results>
+- Process results in the script: filter, count, join, diff, extract, summarize. Return the conclusion — a verdict, a few fields, a short summary — not raw file or search contents.
+- Editing: prefer the client's anchored search/replace editor (an \`old_string\`/\`new_string\`-style pair — read its signature below, don't assume a name) over rewriting whole files or lines. The #1 cause of failed edits is an \`old_string\` that doesn't byte-match the file, so COPY \`old_string\` VERBATIM from the bytes you just read (exact whitespace, indentation, and quotes) — never retype or reformat it from memory. Use the smallest snippet that is unique; if it isn't unique, extend it (add an adjacent line) rather than rewriting more, and match by content, not line numbers. Read the file and compute the exact old/new strings in the same script so its body never round-trips through you. Batch edits across different files in one wave; keep multiple edits to one file sequential. If there's no anchored editor, fall back to a write tool but still compute the content in-script from the read.
+- Use the client's tools directly (outside \`code\`) only for interactive, approval, user-input, or handoff tools whose native flow matters. Use \`code\` for ordinary read/search/write/shell/validation work.
+</working_with_results>
+
+<examples>
+Parallel gather, then summarize:
 \`\`\`
 const [status, log, diff] = await Promise.all([
   tools.Execute({ command: "git status" }),
@@ -49,59 +67,26 @@ const [status, log, diff] = await Promise.all([
 return { status: status.text, log: log.text, diffstat: diff.text };
 \`\`\`
 
-PATTERNS:
-- Batch independent work into one wave with \`await Promise.all([...])\`. Writing N sequential \`await\`s for calls that do not depend on each other is the most common mistake — each becomes its own client round-trip. (Still one model round-trip, but slower and noisier than necessary.)
-- Bake branching into the script. If the next step depends on a tool's result, do NOT return to the model. Use \`if/else\`, loops, and computation, then call the next tool from inside the script. This collapses dependent chains (read → decide → grep → read) into one \`code\` call. A typical script is: one wide \`Promise.all\` to gather, then logic, then maybe a second \`Promise.all\` for follow-up work.
-- Do the work in script: filter, count, join, diff, extract, summarize. Return only the conclusion. Raw tool output never enters your context — only the script's return value does.
+Dependent chain — one call's output drives the next, then fan out over the discovered set:
+\`\`\`
+const status = (await tools.Execute({ command: "git status --porcelain" })).text;
+if (!status.trim()) return { clean: true };
+const files = status.split("\\n").map(l => l.slice(3)).filter(Boolean);
+const diffs = await Promise.all(files.map(f => tools.Execute({ command: \\\`git diff -- \\\${f}\\\` })));
+return { changed: files.length, files: diffs.map((d, i) => ({ file: files[i], lines: d.text.split("\\n").length })) };
+\`\`\`
 
-LOGIC — write a real program, not one await per script. The script is a full async JS program; use real control flow so multi-step work resolves in ONE \`code\` call:
-
-- Retry / validate loop (bounded): act, inspect the result, fix, re-run — without a model round-trip per attempt.
+Bounded retry/validate loop — fix and re-run in-script, no model round-trip per attempt:
 \`\`\`
 let out;
 for (let i = 0; i < 3; i++) {
   out = JSON.parse((await tools.RunValidation({ argv: ["node", "--test"] })).text);
   if (out.exitCode === 0) break;
-  // derive a fix from out.stderr and apply it with an edit tool, then loop
-  await tools.Edit({ /* ... */ });
+  await tools.Edit({ /* derive a fix from out.stderr, then loop */ });
 }
-return { passed: out.exitCode === 0, attempts: i, stderr: out.stderr.slice(0, 400) };
+return { passed: out.exitCode === 0, attempts: i + 1, stderr: out.stderr.slice(0, 400) };
 \`\`\`
-- Dynamic fan-out + reduce: discover a set, act on all of it in one wave, then aggregate in JS. Return a verdict, never the raw set.
-\`\`\`
-const files = (await tools.Glob({ pattern: "**/*.test.mjs", folder: "." })).text.split("\\\\n").filter(Boolean);
-const bodies = await Promise.all(files.map(f => tools.Read({ path: f })));
-const failing = bodies.map((b, i) => ({ f: files[i], todo: (b.text.match(/TODO/g) || []).length }))
-  .filter(x => x.todo > 0).sort((a, b) => b.todo - a.todo).slice(0, 5);
-return { scanned: files.length, topTodo: failing };
-\`\`\`
-- Guard / short-circuit: run a cheap precondition first; only do the expensive wave if it passes. Early-return as soon as you have the answer.
-
-ORDERING / SAFETY:
-- Calls in the same wave run in parallel with no ordering guarantee. Do NOT batch order-dependent or side-effect-chained calls in one wave (create dir → write into it; write file → run command that reads it). Sequence those with separate \`await\`s.
-
-EDITING — prefer surgical, content-anchored edits over rewriting whole files or lines:
-- Use the client's anchored edit tool (a search/replace shape, e.g. \`old_string\`/\`new_string\` or \`old\`/\`new\` — check the tool's signature below; do NOT hardcode a name). Avoid full-file or whole-line rewrites; they are costly and error-prone.
-- Anchor on a UNIQUE, multi-line snippet of surrounding context and keep the replaced region (the hunk) MINIMAL. If the anchor is not unique, WIDEN the context until it is — never fall back to a full rewrite to dodge an ambiguous match. Do not rely on line numbers; match by content.
-- Read → edit in the SAME script: \`const f = await tools.Read({ path });\` then compute the exact old/new strings from \`f.text\` and call the edit tool — so the file body never round-trips through the model.
-- Batch edits to DIFFERENT files in one \`Promise.all\` wave; keep multiple edits to the SAME file sequential (later anchors must match the already-edited text).
-- If the client exposes no anchored editor, fall back to a write tool, but still compute the new content in-script from the read.
-
-RETURN: the script's return value is the only thing you see. Keep it small — a verdict, a summary, a count, a few fields — never raw file contents or full search output.
-
-Use direct client tools (outside \`code\`) only for interactive / approval / user-input / handoff tools whose native flow matters; for ordinary read/search/write/shell/validation work, use \`code\`.
-
-Example:
-\`\`\`
-code({
-  script: \`
-    const list = await tools.ListFiles({ path: "." });
-    const mds = list.text.split("\\\\n").filter(p => p.endsWith(".md"));
-    const reads = await Promise.all(mds.slice(0, 5).map(p => tools.ReadFile({ path: p })));
-    return { count: mds.length, sampled: reads.map(r => r.text.slice(0, 200)) };
-  \`
-})
-\`\`\`
+</examples>
 </tool_use_guidance>`;
 
 export class CodeValidationError extends Error {
@@ -274,15 +259,16 @@ export function buildCodeToolDescription(clientTools) {
   const toolBlocks = entries.map(([name, meta]) => describeClientTool(name, meta));
   return (
     "Run a full async JavaScript program that calls the client's tools and returns a summary. "
+    + "ALWAYS favor intelligent logic, and ALWAYS favor maximum batching and parallelism: push branching/loops/retries/aggregation into the script and run every independent operation together in one parallel wave. There is no time, wave, or call limit — one code call can do an entire task. "
     + "Prefer this for non-interactive read/search/write/shell/validation work; use original tools directly for interactive, approval, handoff, or native-UI flows. "
     + "Call tools with `await tools.<Name>(args)`, `await tools[\"Any-Name\"]`, or `await callTool(name, args)`; each returns `{ text, raw, isError }` (JSON.parse r.text when the tool returns JSON). "
     + "args MUST match the TypeScript signature for that tool below: a trailing ? marks an optional field, "
     + "\"a\" | \"b\" lists the allowed literal values, and Array<T> is an array. "
     + "Descriptions, comments, defaults, examples, formats, and patterns come from the client schema; follow them exactly. "
-    + "Bake branching/loops into the script — if the next step depends on a tool's result, do NOT return to the model; call the next tool from inside the script. "
+    + "Bake branching/loops into the script — if the next step DEPENDS on a tool's result, do NOT return to the model: feed one call's output into the next call's args, loop over a result set, branch on a status, retry on failure — all in the same script. A dependent chain is a reason to write more JavaScript, not to split into more code calls or model turns. "
     + "DEFAULT TO BATCHING: issue all independent calls in one wave with `await Promise.all([...])` (e.g. git status + git log + git diff together, not as separate awaits). Sequential `await`s for independent calls are the most common mistake. "
     + "Write real logic: loops, bounded retry/validate, fan-out+reduce, guards/early-return — not one await per script. "
-    + "Edit via the client's anchored search/replace tool using a unique multi-line anchor and a minimal hunk; read-then-edit in the same script; avoid full-file or whole-line rewrites. "
+    + "Edit via the client's anchored search/replace tool: read the file, copy old_string VERBATIM from the bytes you read (exact whitespace) — the top cause of failed edits is a mismatched old_string — use the smallest unique snippet, edit in the same script, and avoid full-file or whole-line rewrites. "
     + "Do not put order-dependent or side-effect-chained calls (create dir → write into it) in one wave. "
     + "Return only the conclusion — only the script's return value is seen by the assistant.\n\n"
     + (toolBlocks.length ? `Available tools:\n\n${toolBlocks.join("\n\n")}` : "Available tools: (none)")

@@ -67,9 +67,9 @@ const TOOL_TIMEOUT_MS = Number(process.env.TOOL_TIMEOUT_MS || process.env.ACP_TO
 // SDK from emitting message_stop and the per-handler TOOL_TIMEOUT_MS somehow
 // doesn't fire).
 const TURN_TIMEOUT_MS = Number(process.env.TURN_TIMEOUT_MS || process.env.ACP_TURN_TIMEOUT_MS || 300000);
-const CODE_SCRIPT_TIMEOUT_MS = Number(process.env.CODE_SCRIPT_TIMEOUT_MS || 30000);
-const CODE_MAX_WAVES = Number(process.env.CODE_MAX_WAVES || 32);
-const CODE_MAX_CALLS = Number(process.env.CODE_MAX_CALLS || 64);
+const CODE_SCRIPT_TIMEOUT_MS = Number(process.env.CODE_SCRIPT_TIMEOUT_MS || 0); // 0 = no cap
+const CODE_MAX_WAVES = Number(process.env.CODE_MAX_WAVES || 0); // 0 = unlimited
+const CODE_MAX_CALLS = Number(process.env.CODE_MAX_CALLS || 0); // 0 = unlimited
 const LOG_PREFIX = "[claude-agent-api]";
 
 // Models surfaced via the /v1/models catalog so Claude Code's startup model

@@ -244,16 +244,22 @@ test("buildCodeToolDescription script-first guidance mentions tools.X and Promis
 
 test("buildCodeToolDescription includes intelligent-logic and anchored-edit guidance", () => {
   const d = buildCodeToolDescription(new Map());
+  // core principle: always favor logic + batching/parallelism, no caps
+  assert.match(d, /ALWAYS favor intelligent logic/);
+  assert.match(d, /maximum batching and parallelism/);
+  assert.match(d, /no time, wave, or call limit/);
   // logic: real control flow, not one await per script
   assert.match(d, /Write real logic/);
   assert.match(d, /retry/i);
   assert.match(d, /fan-out\+reduce/);
   assert.match(d, /not one await per script/);
-  // editing: anchored search/replace, unique anchor, minimal hunk, read-then-edit
+  // dependent steps: script them rather than splitting into more code calls
+  assert.match(d, /DEPENDS on a tool's result/);
+  assert.match(d, /feed one call's output into the next/);
+  // editing: anchored search/replace, verbatim old_string, smallest unique snippet
   assert.match(d, /anchored search\/replace/);
-  assert.match(d, /unique multi-line anchor/);
-  assert.match(d, /minimal hunk/);
-  assert.match(d, /read-then-edit/);
+  assert.match(d, /copy old_string VERBATIM/);
+  assert.match(d, /smallest unique snippet/);
   assert.match(d, /avoid full-file or whole-line rewrites/);
 });
 
