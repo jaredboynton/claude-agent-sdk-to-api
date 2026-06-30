@@ -161,12 +161,30 @@ async function runScript(script, toolNames) {
   });
 
   const wrapped = `(async () => { ${script} })()`;
-  const scriptObj = new vm.Script(wrapped, { filename: "code-mode-script.vm" });
+  // Deny dynamic import() — never let a script load modules out of the sandbox.
+  // We provide a throwing callback, but node still surfaces its own message
+  // unless run with --experimental-vm-modules; normalizeRunError() below
+  // rewrites either form into a clear denial the script can catch/recover from.
+  const scriptObj = new vm.Script(wrapped, {
+    filename: "code-mode-script.vm",
+    importModuleDynamically: () => {
+      throw new Error("dynamic import() is denied in code mode scripts");
+    },
+  });
   const out = scriptObj.runInContext(context, { timeout: 30000 });
   return out instanceof Promise ? await out : out;
 }
 
 const workerLogs = [];
+
+// Rewrite node's dynamic-import internals message into a clear denial.
+function normalizeRunError(err) {
+  const msg = err?.message || String(err);
+  if (/dynamic import callback|experimental-vm-modules/i.test(msg)) {
+    return "dynamic import() is denied in code mode scripts";
+  }
+  return msg;
+}
 
 parentPort.on("message", async (msg) => {
   if (msg?.type === "wave_result") {
@@ -190,7 +208,7 @@ parentPort.on("message", async (msg) => {
       if (timedOut) return;
       postToParent({
         type: "done",
-        error: err?.message || String(err),
+        error: normalizeRunError(err),
         logs: workerLogs.slice(),
         waves: waveSeq,
         calls: callCount,

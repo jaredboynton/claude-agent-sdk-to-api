@@ -376,6 +376,21 @@ test("runCodeScriptDynamic: denies require/process/setTimeout", async () => {
   }
 });
 
+test("runCodeScriptDynamic: denies dynamic import() with a clean error (no crash)", async () => {
+  const r = await runCodeScriptDynamic("const fs = await import('node:fs'); return 'reached';", {
+    toolNames: [], dispatchWave: async () => [], timeoutMs: 2000,
+  });
+  assert.match(r.error, /dynamic import\(\) is denied/);
+  assert.equal(r.value, null);
+});
+
+test("runCodeScriptDynamic: script can catch a denied import and recover", async () => {
+  const r = await runCodeScriptDynamic("try { await import('node:fs'); return 'imported'; } catch { return 'recovered'; }", {
+    toolNames: [], dispatchWave: async () => [], timeoutMs: 2000,
+  });
+  assert.equal(r.value, "recovered");
+});
+
 // ---------------------------------------------------------------------------
 // syntheticIdFor (wave-component aware)
 // ---------------------------------------------------------------------------
