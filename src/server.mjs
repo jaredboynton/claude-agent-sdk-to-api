@@ -1627,7 +1627,10 @@ export function startServer({ port = 32809, host = "127.0.0.1", account = null, 
   resumeIndexFile = defaultIndexPath();
   initCacheLog(cacheLog, profileDir);
   const server = http.createServer(async (req, res) => {
-    const url = req.url || "";
+    const rawUrl = req.url || "";
+    // Match on pathname only; clients append query strings like
+    // `/v1/messages?beta=true` (Claude Code) that must not break routing.
+    const url = rawUrl.split("?")[0];
     if (req.method === "GET" && (url === "/healthz" || url === "/")) {
       return jsonResp(res, 200, {
         ok: true,
