@@ -38,9 +38,20 @@ Each call returns \`{ text, raw, isError }\`. Use \`r.text\` (string) or \`JSON.
 
 WHY THIS BEATS ONE-TOOL-AT-A-TIME: every turn you take re-reads the entire cached conversation, so round-trips dominate cost. A \`code\` call is ONE round-trip no matter how many tools it touches or how much branching it does. Tool waves inside \`code\` cost ZERO model cache reads.
 
+DEFAULT TO BATCHING. Before you call a tool, ask: "what else will I need that does not depend on this result?" Issue all of those in the SAME wave with \`await Promise.all([...])\`. Independent reads/searches/commands should almost never be separate \`await\`s. Example: to understand a repo you need \`git status\`, \`git log\`, \`git diff\`, and \`git show\` — these are independent, so run them in ONE wave, not four.
+
+\`\`\`
+const [status, log, diff] = await Promise.all([
+  tools.Execute({ command: "git status" }),
+  tools.Execute({ command: "git log --oneline -15" }),
+  tools.Execute({ command: "git diff --stat" }),
+]);
+return { status: status.text, log: log.text, diffstat: diff.text };
+\`\`\`
+
 PATTERNS:
-- Bake branching into the script. If the next step depends on a tool's result, do NOT return to the model. Use \`if/else\`, loops, and computation, then call the next tool from inside the script. This collapses dependent chains (read → decide → grep → read) into one \`code\` call.
-- Parallelize independent calls with \`await Promise.all([tools.A(...), tools.B(...)])\` — they execute in one wave. Sequential \`await\`s are sequential waves (still one model round-trip, but more client round-trips).
+- Batch independent work into one wave with \`await Promise.all([...])\`. Writing N sequential \`await\`s for calls that do not depend on each other is the most common mistake — each becomes its own client round-trip. (Still one model round-trip, but slower and noisier than necessary.)
+- Bake branching into the script. If the next step depends on a tool's result, do NOT return to the model. Use \`if/else\`, loops, and computation, then call the next tool from inside the script. This collapses dependent chains (read → decide → grep → read) into one \`code\` call. A typical script is: one wide \`Promise.all\` to gather, then logic, then maybe a second \`Promise.all\` for follow-up work.
 - Do the work in script: filter, count, join, diff, extract, summarize. Return only the conclusion. Raw tool output never enters your context — only the script's return value does.
 
 ORDERING / SAFETY:
@@ -239,7 +250,7 @@ export function buildCodeToolDescription(clientTools) {
     + "\"a\" | \"b\" lists the allowed literal values, and Array<T> is an array. "
     + "Descriptions, comments, defaults, examples, formats, and patterns come from the client schema; follow them exactly. "
     + "Bake branching/loops into the script — if the next step depends on a tool's result, do NOT return to the model; call the next tool from inside the script. "
-    + "Wrap independent calls in `Promise.all([...])` to run them in one parallel wave; sequential `await`s are sequential waves. "
+    + "DEFAULT TO BATCHING: issue all independent calls in one wave with `await Promise.all([...])` (e.g. git status + git log + git diff together, not as separate awaits). Sequential `await`s for independent calls are the most common mistake. "
     + "Do not put order-dependent or side-effect-chained calls (create dir → write into it) in one wave. "
     + "Return only the conclusion — only the script's return value is seen by the assistant.\n\n"
     + (toolBlocks.length ? `Available tools:\n\n${toolBlocks.join("\n\n")}` : "Available tools: (none)")

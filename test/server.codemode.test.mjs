@@ -239,6 +239,7 @@ test("buildCodeToolDescription script-first guidance mentions tools.X and Promis
   assert.match(d, /Promise\.all/);
   assert.match(d, /Bake branching/);
   assert.match(d, /order-dependent/);
+  assert.match(d, /DEFAULT TO BATCHING/);
 });
 
 // ---------------------------------------------------------------------------
