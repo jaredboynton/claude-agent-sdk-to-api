@@ -24,10 +24,12 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync } from "
 import { setupAuth, resolveProfileDir, readProfileAccount, expandHome } from "../src/auth.mjs";
 import { startServer } from "../src/server.mjs";
 import { loadProfilesConfig, defaultConfigPath } from "../src/config.mjs";
+import { startAutoUpdateLoop, defaultStatePath } from "../src/self-update.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PKG_ROOT = join(__dirname, "..");
 const HOME = homedir();
+const PKG = JSON.parse(readFileSync(join(PKG_ROOT, "package.json"), "utf8"));
 
 function parseArgs(argv) {
   const args = { _: [] };
@@ -71,7 +73,16 @@ function cmdRun(args) {
       (auth.account?.email ? ` account=${auth.account.email}` : "") +
       "\n"
   );
-  startServer({ port, host, account: auth.account, profileDir: auth.configDir });
+  startServer({ port, host, account: auth.account, profileDir: auth.configDir, version: PKG.version });
+
+  if (!args["no-self-update"] && process.env.CLAUDE_AGENT_API_NO_SELF_UPDATE !== "1") {
+    startAutoUpdateLoop({
+      pkgName: PKG.name,
+      ownInstallDir: PKG_ROOT,
+      currentVersion: PKG.version,
+      statePath: defaultStatePath(HOME),
+    });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -99,8 +110,8 @@ function cmdStartAll(args) {
   for (const p of config.profiles) {
     const child = spawn(
       process.execPath,
-      [join(__dirname, "cli.mjs"), "run", "--profile", p.configDir, "--port", String(p.port), "--host", p.host],
-      { stdio: ["ignore", "inherit", "inherit"], env: { ...process.env } }
+      [join(__dirname, "cli.mjs"), "run", "--no-self-update", "--profile", p.configDir, "--port", String(p.port), "--host", p.host],
+      { stdio: ["ignore", "inherit", "inherit"], env: { ...process.env, CLAUDE_AGENT_API_NO_SELF_UPDATE: "1" } }
     );
     process.stderr.write(`claude-agent-api: [${p.name}] pid=${child.pid} port=${p.port} configDir=${p.configDir}\n`);
     children.push({ p, child });
@@ -212,6 +223,8 @@ function cmdInstall(args) {
       const xml = renderTemplate(tpl, {
         LABEL: label, NODE: nodeBin, SERVER: serverPath, PROFILE: p.configDir,
         PORT: String(p.port), HOST: p.host,
+        HOME,
+        PATH: [dirname(nodeBin), join(HOME, ".local", "bin"), "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"].join(":"),
         STDOUT: join(logDir, `claude-agent-api.${p.name}.out.log`),
         STDERR: join(logDir, `claude-agent-api.${p.name}.err.log`),
       });
@@ -274,7 +287,7 @@ function usage() {
   process.stdout.write(
     `claude-agent-api — expose the Claude Agent SDK as an Anthropic /v1/messages API\n\n` +
       `Usage:\n` +
-      `  claude-agent-api [run] --profile <configDir> --port <n> [--host h] [--token-file f]\n` +
+      `  claude-agent-api [run] --profile <configDir> --port <n> [--host h] [--token-file f] [--no-self-update]\n` +
       `  claude-agent-api start-all [--config profiles.json]\n` +
       `  claude-agent-api install   [--config profiles.json]\n` +
       `  claude-agent-api uninstall [--config profiles.json]\n` +

@@ -1,0 +1,5 @@
+{
+  "profiles": [
+    { "name": "factory", "configDir": "~/.claude-", "port": 32809, "host": "127.0.0.1" }
+  ]
+}

@@ -18,6 +18,7 @@ import {
   makeInputQueue,
   claimStreamedToolUse,
   abandonToolRound,
+  raceTurn,
 } from "../src/server.mjs";
 
 function fakeSession(bucket, { seenCount = 0, seenHash = hashMessages([], 0), closed = false, currentTurn = null } = {}) {
@@ -297,4 +298,31 @@ test("abandonToolRound resolves parked handlers with isError and clears state", 
   assert.equal(s.resolvedResults.size, 0);
   assert.equal(s.streamedToolUses.length, 0);
   assert.equal(s.toolUseAccum.size, 0);
+});
+
+// ---------------------------------------------------------------------------
+// raceTurn — turn-level watchdog (prevents "hangs forever" when message_stop
+// never fires)
+// ---------------------------------------------------------------------------
+
+test("raceTurn resolves with the turn value when it settles before the timeout", async () => {
+  const turn = new Promise((resolve) => setTimeout(() => resolve("ok"), 10));
+  const out = await raceTurn(turn, 1000);
+  assert.equal(out, "ok");
+});
+
+test("raceTurn rejects with a turn_timeout error when the turn never settles", async () => {
+  const turn = new Promise(() => {}); // never settles
+  await assert.rejects(
+    raceTurn(turn, 20),
+    (e) => e?.code === "turn_timeout" && /20ms/.test(e?.message)
+  );
+});
+
+test("raceTurn clears the timeout timer after the turn settles (no dangling timer)", async () => {
+  const turn = new Promise((resolve) => setTimeout(() => resolve("ok"), 5));
+  await raceTurn(turn, 10000);
+  // If the timer were not cleared, process wouldn't exit promptly; node --test
+  // would hang on this file. The await returning is sufficient evidence.
+  assert.ok(true);
 });

@@ -42,7 +42,29 @@ const HOME = homedir();
 const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS || process.env.ACP_SESSION_TTL_MS || 300000); // 5 min
 const HEARTBEAT_MS = Number(process.env.HEARTBEAT_MS || process.env.ACP_HEARTBEAT_MS || 15000);
 const TOOL_TIMEOUT_MS = Number(process.env.TOOL_TIMEOUT_MS || process.env.ACP_TOOL_TIMEOUT_MS || 270000); // 4.5 min; must stay under SESSION_TTL_MS
+// Turn-level watchdog: backstop for any path where message_stop never fires
+// (e.g. the SDK stream goes quiet mid-thinking, or a parked handler blocks the
+// SDK from emitting message_stop and the per-handler TOOL_TIMEOUT_MS somehow
+// doesn't fire). Must be > TOOL_TIMEOUT_MS so the handler park timeout gets the
+// first chance to unblock the loop; default matches SESSION_TTL_MS.
+const TURN_TIMEOUT_MS = Number(process.env.TURN_TIMEOUT_MS || process.env.ACP_TURN_TIMEOUT_MS || 300000);
 const LOG_PREFIX = "[claude-agent-api]";
+
+// Race an HTTP turn promise against a wall-clock timeout. Resolves with the
+// turn's value if it settles in time; otherwise rejects with a typed timeout
+// error so the caller can failTurn + abandon the tool round + surface an error
+// to the client instead of hanging forever.
+function raceTurn(turnPromise, timeoutMs = TURN_TIMEOUT_MS) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      const err = new Error(`turn did not complete within ${timeoutMs}ms`);
+      err.code = "turn_timeout";
+      reject(err);
+    }, timeoutMs);
+  });
+  return Promise.race([turnPromise, timeout]).finally(() => clearTimeout(timer));
+}
 
 // Extract system prompt text from Anthropic `system` field (string or array).
 function extractSystemText(system) {
@@ -696,9 +718,21 @@ async function handleMessages(req, res) {
   markSeen(session, messages);
 
   try {
-    await turnPromise;
+    await raceTurn(turnPromise, TURN_TIMEOUT_MS);
   } catch (e) {
-    process.stderr.write(`${LOG_PREFIX} turn failed (${session.key}): ${e?.message || e}\n`);
+    const isTimeout = e?.code === "turn_timeout";
+    process.stderr.write(
+      `${LOG_PREFIX} turn failed (${session.key}): ${e?.message || e}` +
+        (isTimeout
+          ? ` wedged: pendingTools=${session.pendingTools.size} streamedToolUses=${session.streamedToolUses.length} orphanResolvers=${session.orphanResolvers.length} resolvedResults=${session.resolvedResults.size}\n`
+          : "\n")
+    );
+    // A timeout means the turn is still attached and the SDK loop may still be
+    // parked on a tool handler: settle the turn and abandon the round so the
+    // SDK is unblocked (parked handlers resolve with isError) rather than left
+    // to hang. consumeSession-initiated failures have already called failTurn
+    // (currentTurn is null here), so the guard avoids a double settle.
+    if (session.currentTurn) failTurn(session, e);
     if (isStream) {
       if (!res.writableEnded) {
         res.write(sseEvent("error", { type: "error", error: { type: "api_error", message: String(e?.message || e) } }));
@@ -739,13 +773,14 @@ async function handleMessages(req, res) {
 
 // Start the HTTP server. Auth (CLAUDE_CONFIG_DIR / token) must already be applied
 // to process.env by the caller (src/auth.mjs). Returns the http.Server.
-export function startServer({ port = 32809, host = "127.0.0.1", account = null, profileDir = process.env.CLAUDE_CONFIG_DIR } = {}) {
+export function startServer({ port = 32809, host = "127.0.0.1", account = null, profileDir = process.env.CLAUDE_CONFIG_DIR, version = null } = {}) {
   const server = http.createServer(async (req, res) => {
     const url = req.url || "";
     if (req.method === "GET" && (url === "/healthz" || url === "/")) {
       return jsonResp(res, 200, {
         ok: true,
         service: "claude-agent-api",
+        version,
         port,
         profileDir: profileDir || null,
         account: account?.email || null,
@@ -799,4 +834,5 @@ export {
   claimStreamedToolUse,
   abandonToolRound,
   buildParkingMcpServer,
+  raceTurn,
 };
