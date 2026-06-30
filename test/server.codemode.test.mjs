@@ -29,7 +29,9 @@ import {
   hasActiveToolRound,
   normalizeModel,
   modelObject,
-  maybeDispatchQueuedWave,
+  dispatchCodeWave,
+  resolveCodeModeToolResults,
+  notifyTurnAttached,
 } from "../src/server.mjs";
 
 const GREP_SCHEMA = {
@@ -545,6 +547,88 @@ test("projectEvent projects normally when not codeDriving (no code block)", () =
   assert.equal(starts[0].content_block.type, "text");
 });
 
+test("dispatchCodeWave emits immediately on the attached HTTP turn", async () => {
+  const events = [];
+  let resolvedTurn = false;
+  const session = fakeCodeSession({
+    model: "claude-opus-4-8",
+    currentTurn: { resolve: () => { resolvedTurn = true; } },
+    res: { writableEnded: false, write: (s) => { const m = s.match(/^data: (.+)\n\n$/m); if (m) events.push(JSON.parse(m[1])); } },
+  });
+  initMessageProjection(session);
+  const codeId = "toolu_code_main";
+  const syn0 = syntheticIdFor(codeId, 1, 0);
+  session.codeRun = {
+    codeId,
+    aborted: false,
+    currentWave: null,
+    preamble: null,
+    waveSeq: 0,
+    waveCount: 0,
+    callCount: 0,
+  };
+
+  const resultPromise = dispatchCodeWave(session, codeId, 1, [
+    { name: "Grep", args: { pattern: "x", path: "/r" } },
+  ]);
+
+  assert.equal(resolvedTurn, true, "HTTP turn closed so the client can execute the tool");
+  assert.equal(session.codeRun.currentWave?.waveNum, 1);
+  assert.equal(session.codeRun.currentWave?.dispatched, true);
+  assert.equal(session.codeRun.currentWave?.pending.has(syn0), true);
+  const tu = events.find((e) => e.type === "content_block_start" && e.content_block?.type === "tool_use");
+  assert.equal(tu?.content_block?.id, syn0);
+  assert.equal(tu?.content_block?.name, "Grep");
+
+  await resolveCodeModeToolResults(session, [
+    { tool_use_id: syn0, content: [{ type: "text", text: "ok" }] },
+  ]);
+  const results = await resultPromise;
+  assert.equal(results[0].text, "ok");
+});
+
+test("dispatchCodeWave waits for HTTP turn attachment then fabricates", async () => {
+  const events = [];
+  let resolvedTurn = false;
+  const session = fakeCodeSession({
+    model: "claude-opus-4-8",
+    currentTurn: null,
+    res: { writableEnded: false, write: (s) => { const m = s.match(/^data: (.+)\n\n$/m); if (m) events.push(JSON.parse(m[1])); } },
+  });
+  initMessageProjection(session);
+  const codeId = "toolu_code_main";
+  const syn0 = syntheticIdFor(codeId, 1, 0);
+  session.codeRun = {
+    codeId,
+    aborted: false,
+    currentWave: null,
+    preamble: null,
+    waveSeq: 0,
+    waveCount: 0,
+    callCount: 0,
+  };
+
+  const p = dispatchCodeWave(session, codeId, 1, [
+    { name: "Grep", args: { pattern: "x", path: "/r" } },
+  ]);
+  assert.equal(events.length, 0, "blocks until an HTTP turn attaches");
+  assert.ok(session.turnWaiters?.length, "registers a turn waiter");
+  assert.equal(session.codeRun.currentWave?.waveNum, 1);
+
+  session.currentTurn = { resolve: () => { resolvedTurn = true; } };
+  notifyTurnAttached(session);
+
+  assert.equal(resolvedTurn, true, "HTTP turn closed so the client can execute the tool");
+  const tu = events.find((e) => e.type === "content_block_start" && e.content_block?.type === "tool_use");
+  assert.equal(tu?.content_block?.id, syn0);
+
+  await resolveCodeModeToolResults(session, [
+    { tool_use_id: syn0, content: [{ type: "text", text: "done" }] },
+  ]);
+  const results = await p;
+  assert.equal(results[0].text, "done");
+});
+
 test("fabricated wave message_start carries a usage object (no undefined input_tokens)", () => {
   const events = [];
   const session = fakeCodeSession({
@@ -560,14 +644,13 @@ test("fabricated wave message_start carries a usage object (no undefined input_t
     aborted: false,
     currentWave: null,
     preamble: null,
-    waveQueue: [{
-      waveNum: 1,
-      calls: [{ syntheticId: syn0, tool: "Grep", args: { pattern: "x", path: "/r" }, inlineError: null }],
-      results: [null],
-      pending: new Set([syn0]),
-    }],
+    waveSeq: 0,
+    waveCount: 0,
+    callCount: 0,
   };
-  maybeDispatchQueuedWave(session);
+  dispatchCodeWave(session, codeId, 1, [
+    { name: "Grep", args: { pattern: "x", path: "/r" } },
+  ]);
   const start = events.find((e) => e.type === "message_start");
   assert.ok(start, "should emit a fabricated message_start");
   assert.ok(start.message, "message_start has a message object");
@@ -607,14 +690,13 @@ test("fabricated wave reuses last real upstream usage instead of zeros (no statu
     aborted: false,
     currentWave: null,
     preamble: null,
-    waveQueue: [{
-      waveNum: 1,
-      calls: [{ syntheticId: syn0, tool: "Grep", args: { pattern: "x", path: "/r" }, inlineError: null }],
-      results: [null],
-      pending: new Set([syn0]),
-    }],
+    waveSeq: 0,
+    waveCount: 0,
+    callCount: 0,
   };
-  maybeDispatchQueuedWave(session);
+  dispatchCodeWave(session, codeId, 1, [
+    { name: "Grep", args: { pattern: "x", path: "/r" } },
+  ]);
   const start = events.find((e) => e.type === "message_start");
   assert.ok(start?.message?.usage, "fabricated message_start has usage");
   // Reuses the real upstream input tokens — does NOT reset to 0.
@@ -642,14 +724,13 @@ test("fabricated wave falls back to a complete zeroed usage when no upstream usa
     aborted: false,
     currentWave: null,
     preamble: null,
-    waveQueue: [{
-      waveNum: 1,
-      calls: [{ syntheticId: syn0, tool: "Grep", args: { pattern: "x", path: "/r" }, inlineError: null }],
-      results: [null],
-      pending: new Set([syn0]),
-    }],
+    waveSeq: 0,
+    waveCount: 0,
+    callCount: 0,
   };
-  maybeDispatchQueuedWave(session);
+  dispatchCodeWave(session, codeId, 1, [
+    { name: "Grep", args: { pattern: "x", path: "/r" } },
+  ]);
   const start = events.find((e) => e.type === "message_start");
   assert.ok(start?.message?.usage, "fabricated message_start has usage");
   // Crash protection: the four canonical fields exist and are numbers.

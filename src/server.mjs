@@ -1026,21 +1026,56 @@ function initMessageProjection(session) {
   };
 }
 
+function rejectTurnWaitersForRun(session, run, err) {
+  const waiters = session.turnWaiters ?? [];
+  session.turnWaiters = waiters.filter((w) => {
+    if (w.run === run) {
+      try { w.reject(err); } catch {}
+      return false;
+    }
+    return true;
+  });
+}
+
+function waitForCurrentTurn(session, run) {
+  if (session.currentTurn) return Promise.resolve();
+  if (run.aborted) return Promise.reject(new Error("code run aborted"));
+  return new Promise((resolve, reject) => {
+    (session.turnWaiters ??= []).push({ resolve, reject, run });
+  });
+}
+
+function notifyTurnAttached(session) {
+  const waiters = session.turnWaiters ?? [];
+  session.turnWaiters = [];
+  for (const w of waiters) {
+    if (w.run.aborted) {
+      try { w.reject(new Error("code run aborted")); } catch {}
+    } else {
+      try { w.resolve(); } catch {}
+    }
+  }
+  fabricateCurrentWave(session);
+}
+
 function clearCodeRun(session, codeId) {
   const run = session.codeRun;
   if (run && run.codeId === codeId) {
+    rejectTurnWaitersForRun(session, run, new Error("code round abandoned"));
     session.codeRun = null;
   }
 }
 
 function clearAllCodeState(session) {
   if (session.codeRun) {
-    session.codeRun.aborted = true;
-    if (session.codeRun.reject) {
-      try { session.codeRun.reject(new Error("code round abandoned")); } catch {}
+    const run = session.codeRun;
+    run.aborted = true;
+    rejectTurnWaitersForRun(session, run, new Error("code round abandoned"));
+    if (run.currentWave?.reject) {
+      try { run.currentWave.reject(new Error("code round abandoned")); } catch {}
     }
+    session.codeRun = null;
   }
-  session.codeRun = null;
   session.syntheticToCode?.clear();
   session.codeDriving = false;
   session.suppressEndTurn = false;
@@ -1130,8 +1165,7 @@ function startCodeRun(session, codeToolUseId, input) {
   const run = {
     codeId: codeToolUseId,
     script,
-    waveQueue: [],           // FIFO of waves waiting for an open HTTP request
-    currentWave: null,       // { waveNum, calls, results, pending, promise, resolve, reject }
+    currentWave: null,       // single in-flight wave awaiting client tool_results
     waveSeq: 0,
     waveCount: 0,
     callCount: 0,
@@ -1274,40 +1308,52 @@ async function dispatchCodeWave(session, codeToolUseId, waveNum, calls) {
     return validated.map((v) => ({ text: v.inlineError, raw: null, isError: true }));
   }
 
-  // Build the wave entry. The bridge will fabricate a client turn when an HTTP
-  // request is available.
+  if (run.currentWave) {
+    return calls.map(() => ({ text: "previous code wave still in flight", raw: null, isError: true }));
+  }
+
   const waveEntry = {
     waveNum,
     calls: validated,
     fabricatable,
     results: new Array(validated.length).fill(null),
     pending: new Set(fabricatable.map((v) => v.syntheticId)),
+    dispatched: false,
     promise: null,
     resolve: null,
     reject: null,
   };
   waveEntry.promise = new Promise((res, rej) => { waveEntry.resolve = res; waveEntry.reject = rej; });
 
-  run.waveQueue.push(waveEntry);
+  run.currentWave = waveEntry;
   run.waveSeq = waveNum;
   run.waveCount++;
 
-  // Try to dispatch immediately if an HTTP turn is attached.
-  maybeDispatchQueuedWave(session);
-
-  const results = await waveEntry.promise;
-  return results;
+  try {
+    if (!session.currentTurn) {
+      await waitForCurrentTurn(session, run);
+    }
+    if (run.aborted) {
+      if (run.currentWave === waveEntry) run.currentWave = null;
+      return calls.map(() => ({ text: "code run aborted", raw: null, isError: true }));
+    }
+    fabricateCurrentWave(session);
+    return await waveEntry.promise;
+  } catch (e) {
+    if (run.currentWave === waveEntry) run.currentWave = null;
+    return calls.map(() => ({ text: e?.message || String(e), raw: null, isError: true }));
+  }
 }
 
-// If an HTTP turn is attached and a wave is queued, fabricate the client turn.
-function maybeDispatchQueuedWave(session) {
+// Fabricate the single in-flight wave onto the attached HTTP turn.
+function fabricateCurrentWave(session) {
   const run = session.codeRun;
   if (!run || run.aborted) return;
-  if (!session.currentTurn) return; // no open HTTP request to ride on
-  if (run.currentWave) return;      // a wave is already being served
-  const wave = run.waveQueue.shift();
-  if (!wave) return;
-  run.currentWave = wave;
+  if (!session.currentTurn) return;
+  const wave = run.currentWave;
+  if (!wave || wave.dispatched) return;
+
+  wave.dispatched = true;
 
   const p = session._proj;
   // Start a fresh fabricated assistant message. The client (and its subagent
@@ -1500,7 +1546,7 @@ function createSession(key, model, tools, callerSystem, bucket, { resume, codeMo
     inputParsers: new Map(),      // toolName -> z.object(shape); canonical parser mirroring MCP validateToolInput
     fifoFallbacks: 0,             // per-session count of correlation FIFO fallbacks (observable)
     clientTools: new Map(),       // code mode: name -> {description, input_schema}
-    codeRun: null,                // active dynamic code run: { codeId, resultPromise, waveQueue, currentWave, waveSeq, waveCount, callCount, aborted, resolve, reject, preamble }
+    codeRun: null,                // active dynamic code run: { codeId, currentWave, waveSeq, waveCount, callCount, aborted, preamble }
     syntheticToCode: new Map(),   // syntheticId -> codeId (for routing tool_results)
     codeDriving: false,           // bridge controls visible client turns while SDK is parked on code
     suppressEndTurn: false,
@@ -1906,9 +1952,6 @@ async function resolveCodeModeToolResults(session, toolResults) {
     if (session.turnMetrics) session.turnMetrics.codeSubCalls += subCalls;
 
     wave.resolve(results);
-
-    // Try to dispatch the next queued wave into this same open request.
-    maybeDispatchQueuedWave(session);
   }
 }
 
@@ -2044,6 +2087,7 @@ async function handleMessages(req, res) {
   const turnPromise = new Promise((resolve, reject) => {
     session.currentTurn = { resolve, reject };
   });
+  notifyTurnAttached(session);
 
   if (isStream) {
     res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
@@ -2086,16 +2130,22 @@ async function handleMessages(req, res) {
     // drop a real user turn or abandon a parked tool round. Emit a minimal,
     // well-formed empty assistant turn and resolve immediately so the client gets
     // a clean end_turn without waiting on the SDK (which has nothing new to do).
-    if (isStream) {
-      if (!res.writableEnded) {
-        res.write(sseEvent("message_start", { type: "message_start", message: { id: `msg_${Date.now()}`, type: "message", role: "assistant", model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } } }));
-        res.write(sseEvent("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 0 } }));
-        res.write(sseEvent("message_stop", { type: "message_stop" }));
+    // If notifyTurnAttached already fabricated a pending code wave, endTurn cleared
+    // currentTurn — skip the empty noop response.
+    if (session.currentTurn) {
+      if (isStream) {
+        if (!res.writableEnded) {
+          res.write(sseEvent("message_start", { type: "message_start", message: { id: `msg_${Date.now()}`, type: "message", role: "assistant", model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } } }));
+          res.write(sseEvent("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 0 } }));
+          res.write(sseEvent("message_stop", { type: "message_stop" }));
+        }
+      } else {
+        session.nonStream = { blocks: [], stopReason: "end_turn" };
       }
-    } else {
-      session.nonStream = { blocks: [], stopReason: "end_turn" };
+      const t = session.currentTurn;
+      session.currentTurn = null;
+      t.resolve();
     }
-    if (session.currentTurn) { const t = session.currentTurn; session.currentTurn = null; t.resolve(); }
   } else {
     // action === "push" or "new": a fresh user turn on a live session. If the
     // prior turn left a tool round parked (the caller interjected text instead
@@ -2347,7 +2397,8 @@ export {
   createSession,
   startCodeRun,
   dispatchCodeWave,
-  maybeDispatchQueuedWave,
+  fabricateCurrentWave,
+  notifyTurnAttached,
   resolveCodeModeToolResults,
   projectEvent,
   initMessageProjection,

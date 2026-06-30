@@ -13,6 +13,7 @@ import {
   dispatchCodeWave,
   resolveCodeModeToolResults,
   buildParkingMcpServer,
+  initMessageProjection,
 } from "../src/server.mjs";
 import { createAnchorState, annotateReadResult } from "../src/anchor-edit.mjs";
 
@@ -42,7 +43,7 @@ function codeSession(overrides = {}) {
     orphanResolvers: [],
     streamedToolUses: [],
     toolUseAccum: new Map(),
-    currentTurn: null, // keeps maybeDispatchQueuedWave from fabricating a turn
+    currentTurn: null,
     res: null,
     nonStream: null,
     codeSubCalls: 0,
@@ -55,7 +56,6 @@ function freshRun(codeId = "toolu_code_x") {
   return {
     codeId,
     aborted: false,
-    waveQueue: [],
     currentWave: null,
     waveSeq: 0,
     waveCount: 0,
@@ -72,14 +72,13 @@ test("dispatchCodeWave translates anchor-shaped Edit args to native old_string",
   const [, mid] = anchorsOf(annotated);
   session.codeRun = freshRun();
 
-  // Not awaited: with no currentTurn the wave parks in the queue; the
-  // synchronous validation has already run by the time the promise is returned.
+  // Not awaited: validation runs synchronously and sets currentWave before waiting for a turn.
   dispatchCodeWave(session, session.codeRun.codeId, 1, [
     { name: "Edit", args: { file_path: "/a.js", start_anchor: `${OPEN}${mid}${CLOSE}`, end_anchor: `${OPEN}${mid}${CLOSE}`, new_string: "  BETA;" } },
   ]);
 
-  const wave = session.codeRun.waveQueue[0];
-  assert.ok(wave, "wave queued");
+  const wave = session.codeRun.currentWave;
+  assert.ok(wave, "wave assigned to currentWave");
   const call = wave.calls[0];
   assert.equal(call.inlineError, null);
   assert.deepEqual(call.args, { file_path: "/a.js", old_string: "  beta;", new_string: "  BETA;" });
@@ -94,7 +93,7 @@ test("dispatchCodeWave passes native old_string args through untranslated", () =
     { name: "Edit", args: { file_path: "/a.js", old_string: "  beta;", new_string: "  BETA;" } },
   ]);
 
-  const call = session.codeRun.waveQueue[0].calls[0];
+  const call = session.codeRun.currentWave.calls[0];
   assert.equal(call.inlineError, null);
   assert.deepEqual(call.args, { file_path: "/a.js", old_string: "  beta;", new_string: "  BETA;" });
 });
@@ -124,6 +123,7 @@ test("resolveCodeModeToolResults exposes .anchored for a Read result, .text stay
     fabricatable: [{ syntheticId: synId }],
     results: [null],
     pending: new Set([synId]),
+    dispatched: true,
     resolve: () => {},
     reject: () => {},
   };
@@ -143,23 +143,23 @@ test("resolveCodeModeToolResults exposes .anchored for a Read result, .text stay
 });
 
 test("code-mode reconcile: a confirmed Edit result updates the cached snapshot", () => {
-  const session = codeSession();
+  const session = codeSession({
+    currentTurn: { resolve: () => {} },
+    res: { writableEnded: false, write: () => {} },
+  });
+  initMessageProjection(session);
   const run = freshRun();
   session.codeRun = run;
   const { text: annotated } = annotateReadResult(session.anchorState, "/a.js", gutter(["one", "two", "three"]));
   const anchors = anchorsOf(annotated);
 
-  // Stage an Edit wave (top-line edit growing the file). The plan rides on the
-  // validated call via dispatchCodeWave.
   dispatchCodeWave(session, run.codeId, 1, [
     { name: "Edit", args: { file_path: "/a.js", start_anchor: `${OPEN}${anchors[0]}${CLOSE}`, end_anchor: `${OPEN}${anchors[0]}${CLOSE}`, new_string: "ONE\ninserted" } },
   ]);
-  const wave = run.waveQueue[0];
+  const wave = run.currentWave;
   const synId = wave.calls[0].syntheticId;
   assert.ok(wave.calls[0].anchorPlan, "reconcile plan attached to the call");
-  // Promote to currentWave the way maybeDispatchQueuedWave would.
-  run.currentWave = wave;
-  session.syntheticToCode.set(synId, run.codeId);
+  assert.ok(session.syntheticToCode.has(synId), "fabrication registered synthetic id");
 
   // Client confirms success -> resolveCodeModeToolResults reconciles.
   resolveCodeModeToolResults(session, [
