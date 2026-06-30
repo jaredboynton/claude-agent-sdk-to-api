@@ -49,6 +49,7 @@ import {
 } from "./resume-index.mjs";
 import {
   CODE_MODE_APPEND,
+  NATIVE_PARALLEL_APPEND,
   CodeValidationError,
   validateCodeInput,
   runCodeScriptDynamic,
@@ -75,11 +76,14 @@ import {
 const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS || process.env.ACP_SESSION_TTL_MS || 300000); // 5 min
 const HEARTBEAT_MS = Number(process.env.HEARTBEAT_MS || process.env.ACP_HEARTBEAT_MS || 15000);
 const TOOL_TIMEOUT_MS = Number(process.env.TOOL_TIMEOUT_MS || process.env.ACP_TOOL_TIMEOUT_MS || 1800000); // 30 min; active tool rounds are retained past SESSION_TTL_MS
-// Turn-level watchdog: backstop for any path where message_stop never fires
-// (e.g. the SDK stream goes quiet mid-thinking, or a parked handler blocks the
-// SDK from emitting message_stop and the per-handler TOOL_TIMEOUT_MS somehow
-// doesn't fire).
-const TURN_TIMEOUT_MS = Number(process.env.TURN_TIMEOUT_MS || process.env.ACP_TURN_TIMEOUT_MS || 300000);
+// NOTE: there is intentionally NO turn-level timeout/watchdog. A clock-based
+// backstop only masks the real failure (a wedged turn) and silently drops
+// context. Turn teardown is purely EVENT-DRIVEN off the SDK query() lifecycle:
+// when the live query()'s async iterator ends, errors, or is aborted,
+// consumeSession() immediately settles the attached turn (failTurn) and abandons
+// any parked tool round. A turn that never settles means the SDK genuinely never
+// emitted message_stop and never closed — that is a real bug to root-cause from
+// the event stream, not something to paper over with a timer.
 const CODE_SCRIPT_TIMEOUT_MS = Number(process.env.CODE_SCRIPT_TIMEOUT_MS || 0); // 0 = no cap
 const CODE_MAX_WAVES = Number(process.env.CODE_MAX_WAVES || 0); // 0 = unlimited
 const CODE_MAX_CALLS = Number(process.env.CODE_MAX_CALLS || 0); // 0 = unlimited
@@ -151,22 +155,6 @@ function modelObject(id) {
     display_name: base,
     created_at: "2025-01-01T00:00:00Z",
   };
-}
-
-// Race an HTTP turn promise against a wall-clock timeout. Resolves with the
-// turn's value if it settles in time; otherwise rejects with a typed timeout
-// error so the caller can failTurn + abandon the tool round + surface an error
-// to the client instead of hanging forever.
-function raceTurn(turnPromise, timeoutMs = TURN_TIMEOUT_MS) {
-  let timer;
-  const timeout = new Promise((_, reject) => {
-    timer = setTimeout(() => {
-      const err = new Error(`turn did not complete within ${timeoutMs}ms`);
-      err.code = "turn_timeout";
-      reject(err);
-    }, timeoutMs);
-  });
-  return Promise.race([turnPromise, timeout]).finally(() => clearTimeout(timer));
 }
 
 // Extract system prompt text from Anthropic `system` field (string or array).
@@ -900,6 +888,76 @@ function markSeen(session, messages) {
   session.seenHash = hashMessages(messages, messages.length);
 }
 
+// Classify the unseen tail of a request into actionable pieces.
+//
+// Clients (Claude Code in particular) do NOT append exactly one new message per
+// POST. They synthesize trailing `role: "system"` messages (attachments /
+// reminders / recaps such as `task_reminder`, `output_style`, `away_summary`)
+// AFTER the real payload. The Anthropic Messages API rejects `role: "system"`
+// inside `messages`; this bridge must not let that synthesized metadata win the
+// "what is the new turn?" decision, or it (a) drops the real user text and (b)
+// misclassifies a `tool_result` turn as a fresh push, abandoning the parked
+// tool round and wedging the SDK (the turn then never settles until the live
+// query() closes). This selector is the root-cause fix for both failures.
+//
+// Given the unseen tail (`messages.slice(prevSeen)`), return:
+//   {
+//     toolResultMsgs: [...],          // the actionable msg if it carries tool_results
+//     toolResults:     [...],          // its flattened tool_result blocks (for resolve)
+//     userMsg:         <msg | null>,   // the actionable real user turn to push
+//     isToolResult:    <bool>,         // the actionable msg is a tool_result turn
+//     hasSystemOnly:   <bool>,         // no actionable user msg, only system/meta
+//   }
+//
+// The "actionable" message is found by scanning from the END of the tail and
+// taking the first `role: "user"` message, skipping `assistant` echoes (the SDK
+// authored them) and `role: "system"` metadata (synthesized attachments /
+// reminders / recaps that must never be coerced into a user turn). This mirrors
+// the original "last message" intent but is immune to trailing system messages,
+// and it stays correct when the tail is the full history (prevSeen=0 on the
+// cold/resume path): only the LATEST turn's nature drives the decision, not any
+// tool_result buried earlier in the conversation.
+//
+// A user message can carry BOTH tool_result and text (Claude Code sometimes
+// appends a text note alongside results); such a message is a tool_result turn
+// (resolved), not a fresh user turn.
+function actionableTail(tail) {
+  const list = Array.isArray(tail) ? tail : [];
+  let actionable = null;
+  for (let i = list.length - 1; i >= 0; i--) {
+    const m = list[i];
+    if (!m || typeof m !== "object") continue;
+    if (m.role === "user") { actionable = m; break; }
+    // assistant echoes and system metadata are skipped; keep scanning back.
+  }
+
+  if (!actionable) {
+    const hasSystemOnly = list.some((m) => m && m.role === "system");
+    return { toolResultMsgs: [], toolResults: [], userMsg: null, isToolResult: false, hasSystemOnly };
+  }
+
+  const content = Array.isArray(actionable.content) ? actionable.content : null;
+  const trs = content ? content.filter((b) => b && b.type === "tool_result") : [];
+  if (trs.length) {
+    return { toolResultMsgs: [actionable], toolResults: trs, userMsg: null, isToolResult: true, hasSystemOnly: false };
+  }
+  return { toolResultMsgs: [], toolResults: [], userMsg: actionable, isToolResult: false, hasSystemOnly: false };
+}
+
+// Decide the warm-session action from a classified unseen tail. Pure + exported
+// so the request-handler decision tree is unit-testable without an HTTP harness.
+//
+// Returns { action: "resolve"|"push"|"noop", toolResults, userMsg }.
+//   - "resolve": the tail carries tool_result(s) for the parked handler.
+//   - "push":    the tail has a real user turn to feed the SDK.
+//   - "noop":    only system/meta (or nothing) — do not fabricate a user turn.
+function decideWarmAction(tail) {
+  const cls = actionableTail(tail);
+  if (cls.isToolResult) return { action: "resolve", toolResults: cls.toolResults, userMsg: null };
+  if (cls.userMsg) return { action: "push", toolResults: [], userMsg: cls.userMsg };
+  return { action: "noop", toolResults: [], userMsg: null };
+}
+
 // Pushable, held-open async-iterable input queue for the SDK.
 function makeInputQueue() {
   const items = [];
@@ -1422,7 +1480,7 @@ function createSession(key, model, tools, callerSystem, bucket, { resume, codeMo
     turnMetrics: null,
   };
 
-  const systemAppend = codeMode ? callerSystem + CODE_MODE_APPEND : callerSystem;
+  const systemAppend = codeMode ? callerSystem + CODE_MODE_APPEND : callerSystem + NATIVE_PARALLEL_APPEND;
   const mcpServer = buildParkingMcpServer(tools, session);
   const queryOptions = {
     model,
@@ -1804,10 +1862,17 @@ async function handleMessages(req, res) {
   let anchorEdit = serverAnchorEdit;
   if (headerAnchor === "0" || headerAnchor === "false") anchorEdit = false;
   else if (headerAnchor === "1" || headerAnchor === "true") anchorEdit = true;
+  // Classify what's actionable in this request. Clients (Claude Code) append
+  // synthesized `role: "system"` messages (attachments/reminders/recaps) AFTER
+  // the real payload; the physical last array element is therefore NOT a
+  // reliable "new turn" selector. We pick the latest actionable user/tool-result
+  // message and treat system messages as non-actionable metadata. See
+  // actionableTail() above.
+  //
+  // `tail` is computed against the matched session's seenCount once we have a
+  // session; for cold/new/resume (no matched warm session) we classify the full
+  // messages array to find the actionable user message for priming/resume.
   const last = messages[messages.length - 1];
-  const toolResults = Array.isArray(last?.content) ? last.content.filter((b) => b.type === "tool_result") : [];
-  const lastIsToolResult = toolResults.length > 0;
-
   // Stable conversation id when the client provides one. Claude Code sends
   // `x-claude-code-session-id` (distinct per conversation AND per subagent), so
   // parallel fan-out sessions that share an identical system+first-user prefix
@@ -1824,17 +1889,36 @@ async function handleMessages(req, res) {
 
   let session = findSession(messages, system, convId, cwd);
   let resumeCatchupTail = null;
+
+  // Classify the unseen tail against the matched warm session's seenCount. For
+  // cold/new/resume there is no matched session, so classify the full array to
+  // find the actionable user message (used for priming/resume).
+  const prevSeen = session ? session.seenCount : 0;
+  const tail = messages.slice(prevSeen);
+  const cls = actionableTail(tail);
+  const { toolResults, userMsg, isToolResult } = cls;
+  // For cold/resume paths that still take a single "last" user turn, prefer the
+  // actionable user message; fall back to the physical last message only when
+  // the tail has no actionable user message (e.g. a genuinely single-message
+  // new conversation, or a pathological system-only request).
+  const actionableLast = userMsg || last;
+  const lastIsToolResult = isToolResult;
+
   // "resolve" => feed tool_result(s) to the parked handler of a matched session.
-  // "push"    => push the latest user turn into a matched session.
+  // "push"    => push the latest real user turn into a matched session.
+  // "noop"    => matched warm session but tail is system-only metadata: nothing
+  //              to feed the SDK; just mark seen and end the turn cleanly.
   // "resume"  => cold start recovered via SDK resume; push only the last user turn.
   // "resume-catchup" => SDK resume + small unseen tail as narrative context.
   // "cold"    => no matching live session and no resume index hit: narrative priming.
   // "new"     => brand-new conversation (single message): new session.
   let action;
-  if (session && lastIsToolResult) {
-    action = "resolve";
-  } else if (session) {
-    action = "push";
+  if (session) {
+    // Warm session: decide from the classified tail (resolve | push | noop).
+    // Never fabricate a user turn from a trailing system/meta message, and never
+    // abandon a parked tool round just because a system message trails the
+    // tool_result. See decideWarmAction()/actionableTail().
+    action = decideWarmAction(tail).action;
   } else if (messages.length > 1) {
     const b = bucketKey(system, messages, convId, cwd);
     // Resume is enabled for non-code sessions only; code-mode SDK resume is
@@ -1908,7 +1992,7 @@ async function handleMessages(req, res) {
     if (session.codeMode) await resolveCodeModeToolResults(session, toolResults);
     else for (const tr of toolResults) resolveTool(session, tr.tool_use_id, maybeAnchorReadResult(session, tr.tool_use_id, toCallToolResult(tr)));
   } else if (action === "resume") {
-    session.input.push(toUserFrame(last));
+    session.input.push(toUserFrame(actionableLast));
   } else if (action === "resume-catchup") {
     for (const frame of buildResumeCatchupFrames(resumeCatchupTail || [], {
       renderTranscript: renderPrimingTranscript,
@@ -1919,34 +2003,47 @@ async function handleMessages(req, res) {
       session.input.push(frame);
     }
   } else if (action === "cold") {
-    pushColdStartFrames(session, messages, last, lastIsToolResult);
+    pushColdStartFrames(session, messages, actionableLast, lastIsToolResult);
+  } else if (action === "noop") {
+    // Matched warm session but the unseen tail is only system/meta (or empty).
+    // Do NOT fabricate a user turn from a synthesized system message — that would
+    // drop a real user turn or abandon a parked tool round. Emit a minimal,
+    // well-formed empty assistant turn and resolve immediately so the client gets
+    // a clean end_turn without waiting on the SDK (which has nothing new to do).
+    if (isStream) {
+      if (!res.writableEnded) {
+        res.write(sseEvent("message_start", { type: "message_start", message: { id: `msg_${Date.now()}`, type: "message", role: "assistant", model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } } }));
+        res.write(sseEvent("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 0 } }));
+        res.write(sseEvent("message_stop", { type: "message_stop" }));
+      }
+    } else {
+      session.nonStream = { blocks: [], stopReason: "end_turn" };
+    }
+    if (session.currentTurn) { const t = session.currentTurn; session.currentTurn = null; t.resolve(); }
   } else {
-    // action === "push" or "new": a fresh user turn on a live session. If the prior turn
-    // left a tool round parked (the caller interjected text instead of returning
-    // a tool_result), abandon it so the new turn is not stuck behind a handler
-    // that will never be resolved.
+    // action === "push" or "new": a fresh user turn on a live session. If the
+    // prior turn left a tool round parked (the caller interjected text instead
+    // of returning a tool_result), abandon it so the new turn is not stuck
+    // behind a handler that will never be resolved. Push the REAL user message,
+    // never a trailing system/meta message.
     if (hasActiveToolRound(session, { includeCurrentTurn: false })) {
       abandonToolRound(session);
     }
-    session.input.push(toUserFrame(last));
+    session.input.push(toUserFrame(userMsg || last));
   }
   markSeen(session, messages);
 
   try {
-    await raceTurn(turnPromise, TURN_TIMEOUT_MS);
+    // Await the turn directly — NO timeout race. The turn settles only on a real
+    // SDK event: message_stop (endTurn -> resolve) or the query() iterator
+    // ending/erroring/aborting (consumeSession -> failTurn -> reject). A clock
+    // would only mask a genuine wedge and drop context.
+    await turnPromise;
   } catch (e) {
-    const isTimeout = e?.code === "turn_timeout";
-    process.stderr.write(
-      `${LOG_PREFIX} turn failed (${session.key}): ${e?.message || e}` +
-        (isTimeout
-          ? ` wedged: pendingTools=${session.pendingTools.size} streamedToolUses=${session.streamedToolUses.length} orphanResolvers=${session.orphanResolvers.length} resolvedResults=${session.resolvedResults.size}\n`
-          : "\n")
-    );
-    // A timeout means the turn is still attached and the SDK loop may still be
-    // parked on a tool handler: settle the turn and abandon the round so the
-    // SDK is unblocked (parked handlers resolve with isError) rather than left
-    // to hang. consumeSession-initiated failures have already called failTurn
-    // (currentTurn is null here), so the guard avoids a double settle.
+    process.stderr.write(`${LOG_PREFIX} turn failed (${session.key}): ${e?.message || e}\n`);
+    // The rejection came from consumeSession's catch/finally (iterator
+    // error/abort/close), which already called failTurn. The guard avoids a
+    // double settle if a turn is somehow still attached.
     if (session.currentTurn) failTurn(session, e);
     if (isStream) {
       if (!res.writableEnded) {
@@ -2089,6 +2186,8 @@ export {
   primingFrameText,
   findSession,
   markSeen,
+  actionableTail,
+  decideWarmAction,
   sessions,
   stripCacheControl,
   toCallToolResult,
@@ -2100,7 +2199,6 @@ export {
   abandonToolRound,
   buildParkingMcpServer,
   hasActiveToolRound,
-  raceTurn,
   pushColdStartFrames,
   noteStreamTiming,
   persistResumeIndex,

@@ -10,6 +10,8 @@ import {
   formatCodeResult,
   buildCodeToolDescription,
   CodeValidationError,
+  CODE_MODE_APPEND,
+  NATIVE_PARALLEL_APPEND,
 } from "../src/code-mode.mjs";
 import {
   toolInputShape,
@@ -246,7 +248,7 @@ test("buildCodeToolDescription script-first guidance mentions tools.X and Promis
   assert.match(d, /Promise\.all/);
   assert.match(d, /Bake branching/);
   assert.match(d, /order-dependent/);
-  assert.match(d, /DEFAULT TO BATCHING/);
+  assert.match(d, /DECISION RULE/);
 });
 
 test("buildCodeToolDescription includes intelligent-logic and anchored-edit guidance", () => {
@@ -268,6 +270,57 @@ test("buildCodeToolDescription includes intelligent-logic and anchored-edit guid
   assert.match(d, /copy old_string VERBATIM/);
   assert.match(d, /smallest unique snippet/);
   assert.match(d, /avoid full-file or whole-line rewrites/);
+});
+
+test("buildCodeToolDescription includes decision rule, read-only carve-out, dependency guard, JS guard, compact returns", () => {
+  const d = buildCodeToolDescription(new Map());
+  // pre-wave decision rule: write B's args before A returns
+  assert.match(d, /DECISION RULE/);
+  assert.match(d, /before each wave, list all calls needed/i);
+  assert.match(d, /write B's args before A returns/);
+  // read-only fan-out carve-out
+  assert.match(d, /Read-only commands and tools/);
+  assert.match(d, /gh release view/);
+  assert.match(d, /always one wave/);
+  // dependency guard
+  assert.match(d, /Only batch calls that are independent/);
+  assert.match(d, /git add` → `git commit`/);
+  // JavaScript-not-TypeScript guard
+  assert.match(d, /write executable JavaScript, not TypeScript syntax/);
+  // compact returns
+  assert.match(d, /verdict\/summary\/fields/);
+});
+
+test("CODE_MODE_APPEND has decision rule, read-only carve-out, dependency guard, JS guard, expanded example", () => {
+  const a = CODE_MODE_APPEND;
+  // stronger parallel phrasing
+  assert.match(a, /Maximize parallelism/);
+  assert.match(a, /Err on the side of maximizing parallel calls/);
+  // pre-wave decision rule
+  assert.match(a, /<decision_rule>/);
+  assert.match(a, /Can I write call B's arguments before call A returns\?/);
+  // read-only carve-out
+  assert.match(a, /Read-only operations/);
+  assert.match(a, /Batch all reads for a phase in one wave/);
+  // dependency guard
+  assert.match(a, /Only batch calls that are independent/);
+  assert.match(a, /git add` → `git commit`/);
+  // JavaScript guard
+  assert.match(a, /<language>/);
+  assert.match(a, /do not use type annotations, interfaces, or generics/);
+  // expanded example: git fetch phase boundary + gh release view + node --test
+  assert.match(a, /git fetch --all --tags --prune/);
+  assert.match(a, /gh release view/);
+  assert.match(a, /node --test/);
+});
+
+test("NATIVE_PARALLEL_APPEND has use_parallel_tool_calls block with dependency guard", () => {
+  const n = NATIVE_PARALLEL_APPEND;
+  assert.match(n, /<use_parallel_tool_calls>/);
+  assert.match(n, /make all of the independent tool calls in parallel/);
+  assert.match(n, /read-only commands/i);
+  assert.match(n, /do NOT call these tools in parallel and instead call them sequentially/);
+  assert.match(n, /Never use placeholders or guess missing parameters/);
 });
 
 // ---------------------------------------------------------------------------

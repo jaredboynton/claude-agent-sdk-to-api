@@ -41,14 +41,22 @@ const r = await callTool(name, args);          // generic form
 Each call returns \`{ text, raw, isError }\`; use \`r.text\`, or \`JSON.parse(r.text)\` for JSON tools. Only the script's return value reaches you — raw tool output never enters your context.
 
 <principle>
-Favor intelligent logic and maximum parallelism. Do as much as possible in one \`code\` call: gather everything you can in parallel, then branch, loop, and aggregate in JavaScript. One \`code\` call is a single model round-trip no matter how many tools it touches, and the tool waves inside it cost nothing against your context. There is no time, wave, or call limit. Return for another \`code\` call only when you must show the user intermediate output or get their input.
+Maximize parallelism and intelligent logic. Whenever you perform multiple independent operations, issue all of them in one \`await Promise.all([...])\` wave — not sequential \`await\`s. Err on the side of maximizing parallel calls. Do as much as possible in one \`code\` call: gather everything you can in parallel, then branch, loop, and aggregate in JavaScript. One \`code\` call is a single model round-trip no matter how many tools it touches, and the tool waves inside it cost nothing against your context. There is no time, wave, or call limit. Return for another \`code\` call only when you must show the user intermediate output or get their input.
 </principle>
 
+<decision_rule>
+Before each wave, list every tool call needed for this phase. For each pair, ask: "Can I write call B's arguments before call A returns?" If yes for all pairs, batch them in one \`Promise.all\`. If B's args depend on A's result, keep B in a later wave.
+</decision_rule>
+
 <calling_tools>
-- Independent calls run together in one wave with \`await Promise.all([...])\`. Sequential \`await\`s for calls that don't depend on each other are the main thing to avoid — each is a wasted client round-trip. To survey a repo, fetch \`git status\`, \`git log\`, and \`git diff\` in one wave, not three.
+- Read-only operations — file reads, greps, globs, web searches, \`git status\`, \`git diff\`, \`gh release view\`, and tests/validation that only read the current tree — are safe to parallelize unless one call's args depend on another's result. Batch all reads for a phase in one wave. Sequential \`await\`s for independent reads are the top mistake.
+- Only batch calls that are independent. If one call's args depend on another's result, or if calls have ordering side-effects (\`git fetch\` → \`git log origin/main..HEAD\`; create dir → write into it; write file → test that file; \`git add\` → \`git commit\`), sequence them with separate \`await\`s.
 - Dependent calls stay in the script: feed one call's output into the next call's args, loop over a discovered set, branch on a status, retry on failure. A dependency is a reason to write a few more lines here, not to split into another \`code\` call or model turn.
-- Calls in one wave run in parallel with no ordering guarantee. Sequence steps that depend on each other's side effects (create a dir, then write into it) with separate \`await\`s.
 </calling_tools>
+
+<language>
+The tool signatures below are TypeScript-shaped documentation for argument types only. The script you write is JavaScript: do not use type annotations, interfaces, or generics.
+</language>
 
 <working_with_results>
 - Process results in the script: filter, count, join, diff, extract, summarize. Return the conclusion — a verdict, a few fields, a short summary — not raw file or search contents.
@@ -57,14 +65,20 @@ Favor intelligent logic and maximum parallelism. Do as much as possible in one \
 </working_with_results>
 
 <examples>
-Parallel gather, then summarize:
+Phased gather — one required serial step, then a wide read-only wave:
 \`\`\`
-const [status, log, diff] = await Promise.all([
-  tools.Execute({ command: "git status" }),
-  tools.Execute({ command: "git log --oneline -15" }),
+// Phase 1: only if remote refs must be fresh for later origin/main comparisons.
+await tools.Execute({ command: "git fetch --all --tags --prune" });
+
+// Phase 2: independent read-only/status work — all in one wave.
+const [status, log, diff, release, tests] = await Promise.all([
+  tools.Execute({ command: "git status --short" }),
+  tools.Execute({ command: "git log --oneline -10" }),
   tools.Execute({ command: "git diff --stat" }),
+  tools.Execute({ command: "gh release view v1.22.6 --json tagName,createdAt" }),
+  tools.Execute({ command: "node --test test/rt-map-seed.test.mjs" }),
 ]);
-return { status: status.text, log: log.text, diffstat: diff.text };
+return { status: status.text, log: log.text, diffstat: diff.text, release: release.text, tests: tests.text };
 \`\`\`
 
 Dependent chain — one call's output drives the next, then fan out over the discovered set:
@@ -88,6 +102,17 @@ return { passed: out.exitCode === 0, attempts: i + 1, stderr: out.stderr.slice(0
 \`\`\`
 </examples>
 </tool_use_guidance>`;
+
+// Native-mode guidance: used when code mode is OFF. Steers the model to emit
+// multiple independent tool_use blocks per turn (parallel tool calls) while
+// keeping dependent calls sequential.
+export const NATIVE_PARALLEL_APPEND = `
+
+<use_parallel_tool_calls>
+If you intend to call multiple tools and there are no dependencies between the tool calls, make all of the independent tool calls in parallel. Prioritize calling tools simultaneously whenever the actions can be done in parallel rather than sequentially. For example, when reading 3 files, run 3 tool calls in parallel to read all 3 files into context at the same time. When running multiple read-only commands like \`git status\`, \`git diff\`, \`git log\`, or \`gh release view\`, always run all of the commands in parallel. Err on the side of maximizing parallel tool calls rather than running too many tools sequentially.
+
+Only batch tool calls that are independent of each other. If some tool calls depend on previous calls to inform dependent values (the parameters), or if calls have ordering side-effects (\`git fetch\` then \`git log origin/main..HEAD\`; create a directory then write into it; \`git add\` then \`git commit\`), do NOT call these tools in parallel and instead call them sequentially. Never use placeholders or guess missing parameters in tool calls.
+</use_parallel_tool_calls>`;
 
 export class CodeValidationError extends Error {
   constructor(message) {
@@ -262,15 +287,18 @@ export function buildCodeToolDescription(clientTools) {
     + "ALWAYS favor intelligent logic, and ALWAYS favor maximum batching and parallelism: push branching/loops/retries/aggregation into the script and run every independent operation together in one parallel wave. There is no time, wave, or call limit — one code call can do an entire task. "
     + "Prefer this for non-interactive read/search/write/shell/validation work; use original tools directly for interactive, approval, handoff, or native-UI flows. "
     + "Call tools with `await tools.<Name>(args)`, `await tools[\"Any-Name\"]`, or `await callTool(name, args)`; each returns `{ text, raw, isError }` (JSON.parse r.text when the tool returns JSON). "
+    + "The signatures below are TypeScript-shaped docs only; write executable JavaScript, not TypeScript syntax (no type annotations, interfaces, or generics). "
     + "args MUST match the TypeScript signature for that tool below: a trailing ? marks an optional field, "
     + "\"a\" | \"b\" lists the allowed literal values, and Array<T> is an array. "
     + "Descriptions, comments, defaults, examples, formats, and patterns come from the client schema; follow them exactly. "
     + "Bake branching/loops into the script — if the next step DEPENDS on a tool's result, do NOT return to the model: feed one call's output into the next call's args, loop over a result set, branch on a status, retry on failure — all in the same script. A dependent chain is a reason to write more JavaScript, not to split into more code calls or model turns. "
-    + "DEFAULT TO BATCHING: issue all independent calls in one wave with `await Promise.all([...])` (e.g. git status + git log + git diff together, not as separate awaits). Sequential `await`s for independent calls are the most common mistake. "
+    + "DECISION RULE: before each wave, list all calls needed; batch every pair where you can write B's args before A returns into one `await Promise.all([...])`. "
+    + "Read-only commands and tools (file reads, grep/glob/search, `git status`, `git diff`, `gh release view`, validation/tests that do not depend on an earlier mutation) with no cross-deps → always one wave. Sequential `await`s for independent reads are the top mistake. "
+    + "Only batch calls that are independent: if one call's args depend on another's result, or calls have ordering side-effects (`git fetch` → `git log origin/main..HEAD`; create dir → write into it; `git add` → `git commit`), sequence them with separate `await`s. "
     + "Write real logic: loops, bounded retry/validate, fan-out+reduce, guards/early-return — not one await per script. "
     + "Edit via the client's anchored search/replace tool: read the file, then either copy old_string VERBATIM from the bytes you read (exact whitespace) or, if the tool offers start_anchor/end_anchor and your read result has an .anchored view, point at those anchors instead — the top cause of failed edits is a mismatched old_string — use the smallest unique snippet, edit in the same script, and avoid full-file or whole-line rewrites. One file with many changes: prefer a single MultiEdit, else await edits to that path one at a time (never two edits to the same file in one parallel wave); different files edit in parallel. "
     + "Do not put order-dependent or side-effect-chained calls (create dir → write into it) in one wave. "
-    + "Return only the conclusion — only the script's return value is seen by the assistant.\n\n"
+    + "Return only the conclusion — the verdict/summary/fields; intermediate results stay inside the script and only the script's return value is seen by the assistant.\n\n"
     + (toolBlocks.length ? `Available tools:\n\n${toolBlocks.join("\n\n")}` : "Available tools: (none)")
   );
 }

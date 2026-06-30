@@ -14,6 +14,8 @@ import {
   primingFrameText,
   findSession,
   markSeen,
+  actionableTail,
+  decideWarmAction,
   sessions,
   toCallToolResult,
   toUserFrame,
@@ -24,7 +26,6 @@ import {
   extractIdHint,
   abandonToolRound,
   noteStreamTiming,
-  raceTurn,
   toolInputShape,
   resolveCwd,
   isValidCwd,
@@ -656,28 +657,119 @@ test("abandonToolRound resolves parked handlers with isError and clears state", 
 });
 
 // ---------------------------------------------------------------------------
-// raceTurn — turn-level watchdog (prevents "hangs forever" when message_stop
-// never fires)
+// actionableTail — classifies the unseen request tail, ignoring trailing
+// role:"system" metadata that Claude Code appends after the real payload.
 // ---------------------------------------------------------------------------
 
-test("raceTurn resolves with the turn value when it settles before the timeout", async () => {
-  const turn = new Promise((resolve) => setTimeout(() => resolve("ok"), 10));
-  const out = await raceTurn(turn, 1000);
-  assert.equal(out, "ok");
+const SYS = (text) => ({ role: "system", content: [{ type: "text", text }] });
+const U = (text) => ({ role: "user", content: [{ type: "text", text }] });
+const A = (text) => ({ role: "assistant", content: [{ type: "text", text }] });
+const ATOOL = (name = "Read", id = "t1") => ({
+  role: "assistant",
+  content: [{ type: "tool_use", id, name, input: {} }],
+});
+const URES = (id = "t1", text = "data") => ({
+  role: "user",
+  content: [{ type: "tool_result", tool_use_id: id, content: [{ type: "text", text }] }],
 });
 
-test("raceTurn rejects with a turn_timeout error when the turn never settles", async () => {
-  const turn = new Promise(() => {}); // never settles
-  await assert.rejects(
-    raceTurn(turn, 20),
-    (e) => e?.code === "turn_timeout" && /20ms/.test(e?.message)
-  );
+test("actionableTail: user text followed by trailing system -> userMsg is the user text", () => {
+  const t = actionableTail([A("ok"), U("hello"), SYS("reminder")]);
+  assert.equal(t.isToolResult, false);
+  assert.deepEqual(t.toolResults, []);
+  assert.equal(t.userMsg?.content?.[0]?.text, "hello");
+  assert.equal(t.hasSystemOnly, false);
 });
 
-test("raceTurn clears the timeout timer after the turn settles (no dangling timer)", async () => {
-  const turn = new Promise((resolve) => setTimeout(() => resolve("ok"), 5));
-  await raceTurn(turn, 10000);
-  // If the timer were not cleared, process wouldn't exit promptly; node --test
-  // would hang on this file. The await returning is sufficient evidence.
-  assert.ok(true);
+test("actionableTail: tool_result followed by trailing system -> isToolResult, no userMsg, no abandon trigger", () => {
+  const t = actionableTail([ATOOL(), URES(), SYS("reminder")]);
+  assert.equal(t.isToolResult, true);
+  assert.equal(t.toolResults.length, 1);
+  assert.equal(t.toolResults[0].tool_use_id, "t1");
+  assert.equal(t.userMsg, null);
+  assert.equal(t.hasSystemOnly, false);
+});
+
+test("actionableTail: normal single user turn -> one userMsg", () => {
+  const t = actionableTail([U("next")]);
+  assert.equal(t.isToolResult, false);
+  assert.equal(t.userMsg?.content?.[0]?.text, "next");
+});
+
+test("actionableTail: assistant echoes are ignored", () => {
+  const t = actionableTail([A("echo"), A("echo2"), U("real")]);
+  assert.equal(t.userMsg?.content?.[0]?.text, "real");
+});
+
+test("actionableTail: system-only tail -> hasSystemOnly, no userMsg, no toolResults", () => {
+  const t = actionableTail([SYS("a"), SYS("b")]);
+  assert.equal(t.hasSystemOnly, true);
+  assert.equal(t.userMsg, null);
+  assert.equal(t.isToolResult, false);
+  assert.deepEqual(t.toolResults, []);
+});
+
+test("actionableTail: mixed user text + tool_result blocks in one user message is a tool_result turn", () => {
+  const mixed = {
+    role: "user",
+    content: [
+      { type: "tool_result", tool_use_id: "t1", content: [{ type: "text", text: "data" }] },
+      { type: "text", text: "and a note" },
+    ],
+  };
+  const t = actionableTail([ATOOL(), mixed, SYS("r")]);
+  assert.equal(t.isToolResult, true);
+  assert.equal(t.toolResults.length, 1);
+  assert.equal(t.userMsg, null); // tool_result message is resolved, not pushed as a fresh turn
+});
+
+test("actionableTail: multiple user turns -> latest user text wins as userMsg", () => {
+  const t = actionableTail([U("first"), U("second"), SYS("r")]);
+  assert.equal(t.userMsg?.content?.[0]?.text, "second");
+  assert.equal(t.isToolResult, false);
+});
+
+test("actionableTail: empty tail -> nothing actionable", () => {
+  const t = actionableTail([]);
+  assert.equal(t.userMsg, null);
+  assert.equal(t.isToolResult, false);
+  assert.equal(t.hasSystemOnly, false);
+});
+
+// ---------------------------------------------------------------------------
+// decideWarmAction — the warm-session decision tree (the 4 tail shapes from the
+// plan). This is what handleMessages uses for a matched live session.
+// ---------------------------------------------------------------------------
+
+test("decideWarmAction: [assistant, user:text, system] -> push the user text (Symptom 1 fix)", () => {
+  const d = decideWarmAction([A("ok"), U("well the background subagent also got stuck"), SYS("away_summary")]);
+  assert.equal(d.action, "push");
+  assert.equal(d.userMsg?.content?.[0]?.text, "well the background subagent also got stuck");
+  assert.deepEqual(d.toolResults, []);
+});
+
+test("decideWarmAction: [assistant(tool_use), user:tool_result, system] -> resolve, not push (Symptom 2 fix)", () => {
+  const d = decideWarmAction([ATOOL("Read", "t1"), URES("t1"), SYS("reminder")]);
+  assert.equal(d.action, "resolve");
+  assert.equal(d.toolResults.length, 1);
+  assert.equal(d.toolResults[0].tool_use_id, "t1");
+  assert.equal(d.userMsg, null);
+});
+
+test("decideWarmAction: normal single user turn -> push exactly that turn", () => {
+  const d = decideWarmAction([U("next")]);
+  assert.equal(d.action, "push");
+  assert.equal(d.userMsg?.content?.[0]?.text, "next");
+});
+
+test("decideWarmAction: system-only tail -> noop (no fabricated user turn)", () => {
+  const d = decideWarmAction([SYS("recap"), SYS("reminder")]);
+  assert.equal(d.action, "noop");
+  assert.equal(d.userMsg, null);
+  assert.deepEqual(d.toolResults, []);
+});
+
+test("decideWarmAction: empty tail -> noop", () => {
+  const d = decideWarmAction([]);
+  assert.equal(d.action, "noop");
 });

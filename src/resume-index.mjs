@@ -88,7 +88,12 @@ export function findResumeCandidate({
   const best = candidates[0];
   if (!best?.sdkSessionId) return null;
 
-  const tail = messages.slice(best.seenCount);
+  // Drop synthesized `role: "system"` metadata (attachments / reminders /
+  // recaps that Claude Code appends after the real payload) before classifying
+  // the tail shape. They are non-actionable and must not turn a clean
+  // `assistant + user` continuation into a multi-message catchup (or block a
+  // `tool_result + system` tail from being recognized as a tool-loop tail).
+  const tail = messages.slice(best.seenCount).filter((m) => m && m.role !== "system");
   if (tail.length === 0) return null;
 
   // Code mode: ONLY clean user-turn resume is safe. A tool_result tail carries

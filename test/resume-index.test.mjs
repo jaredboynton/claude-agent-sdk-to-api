@@ -82,6 +82,57 @@ test("findResumeCandidate returns resume for assistant+user tail", () => {
   assert.equal(cand?.tail.length, 2);
 });
 
+test("findResumeCandidate ignores a trailing system message: assistant+user+system stays a clean resume", () => {
+  // Claude Code appends a synthesized role:"system" recap/reminder after the
+  // user turn. Without filtering it, this 3-message tail would degrade to
+  // resume-catchup (narrative priming) instead of a clean resume.
+  const incoming = [
+    { role: "user", content: [{ type: "text", text: "start" }] },
+    { role: "assistant", content: [{ type: "text", text: "a" }] },
+    { role: "user", content: [{ type: "text", text: "b" }] },
+    { role: "assistant", content: [{ type: "text", text: "c" }] },
+    { role: "user", content: [{ type: "text", text: "d" }] },
+    { role: "system", content: [{ type: "text", text: "away_summary recap" }] },
+  ];
+  const cand = findResumeCandidate({
+    entries: [entry(3, incoming)],
+    model: "claude-opus-4-8",
+    profileKey: PK,
+    bucket: BUCKET,
+    messages: incoming,
+    lastIsToolResult: false,
+    hashMessages,
+  });
+  assert.equal(cand?.mode, "resume");
+  // tail is system-free: assistant("c") + user("d")
+  assert.equal(cand?.tail.length, 2);
+  assert.ok(cand?.tail.every((m) => m.role !== "system"));
+});
+
+test("findResumeCandidate ignores a trailing system message on a single user tail", () => {
+  const base = [
+    { role: "user", content: [{ type: "text", text: "start" }] },
+    { role: "assistant", content: [{ type: "text", text: "ok" }] },
+  ];
+  const incoming = [
+    ...base,
+    { role: "user", content: [{ type: "text", text: "next" }] },
+    { role: "system", content: [{ type: "text", text: "reminder" }] },
+  ];
+  const cand = findResumeCandidate({
+    entries: [entry(2, incoming)],
+    model: "claude-opus-4-8",
+    profileKey: PK,
+    bucket: BUCKET,
+    messages: incoming,
+    lastIsToolResult: false,
+    hashMessages,
+  });
+  assert.equal(cand?.mode, "resume");
+  assert.equal(cand?.tail.length, 1);
+  assert.equal(cand?.tail[0].content[0].text, "next");
+});
+
 test("findResumeCandidate returns resume-catchup for multi-message tail", () => {
   const incoming = [
     { role: "user", content: [{ type: "text", text: "start" }] },
