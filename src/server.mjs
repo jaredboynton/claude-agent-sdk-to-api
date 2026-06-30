@@ -514,7 +514,14 @@ function buildParkingMcpServer(tools, session, createServer = createSdkMcpServer
             const idx = session.orphanResolvers.indexOf(wrappedResolve);
             if (idx !== -1) session.orphanResolvers.splice(idx, 1);
           }
-          if (session.codeMode && originalName === "code" && id) clearCodeRun(session, id);
+          if (session.codeMode && originalName === "code" && id) {
+            clearCodeRun(session, id);
+            // clearCodeRun only nulls session.codeRun; also drop codeDriving
+            // so SDK events are no longer suppressed and the client doesn't
+            // see silence after the 30-min code-handler timeout.
+            session.codeDriving = false;
+            session.suppressEndTurn = false;
+          }
           session.lastActivity = Date.now();
           process.stderr.write(`${LOG_PREFIX} tool ${id ?? originalName} park timeout after ${TOOL_TIMEOUT_MS}ms; returning isError\n`);
           resolve({ content: [{ type: "text", text: `Tool result was not provided within ${TOOL_TIMEOUT_MS}ms` }], isError: true });
@@ -698,6 +705,37 @@ function normalizeUsage(u) {
     output_tokens: u.output_tokens || 0,
     cache_creation_input_tokens: u.cache_creation_input_tokens || 0,
     cache_read_input_tokens: u.cache_read_input_tokens || 0,
+  };
+}
+
+// A client-facing usage object that preserves the full upstream shape (cache
+// breakdown, server_tool_use, service_tier, iterations, speed, etc.) so
+// downstream consumers like Claude Code's statusbar see the same fields the
+// real Anthropic API would return. Shallow-clone so we can mutate output_tokens
+// on message_delta without touching the cached original.
+function cloneUsageForClient(u) {
+  if (!u || typeof u !== "object") return null;
+  const out = { ...u };
+  // Guarantee the canonical four fields the SDK and clients rely on.
+  out.input_tokens = u.input_tokens || 0;
+  out.output_tokens = u.output_tokens || 0;
+  out.cache_creation_input_tokens = u.cache_creation_input_tokens || 0;
+  out.cache_read_input_tokens = u.cache_read_input_tokens || 0;
+  return out;
+}
+
+// Fabricated code-mode tool-wave turns are NOT real upstream messages, so they
+// must not reset visible usage to zero (Claude Code's statusbar would bounce).
+// Replay the last real upstream usage if we have one; otherwise emit a complete
+// zeroed usage object so clients that read usage.input_tokens never crash.
+function clientVisibleUsage(session) {
+  const last = session.lastRawUsage;
+  if (last) return cloneUsageForClient(last);
+  return {
+    input_tokens: 0,
+    output_tokens: 0,
+    cache_creation_input_tokens: 0,
+    cache_read_input_tokens: 0,
   };
 }
 
@@ -1275,8 +1313,9 @@ function maybeDispatchQueuedWave(session) {
   // Start a fresh fabricated assistant message. The client (and its subagent
   // accounting) reads message.usage.input_tokens, so a bare { role } here
   // throws "undefined is not an object (evaluating 'o.input_tokens')". Emit a
-  // complete message envelope with a usage object (zeroed — the real token
-  // accounting rides on the SDK's own message_start/message_delta events).
+  // complete message envelope with a usage object — but replay the last real
+  // upstream usage instead of zeros, so statusbar context does not bounce to
+  // zero between real upstream messages during a code-mode tool wave.
   writeEvent(session, {
     type: "message_start",
     message: {
@@ -1287,12 +1326,7 @@ function maybeDispatchQueuedWave(session) {
       content: [],
       stop_reason: null,
       stop_sequence: null,
-      usage: {
-        input_tokens: 0,
-        output_tokens: 0,
-        cache_creation_input_tokens: 0,
-        cache_read_input_tokens: 0,
-      },
+      usage: clientVisibleUsage(session),
     },
   });
 
@@ -1326,12 +1360,13 @@ function maybeDispatchQueuedWave(session) {
   }
 
   // Close the fabricated message + HTTP turn. message_delta carries a usage
-  // object in the real API; include a zeroed one so clients that read
-  // delta.usage.output_tokens don't trip over undefined.
+  // object in the real API; include one (replaying last known output tokens)
+  // so clients that read delta.usage.output_tokens don't trip over undefined
+  // and the statusbar doesn't bounce to zero during a code-mode tool wave.
   writeEvent(session, {
     type: "message_delta",
     delta: { stop_reason: "tool_use", stop_sequence: null },
-    usage: { output_tokens: 0 },
+    usage: { output_tokens: session.lastRawUsage?.output_tokens ?? 0 },
   });
   writeEvent(session, {
     type: "message_stop",
@@ -1477,6 +1512,7 @@ function createSession(key, model, tools, callerSystem, bucket, { resume, codeMo
     res: null,                    // current streaming HTTP response
     nonStream: null,              // { blocks, stopReason } when buffering for non-stream
     lastUsage: { input_tokens: 0, output_tokens: 0 },
+    lastRawUsage: null,           // full-shape upstream usage for client replay
     lastActivity: Date.now(),
     closed: false,
     turnMetrics: null,
@@ -1492,9 +1528,23 @@ function createSession(key, model, tools, callerSystem, bucket, { resume, codeMo
     mcpServers: mcpServer ? [mcpServer] : [],
     strictMcpConfig: true,
     permissionMode: "bypassPermissions", // MCP handlers (our parking tools) must run without prompts
+    allowDangerouslySkipPermissions: true, // SDK types require this whenever permissionMode is bypassPermissions
     cwd,
     includePartialMessages: true,
     abortController,
+    // The proxy parks MCP handlers across HTTP turns (minutes), but the
+    // SDK's bundled CLI closes its stdin stream after CLAUDE_CODE_STREAM_CLOSE_TIMEOUT
+    // ms of inactivity (default ~60s). Without raising it to outlast our
+    // TOOL_TIMEOUT_MS, the CLI gives up on parked handlers before our own
+    // watchdog fires — producing the "model hangs after tool calls" symptom
+    // (SDK issue #114). Pass a per-query env that raises stream-close to
+    // TOOL_TIMEOUT_MS + a grace window. env REPLACES process.env, so spread it.
+    env: {
+      ...process.env,
+      CLAUDE_CODE_STREAM_CLOSE_TIMEOUT: String(
+        Number(process.env.CLAUDE_CODE_STREAM_CLOSE_TIMEOUT) || (TOOL_TIMEOUT_MS + 60000)
+      ),
+    },
   };
   if (resume) queryOptions.resume = resume;
   session.query = query({ prompt: input.iterable, options: queryOptions });
@@ -1570,6 +1620,11 @@ async function consumeSession(session) {
         if (ev.type === "message_start" && ev.message?.usage) {
           const u = normalizeUsage(ev.message.usage);
           if (u) session.lastUsage = u;
+          // Preserve the full upstream shape for client-facing replay
+          // (fabricated code-mode waves reuse this so statusbar usage does
+          // not bounce to zero between real upstream messages).
+          const full = cloneUsageForClient(ev.message.usage);
+          if (full) session.lastRawUsage = full;
           // message_start usage is authoritative for the prefill cache/input
           // tokens of this upstream call; accumulate global counters and the
           // per-turn row from it. (An HTTP turn may contain several upstream
@@ -1580,6 +1635,7 @@ async function consumeSession(session) {
           // delta usage carries the running output total for the current message.
           if (ev.usage.output_tokens != null) {
             session.lastUsage.output_tokens = ev.usage.output_tokens;
+            if (session.lastRawUsage) session.lastRawUsage.output_tokens = ev.usage.output_tokens;
             if (session.turnMetrics) session.turnMetrics._curMsgOutput = ev.usage.output_tokens;
           }
         }
@@ -1590,10 +1646,28 @@ async function consumeSession(session) {
         if (msg.usage) {
           const u = normalizeUsage(msg.usage);
           if (u) session.lastUsage = u;
+          const full = cloneUsageForClient(msg.usage);
+          if (full) session.lastRawUsage = full;
         }
         if (session.nonStream && msg.stop_reason) session.nonStream.stopReason = msg.stop_reason;
         if (msg.subtype && msg.subtype !== "success") {
           failTurn(session, new Error(`SDK result ${msg.subtype}`));
+        } else if (msg.subtype === "success" && session.currentTurn) {
+          // Fallback turn settlement: the SDK emitted a successful result
+          // WITHOUT a preceding message_stop (SDK bugs #333 / #339 — iterator
+          // silent after tool_result, or ends without result). Without this
+          // fallback the HTTP turn would hang indefinitely waiting on an
+          // event that never arrives. Only resolve if a turn is still
+          // attached; otherwise endTurn is a no-op and we just clear state.
+          process.stderr.write(`${LOG_PREFIX} result=success without message_stop key=${session.key.slice(0, 8)}; settling turn via result fallback\n`);
+          endTurn(session);
+        }
+      } else if (msg.type === "system" && msg.subtype === "session_state_changed" && msg.state === "idle") {
+        // The SDK's authoritative turn-over signal. If a turn is still
+        // attached (message_stop was missed), settle it now.
+        if (session.currentTurn) {
+          process.stderr.write(`${LOG_PREFIX} session_state=idle without message_stop key=${session.key.slice(0, 8)}; settling turn via idle fallback\n`);
+          endTurn(session);
         }
       }
     }
@@ -2087,6 +2161,37 @@ async function handleMessages(req, res) {
   }
 }
 
+// Anthropic OAuth usage endpoint (the same one ~/.claude-/statusline.py calls
+// out-of-band for extra_usage). Limited to a known-safe upstream host so the
+// pass-through can never be redirected by the client.
+const ANTHROPIC_API_ORIGIN = "https://api.anthropic.com";
+const OAUTH_PASS_THROUGH_PATHS = new Set([
+  "/api/oauth/usage",
+]);
+
+// Forward an OAuth usage request to the real Anthropic endpoint, preserving
+// the client's Authorization header. The proxy does not see or store the
+// token. Used so Claude Code's statusbar rate_limits populate correctly when
+// ANTHROPIC_BASE_URL points at this proxy.
+async function forwardOauthUsage(req, res, rawUrl) {
+  const headers = { "accept": "application/json" };
+  const auth = req.headers["authorization"];
+  if (auth) headers["authorization"] = Array.isArray(auth) ? auth.join(",") : String(auth);
+  const beta = req.headers["anthropic-beta"];
+  if (beta) headers["anthropic-beta"] = Array.isArray(beta) ? beta.join(",") : String(beta);
+  try {
+    const upstream = new URL(ANTHROPIC_API_ORIGIN + rawUrl);
+    const up = await fetch(upstream, { method: "GET", headers, signal: AbortSignal.timeout(8000) });
+    const contentType = up.headers.get("content-type") || "application/json";
+    const body = Buffer.from(await up.arrayBuffer());
+    res.writeHead(up.status, { "content-type": contentType, "content-length": body.length });
+    res.end(body);
+  } catch (e) {
+    process.stderr.write(`${LOG_PREFIX} oauth usage pass-through failed: ${e?.message || e}\n`);
+    jsonResp(res, 502, { type: "error", error: { type: "api_error", message: `upstream usage fetch failed: ${e?.message || e}` } });
+  }
+}
+
 // Start the HTTP server. Auth (CLAUDE_CONFIG_DIR / token) must already be applied
 // to process.env by the caller (src/auth.mjs). Returns the http.Server.
 export function startServer({ port = 32809, host = "127.0.0.1", account = null, profileDir = process.env.CLAUDE_CONFIG_DIR, version = null, codeMode = true, anchorEdit = true, cacheLog = process.env.CACHE_LOG } = {}) {
@@ -2156,6 +2261,36 @@ export function startServer({ port = 32809, host = "127.0.0.1", account = null, 
         return jsonResp(res, 200, { input_tokens: 1 });
       }
     }
+    // OAuth usage / rate-limit pass-through. Claude Code may probe private
+    // usage endpoints through ANTHROPIC_BASE_URL to populate statusbar
+    // rate_limits. The proxy talks upstream through the Claude Agent SDK
+    // (which does not expose these endpoints), so forward the request to the
+    // real Anthropic OAuth endpoint with the client's Authorization header.
+    // The proxy never sees or stores the token. Limited to a known-safe
+    // upstream host and an allowlist of paths.
+    if (req.method === "GET" && OAUTH_PASS_THROUGH_PATHS.has(url)) {
+      return forwardOauthUsage(req, res, rawUrl);
+    }
+    // Secret-safe unknown-route diagnostics: Claude Code sometimes probes
+    // private usage/rate-limit/status endpoints through ANTHROPIC_BASE_URL.
+    // Surface the route + a non-sensitive header allowlist so a missing
+    // compatibility surface is observable instead of a silent 404. Never log
+    // authorization, cookies, or the request body.
+    const SAFE_HEADERS = [
+      "anthropic-beta",
+      "anthropic-version",
+      "user-agent",
+      "content-type",
+      "accept",
+    ];
+    const safeHeaders = {};
+    for (const h of SAFE_HEADERS) {
+      const v = req.headers[h];
+      if (v != null) safeHeaders[h] = Array.isArray(v) ? v.join(",") : String(v);
+    }
+    process.stderr.write(
+      `${LOG_PREFIX} 404 ${req.method} ${url} headers=${JSON.stringify(safeHeaders)}\n`
+    );
     jsonResp(res, 404, { type: "error", error: { type: "not_found_error", message: `unknown route: ${req.method} ${url}` } });
   });
 

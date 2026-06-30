@@ -584,6 +584,82 @@ test("fabricated wave message_start carries a usage object (no undefined input_t
   assert.equal(tu.content_block.name, "Grep");
 });
 
+test("fabricated wave reuses last real upstream usage instead of zeros (no statusbar bounce)", () => {
+  const events = [];
+  const session = fakeCodeSession({
+    model: "claude-opus-4-8",
+    currentTurn: { resolve: () => {} },
+    res: { writableEnded: false, write: (s) => { const m = s.match(/^data: (.+)\n\n$/m); if (m) events.push(JSON.parse(m[1])); } },
+    lastRawUsage: {
+      input_tokens: 1234,
+      output_tokens: 56,
+      cache_creation_input_tokens: 100000,
+      cache_read_input_tokens: 90000,
+      service_tier: "standard",
+      cache_creation: { ephemeral_1h_input_tokens: 100000, ephemeral_5m_input_tokens: 0 },
+    },
+  });
+  initMessageProjection(session);
+  const codeId = "toolu_code_main";
+  const syn0 = syntheticIdFor(codeId, 1, 0);
+  session.codeRun = {
+    codeId,
+    aborted: false,
+    currentWave: null,
+    preamble: null,
+    waveQueue: [{
+      waveNum: 1,
+      calls: [{ syntheticId: syn0, tool: "Grep", args: { pattern: "x", path: "/r" }, inlineError: null }],
+      results: [null],
+      pending: new Set([syn0]),
+    }],
+  };
+  maybeDispatchQueuedWave(session);
+  const start = events.find((e) => e.type === "message_start");
+  assert.ok(start?.message?.usage, "fabricated message_start has usage");
+  // Reuses the real upstream input tokens — does NOT reset to 0.
+  assert.equal(start.message.usage.input_tokens, 1234);
+  assert.equal(start.message.usage.cache_read_input_tokens, 90000);
+  // Preserves extra fields Claude Code's statusbar may read.
+  assert.equal(start.message.usage.service_tier, "standard");
+  const delta = events.find((e) => e.type === "message_delta");
+  assert.equal(delta?.usage?.output_tokens, 56, "delta reuses last known output tokens");
+});
+
+test("fabricated wave falls back to a complete zeroed usage when no upstream usage has arrived yet", () => {
+  const events = [];
+  const session = fakeCodeSession({
+    model: "claude-opus-4-8",
+    currentTurn: { resolve: () => {} },
+    res: { writableEnded: false, write: (s) => { const m = s.match(/^data: (.+)\n\n$/m); if (m) events.push(JSON.parse(m[1])); } },
+    lastRawUsage: null,
+  });
+  initMessageProjection(session);
+  const codeId = "toolu_code_main";
+  const syn0 = syntheticIdFor(codeId, 1, 0);
+  session.codeRun = {
+    codeId,
+    aborted: false,
+    currentWave: null,
+    preamble: null,
+    waveQueue: [{
+      waveNum: 1,
+      calls: [{ syntheticId: syn0, tool: "Grep", args: { pattern: "x", path: "/r" }, inlineError: null }],
+      results: [null],
+      pending: new Set([syn0]),
+    }],
+  };
+  maybeDispatchQueuedWave(session);
+  const start = events.find((e) => e.type === "message_start");
+  assert.ok(start?.message?.usage, "fabricated message_start has usage");
+  // Crash protection: the four canonical fields exist and are numbers.
+  assert.equal(typeof start.message.usage.input_tokens, "number");
+  assert.equal(start.message.usage.input_tokens, 0);
+  assert.equal(typeof start.message.usage.cache_read_input_tokens, "number");
+  const delta = events.find((e) => e.type === "message_delta");
+  assert.equal(typeof delta?.usage?.output_tokens, "number");
+});
+
 // ---------------------------------------------------------------------------
 // abandonToolRound / clearAllCodeState
 // ---------------------------------------------------------------------------

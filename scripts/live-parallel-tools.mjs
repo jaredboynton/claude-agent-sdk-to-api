@@ -9,7 +9,8 @@
 // correctly, and the tool_result round-trip unblocks the loop promptly.
 //
 // Asserts the second turn's message_stop arrives within STOP_BUDGET_MS (60s),
-// far under the 270s pre-fix hang. Run against a throwaway port to avoid
+// far under the 270s pre-fix hang. Turn1 retries up to MAX_TURN1_ATTEMPTS when
+// the model emits fewer than two tool calls (otherwise the scenario is not exercised).
 // disrupting any running daemon:
 //
 //   node bin/cli.mjs run --no-self-update --profile <dir> --port 32821 &
@@ -20,8 +21,9 @@
 const PORT = Number(process.argv[2] || 32821);
 const HOST = "127.0.0.1";
 const BASE = `http://${HOST}:${PORT}`;
-const MODEL = "claude-opus-4-8";
+const MODEL = process.env.MODEL || "claude-opus-4-8";
 const STOP_BUDGET_MS = 60000;
+const MAX_TURN1_ATTEMPTS = 3;
 
 // Two tools with JSON-Schema `default` values — the exact shape that triggered
 // the hang. The model's streamed input omits the defaulted keys; the SDK parses
@@ -128,6 +130,29 @@ async function postMessages(messages, label) {
   return consumeTurn(res, label);
 }
 
+async function requestParallelTurn1(userText) {
+  let turn1 = null;
+  for (let attempt = 1; attempt <= MAX_TURN1_ATTEMPTS; attempt++) {
+    turn1 = await postMessages(
+      [{ role: "user", content: [{ type: "text", text: userText }] }],
+      `turn1-attempt-${attempt}`,
+    );
+    console.log(
+      `turn1 attempt ${attempt}/${MAX_TURN1_ATTEMPTS}: stopReason=${turn1.stopReason} `
+      + `toolUses=${turn1.toolUses.length} elapsed=${turn1.elapsed}ms`,
+    );
+    for (const t of turn1.toolUses) console.log(`  -> ${t.name} id=${t.id} input=${JSON.stringify(t.input)}`);
+    if (turn1.toolUses.length >= 2) return turn1;
+    if (attempt < MAX_TURN1_ATTEMPTS) {
+      console.log(`retrying turn1: model emitted ${turn1.toolUses.length} tool call(s); need >=2 for parallel correlation.`);
+    }
+  }
+  throw new Error(
+    `turn1 failed after ${MAX_TURN1_ATTEMPTS} attempt(s): model emitted ${turn1.toolUses.length} tool call(s); `
+    + "need >=2 parallel tool calls to exercise the correlation fix.",
+  );
+}
+
 async function main() {
   const userText =
     "Use the Grep and Glob tools IN PARALLEL in this single turn (do not run them one at a time): "
@@ -135,13 +160,7 @@ async function main() {
     + "and Glob for pattern '**/*.md' in folder '/Users/jaredboynton/__devlocal/unifable'. "
     + "After both return, summarize the counts briefly.";
 
-  const turn1 = await postMessages([{ role: "user", content: [{ type: "text", text: userText }] }], "turn1");
-  console.log(`turn1: stopReason=${turn1.stopReason} toolUses=${turn1.toolUses.length} elapsed=${turn1.elapsed}ms`);
-  for (const t of turn1.toolUses) console.log(`  -> ${t.name} id=${t.id} input=${JSON.stringify(t.input)}`);
-
-  if (turn1.toolUses.length < 2) {
-    console.log(`note: model emitted ${turn1.toolUses.length} tool call(s) (<2); cannot fully exercise parallel correlation. Re-run if this happens.`);
-  }
+  const turn1 = await requestParallelTurn1(userText);
 
   // Build the tool_result round-trip. Return plausible content for each call.
   const assistantContent = [];

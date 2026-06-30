@@ -19,7 +19,7 @@ const STOP_BUDGET_MS = 120000;
 const TOOLS = [
   {
     name: "Grep",
-    description: "Search file contents for a pattern.",
+    description: "Search file contents for a pattern. Returns plain newline-delimited text, not JSON.",
     input_schema: {
       type: "object",
       properties: {
@@ -33,7 +33,7 @@ const TOOLS = [
   },
   {
     name: "Glob",
-    description: "Find files matching a glob pattern.",
+    description: "Find files matching a glob pattern. Returns plain newline-delimited paths, not JSON.",
     input_schema: {
       type: "object",
       properties: {
@@ -132,10 +132,12 @@ async function healthz() {
 async function main() {
   const h0 = await healthz().catch(() => ({}));
   console.log(`healthz: codeMode=${h0.codeMode} codeCalls=${h0.codeCalls} codeWaves=${h0.codeWaves}`);
+  const startCodeErrors = h0.codeErrors ?? 0;
 
   const userText =
     "Use ONE code tool call to search pattern 'agent' in path "
     + "'/Users/jaredboynton/__devlocal/claude-agent-sdk-to-api' with Grep, and glob '**/*.mjs' in the same folder with Glob. "
+    + "Tool results are plain newline-delimited text, not JSON; do not call JSON.parse on tool results. "
     + "In your script, use Promise.all to call both tools in parallel, then return a JSON summary { grepLineCount, fileCount }.";
 
   const turn1 = await postMessages([{ role: "user", content: [{ type: "text", text: userText }] }], { label: "turn1" });
@@ -182,8 +184,10 @@ async function main() {
 
   const h1 = await healthz().catch(() => ({}));
   console.log(`healthz after: codeCalls=${h1.codeCalls} codeSubCalls=${h1.codeSubCalls} codeWaves=${h1.codeWaves} codeErrors=${h1.codeErrors}`);
+  const noCodeErrors = (h1.codeErrors ?? 0) === startCodeErrors;
+  console.log(noCodeErrors ? "PASS: no code-mode script errors." : `FAIL: codeErrors increased (${startCodeErrors} -> ${h1.codeErrors}).`);
 
-  process.exit(noHang && transparentOk ? 0 : 1);
+  process.exit(noHang && transparentOk && noCodeErrors ? 0 : 1);
 }
 
 main().catch((e) => { console.error("driver error:", e?.stack || e); process.exit(1); });
