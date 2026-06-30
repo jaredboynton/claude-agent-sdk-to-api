@@ -121,16 +121,6 @@ export class CodeValidationError extends Error {
   }
 }
 
-function toolResultText(result) {
-  if (!result) return "";
-  if (typeof result === "string") return result;
-  if (result.text != null) return String(result.text);
-  if (Array.isArray(result.content)) {
-    return result.content.map((c) => (c?.type === "text" ? c.text : JSON.stringify(c))).join("\n");
-  }
-  return JSON.stringify(result);
-}
-
 const JS_IDENT_RE = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
 
 function jsonLiteral(value) {
@@ -141,12 +131,9 @@ function propertyName(name) {
   return JS_IDENT_RE.test(name) ? name : jsonLiteral(name);
 }
 
-function asObject(value) {
-  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
-}
-
-export function normalizeClientToolMeta(name, meta = {}) {
-  const inputSchema = asObject(meta.input_schema);
+export function normalizeClientToolMeta(_name, meta = {}) {
+  const raw = meta.input_schema;
+  const inputSchema = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
   return {
     description: typeof meta.description === "string" ? meta.description : "",
     input_schema: Object.keys(inputSchema).length ? inputSchema : { type: "object", properties: {} },
@@ -215,7 +202,8 @@ function renderObject(schema, indent) {
   const required = new Set(Array.isArray(schema.required) ? schema.required : []);
   const props = schema.properties && typeof schema.properties === "object" ? schema.properties : {};
   const names = Object.keys(props).sort();
-  const hasDescriptions = names.some((n) => propCommentLines(props[n]).length);
+  const propComments = new Map(names.map((n) => [n, propCommentLines(props[n])]));
+  const hasDescriptions = names.some((n) => propComments.get(n).length);
 
   const renderProp = (name) => {
     const opt = required.has(name) ? "" : "?";
@@ -226,7 +214,7 @@ function renderObject(schema, indent) {
     const inner = indent + "  ";
     const lines = ["{"];
     for (const name of names) {
-      for (const dl of propCommentLines(props[name])) {
+      for (const dl of propComments.get(name)) {
         lines.push(`${inner}// ${dl}`);
       }
       lines.push(`${inner}${renderProp(name)}`);
@@ -271,8 +259,8 @@ function propCommentLines(schema) {
 /** Build a typed declaration block for one client tool (codex-style). */
 function describeClientTool(name, meta) {
   const normalized = normalizeClientToolMeta(name, meta);
-  const argsType = jsonSchemaToTs(normalized.input_schema || { type: "object", properties: {} });
-  const desc = typeof normalized.description === "string" ? normalized.description.trim() : "";
+  const argsType = jsonSchemaToTs(normalized.input_schema);
+  const desc = normalized.description.trim();
   const heading = `### ${name}`;
   const sig = `${name}(args: ${argsType})`;
   return desc ? `${heading}\n${desc}\n${sig}` : `${heading}\n${sig}`;
@@ -393,9 +381,6 @@ export function runCodeScriptDynamic(script, {
     worker.on("message", async (msg) => {
       if (!msg || typeof msg !== "object") return;
       if (msg.type === "wave") {
-        // Dispatch to the bridge; bridge fabricates client tool calls and
-        // resolves with an array of { text, raw, isError } once all wave
-        // results arrive. Pipe the results (or error) back to the worker.
         try {
           const results = await dispatchWave(msg.wave, msg.calls || []);
           if (settled) return;
@@ -481,7 +466,6 @@ export function runCodeScriptDynamic(script, {
         toolNames,
         maxWaves,
         maxCalls,
-        timeoutMs,
       });
     } catch (e) {
       fail(new Error(`failed to post run to worker: ${e?.message || e}`));

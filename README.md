@@ -136,7 +136,7 @@ When enabled (the default), every `Read` result is annotated with a stable per-l
 |---|---|---|
 | `PORT` | `32809` | Listen port (also `--port`) |
 | `HOST` | `127.0.0.1` | Listen host (also `--host`) |
-| `SESSION_TTL_MS` | `300000` | Idle session eviction (matches Claude prompt cache) |
+| `SESSION_TTL_MS` | `10800000` | Idle session eviction (3 h default) |
 | `TOOL_TIMEOUT_MS` | `1800000` | Parked-tool watchdog; returns an error result so the loop survives |
 | `HEARTBEAT_MS` | `15000` | SSE keep-alive interval |
 | `CODE_SCRIPT_TIMEOUT_MS` | `0` (no cap) | Optional Worker wall-clock cap on a `code` script's own compute; `0` = unlimited |

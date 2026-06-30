@@ -21,8 +21,10 @@
 //   - Cold start (model swap / TTL eviction / restart): a fresh session is
 //     primed with the full prior transcript so context is recovered; the live
 //     loop still drives every NEW tool call.
-//   - Sessions idle past SESSION_TTL_MS (5 min, matches Claude's prompt cache)
-//     are closed by a sweeper, unless a client tool round is still active.
+//   - Sessions idle past SESSION_TTL_MS (default 3 h) are closed by a sweeper,
+//     unless a client tool round is still active. The TTL is a UX choice (keep
+//     sessions warm across normal idle gaps), not a prompt-cache-alignment
+//     choice — 3 h exceeds the 5 m / 1 h cache windows.
 //
 // Authentication is handled by src/auth.mjs BEFORE this module's query() runs:
 // the SDK's bundled `claude` authenticates natively off the profile named by
@@ -73,9 +75,9 @@ import {
   ANCHORED_EDIT_TOOLS,
 } from "./anchor-edit.mjs";
 
-const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS || process.env.ACP_SESSION_TTL_MS || 300000); // 5 min
+const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS || process.env.ACP_SESSION_TTL_MS || 10800000); // 3 h
 const HEARTBEAT_MS = Number(process.env.HEARTBEAT_MS || process.env.ACP_HEARTBEAT_MS || 15000);
-const TOOL_TIMEOUT_MS = Number(process.env.TOOL_TIMEOUT_MS || process.env.ACP_TOOL_TIMEOUT_MS || 1800000); // 30 min; active tool rounds are retained past SESSION_TTL_MS
+const TOOL_TIMEOUT_MS = Number(process.env.TOOL_TIMEOUT_MS || process.env.ACP_TOOL_TIMEOUT_MS || 1800000); // 30 min; a tool_result that never arrives returns isError so the SDK loop survives
 // NOTE: there is intentionally NO turn-level timeout/watchdog. A clock-based
 // backstop only masks the real failure (a wedged turn) and silently drops
 // context. Turn teardown is purely EVENT-DRIVEN off the SDK query() lifecycle:
@@ -1747,7 +1749,7 @@ function resolveTool(session, toolUseId, result) {
   }
 }
 
-// Idle sweeper: close sessions past the TTL (matches Claude prompt-cache window).
+// Idle sweeper: close sessions past SESSION_TTL_MS.
 const sweeper = setInterval(() => {
   const now = Date.now();
   for (const [key, s] of sessions) {
@@ -2161,7 +2163,7 @@ export function startServer({ port = 32809, host = "127.0.0.1", account = null, 
     process.stderr.write(`${LOG_PREFIX} listening on http://${host}:${port}\n`);
     process.stderr.write(`${LOG_PREFIX} CLAUDE_CONFIG_DIR: ${profileDir || "(default)"}\n`);
     process.stderr.write(`${LOG_PREFIX} account: ${account?.email || "(unconfirmed — SDK is source of truth)"}\n`);
-    process.stderr.write(`${LOG_PREFIX} stateful session bridge (TTL ${SESSION_TTL_MS}ms) — one live query() per conversation\n`);
+    process.stderr.write(`${LOG_PREFIX} stateful session bridge (TTL ${SESSION_TTL_MS}ms ≈ ${Math.round(SESSION_TTL_MS / 60000)}min) — one live query() per conversation\n`);
   });
 
   const shutdown = () => { try { server.close(); } catch {} process.exit(0); };

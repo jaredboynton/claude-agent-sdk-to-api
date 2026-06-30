@@ -14,37 +14,23 @@ import {
   NATIVE_PARALLEL_APPEND,
 } from "../src/code-mode.mjs";
 import {
-  toolInputShape,
   abandonToolRound,
   persistResumeIndex,
-  createSession,
-  startCodeRun,
-  dispatchCodeWave,
-  maybeDispatchQueuedWave,
-  resolveCodeModeToolResults,
   projectEvent,
   initMessageProjection,
   clearAllCodeState,
-  clearCodeRun,
   syntheticIdFor,
-  internalResolveCode,
-  endTurn,
-  resolveTool,
-  writeEvent,
-  accumulateStreamEvent,
-  emitClientToolUse,
   findSession,
   markSeen,
   sessions,
   bucketKey,
   hashMessages,
-  toCallToolResult,
   buildParkingMcpServer,
   hasActiveToolRound,
   normalizeModel,
   modelObject,
+  maybeDispatchQueuedWave,
 } from "../src/server.mjs";
-import { z } from "../src/sdk.mjs";
 
 const GREP_SCHEMA = {
   type: "object",

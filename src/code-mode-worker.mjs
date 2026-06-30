@@ -3,7 +3,7 @@
 // script may run as long as it needs — no time/wave/call caps by default.
 //
 // Protocol with the parent:
-//   parent -> worker: { type: "run", script, toolNames, maxWaves, maxCalls, timeoutMs }
+//   parent -> worker: { type: "run", script, toolNames, maxWaves, maxCalls }
 //   worker -> parent: { type: "wave", wave: N, calls: [{name, args}] }
 //   parent -> worker: { type: "wave_result", wave: N, results: [{text, raw, isError}] | {error} }
 //   worker -> parent: { type: "done", value, logs, waves, calls }
@@ -22,9 +22,6 @@ let waveSeq = 0;
 let callCount = 0;
 let maxWaves = 0; // 0 = unlimited
 let maxCalls = 0; // 0 = unlimited
-let timedOut = false;
-
-const JS_IDENT_RE = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
 
 function postToParent(msg) {
   parentPort.postMessage(msg);
@@ -35,7 +32,6 @@ function makeCallTool(name) {
 }
 
 function callTool(name, args) {
-  if (timedOut) return Promise.reject(new Error("code script aborted"));
   if (maxCalls > 0 && callCount >= maxCalls) {
     return Promise.resolve({
       text: `code call limit reached (${maxCalls} calls)`,
@@ -59,7 +55,6 @@ function callTool(name, args) {
 
 async function flush() {
   if (pending.length === 0) { flushing = false; return; }
-  if (timedOut) { flushing = false; return; }
   const batch = pending;
   pending = [];
   waveSeq++;
@@ -89,7 +84,7 @@ async function flush() {
   });
   flushing = false;
   // If more calls accumulated while we were waiting, flush again.
-  if (pending.length > 0 && !timedOut) {
+  if (pending.length > 0) {
     flushing = true;
     Promise.resolve().then(flush).catch(() => {});
   }
@@ -114,22 +109,22 @@ function handleWaveResult(msg) {
   resolveWave();
 }
 
-function buildToolsProxy(toolNames) {
-  const tools = {};
+function buildToolsProxy(toolNames = []) {
+  const cache = new Map();
   for (const name of toolNames) {
-    if (JS_IDENT_RE.test(name)) tools[name] = makeCallTool(name);
+    if (typeof name === "string") cache.set(name, makeCallTool(name));
   }
-  // Proxy fallback for any name (handles non-identifier tool names and unknowns).
-  const handler = {
-    get(target, prop) {
-      if (prop in target) return target[prop];
-      if (typeof prop === "string") {
-        return makeCallTool(prop);
+  return new Proxy({}, {
+    get(_, prop) {
+      if (typeof prop !== "string" || prop === "then") return undefined;
+      let fn = cache.get(prop);
+      if (!fn) {
+        fn = makeCallTool(prop);
+        cache.set(prop, fn);
       }
-      return undefined;
+      return fn;
     },
-  };
-  return new Proxy(tools, handler);
+  });
 }
 
 async function runScript(script, toolNames) {
@@ -198,7 +193,6 @@ parentPort.on("message", async (msg) => {
     maxCalls = msg.maxCalls ?? 0;
     try {
       const value = await runScript(msg.script, msg.toolNames || []);
-      if (timedOut) return;
       postToParent({
         type: "done",
         value: value === undefined ? null : value,
@@ -207,7 +201,6 @@ parentPort.on("message", async (msg) => {
         calls: callCount,
       });
     } catch (err) {
-      if (timedOut) return;
       postToParent({
         type: "done",
         error: normalizeRunError(err),
