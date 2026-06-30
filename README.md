@@ -88,20 +88,20 @@ See `examples/curl-and-client.mjs` for a complete tool round-trip: POST a messag
 
 ## Code mode (opt-out by default)
 
-When enabled (the default), the bridge collapses the client's N tools into one deterministic `code({ calls, script })` meta-tool for the model. The model declares all client tool invocations upfront in `calls[]`; the bridge expands them into normal `tool_use` blocks for the unchanged client, collapses N `tool_result`s, runs the script in a JS sandbox, and returns only the script's output to the model. This reduces context growth (especially raw tool results) and improves cache-read efficiency on multi-tool turns.
+When enabled (the default), the bridge exposes a single `code({ script })` meta-tool to the model. The model writes an async JavaScript script that calls the client's tools via `await tools.<Name>(args)` (or `await callTool(name, args)`). The bridge runs the script inside a Worker-contained `node:vm` sandbox; each `await`ed tool call becomes a wave of synthetic `tool_use` blocks for the unchanged client, and only the script's return value enters the model's context. This collapses multi-step dependent tool chains (read → decide → grep → read) into **one model round-trip** — tool waves inside `code` cost zero model cache reads.
 
-The original client tools are still exposed alongside `code`, so clients keep their native schemas and interactive/approval/user-input flows can run directly instead of being forced through batching.
+The original client tools are still exposed alongside `code`, so clients keep their native schemas and interactive/approval/user-input flows can run directly instead of being forced through `code`.
 
-**Contract:** every sub-tool call must be listed in `calls[]` up front. The `script` processes results but cannot add new tool calls after seeing them. Data-dependent chaining requires a second `code` call on the next turn.
+**Script-first contract:** the script is a full async JS program. Call tools with `await tools.X(args)` / `await tools["Any-Name"](args)` / `await callTool(name, args)`, each returning `{ text, raw, isError }`. Bake branching/loops into the script — if the next step depends on a tool's result, call the next tool from inside the script instead of returning to the model. Wrap independent calls in `Promise.all([...])` to run them in one parallel wave; sequential `await`s are sequential waves. Do not put order-dependent or side-effect-chained calls in one wave. Only the script's return value is visible to the model.
 
 **Opt out:** set `"codeMode": false` on a profile in `profiles.json`, pass `--code-mode 0` to `claude-agent-api run`, or send `X-Code-Mode: 0` on a request.
 
-**Security:** scripts run in `node:vm`, which is not a hard sandbox. The daemon is local and the model is already authorized to request tools, but do not expose this to untrusted callers without hardening (e.g. `isolated-vm`).
+**Security:** scripts run in `node:vm` inside a Worker (so the parent can enforce wall-clock termination — `vm` timeout alone does not bound async continuations after an `await`). `node:vm` is not a hard security boundary and the script now orchestrates real I/O via the client's tools; the daemon is local and the model is already authorized to request tools, but do not expose this to untrusted callers without hardening (e.g. `isolated-vm`).
 
 Live validation (requires a running bridge):
 
-- `node scripts/live-code-mode.mjs <port>` — smoke test: one expand/collapse round-trip with mocked tool results; confirms the client stream is transparent (no `code` block) and the collapse completes without a park timeout.
-- `node scripts/live-code-mode-agent-task.mjs <port>` — thorough agent workflow: drives a real research-to-code-to-validate task (web search, multi-file generation in a temp project, allowlisted command validation, iterative fixes) and asserts code mode stayed transparent under a multi-turn, multi-tool workload. Requires network for `WebSearch`. Env: `MAX_TURNS`, `KEEP_CODE_MODE_FIXTURE=1`, `MODEL`.
+- `node scripts/live-code-mode.mjs <port>` — smoke test: one wave (Grep+Glob via `Promise.all`) with mocked tool results; confirms the client stream is transparent (no `code` block) and the script completes without a park timeout.
+- `node scripts/live-code-mode-agent-task.mjs <port>` — thorough agent workflow: drives a real research-to-code-to-validate task (web search, multi-file generation in a temp project, allowlisted command validation, iterative fixes) and asserts code mode stayed transparent under a multi-turn, multi-tool workload, including a dependent-chain assertion that one `code` call drove multiple waves. Requires network for `WebSearch`. Env: `MAX_TURNS`, `KEEP_CODE_MODE_FIXTURE=1`, `MODEL`.
 
 ## Environment knobs
 
@@ -112,14 +112,16 @@ Live validation (requires a running bridge):
 | `SESSION_TTL_MS` | `300000` | Idle session eviction (matches Claude prompt cache) |
 | `TOOL_TIMEOUT_MS` | `1800000` | Parked-tool watchdog; returns an error result so the loop survives |
 | `HEARTBEAT_MS` | `15000` | SSE keep-alive interval |
-| `CODE_SCRIPT_TIMEOUT_MS` | `10000` | Code-mode script sandbox timeout |
+| `CODE_SCRIPT_TIMEOUT_MS` | `30000` | Code-mode script Worker wall-clock timeout (parent terminates the worker) |
 | `CODE_SCRIPT_MAX_OUTPUT_BYTES` | `32768` | Maximum collapsed code result before returning a "summarize smaller" error |
+| `CODE_MAX_WAVES` | `32` | Max tool-call waves per `code` run (each wave = one client round-trip) |
+| `CODE_MAX_CALLS` | `64` | Max total tool calls per `code` run |
 | `X-Code-Mode` | (default on) | Per-request header: `0` disables, `1` enables code mode |
 | `CACHE_LOG` | (off) | `1`/`true` → append a per-turn usage row to `<profileDir>/cache-log.jsonl`; or set a path. Also `--cache-log [path]` on `run`, or `"cacheLog": true` per profile |
 
 ## Cache log (per-turn usage receipts)
 
-With `--cache-log` (or `CACHE_LOG=1`), the bridge appends one JSON line per completed HTTP turn capturing the turn's `read`/`create` (cache-read / cache-creation), `input`, and `output` tokens, plus `conv` (conversation id), `model`, `codeMode`, `codeSubCalls`, and `scriptOutBytes`. Cache tokens come from the authoritative `message_start` usage and are summed across all upstream messages in the turn (including code-mode internal continuations). Group by `conv` and price with the Opus card to turn the [code-mode savings model](docs/code-mode-cache-savings.md) into measured receipts. The writer is opt-in, append-only (survives restarts), and never throws into the request path. `/healthz` reports the active `cacheLog` path.
+With `--cache-log` (or `CACHE_LOG=1`), the bridge appends one JSON line per completed HTTP turn capturing the turn's `read`/`create` (cache-read / cache-creation), `input`, and `output` tokens, plus `conv` (conversation id), `model`, `codeMode`, `codeSubCalls`, `codeWaves`, and `scriptOutBytes`. Cache tokens come from the authoritative `message_start` usage and are summed across all upstream messages in the turn (including code-mode internal continuations). Group by `conv` and price with the Opus card to turn the [code-mode savings model](docs/code-mode-cache-savings.md) into measured receipts. The writer is opt-in, append-only (survives restarts), and never throws into the request path. `/healthz` reports the active `cacheLog` path.
 
 ## Tests
 

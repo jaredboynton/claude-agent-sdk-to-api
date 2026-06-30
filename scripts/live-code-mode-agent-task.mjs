@@ -306,11 +306,13 @@ async function executeTool(root, t) {
 const SYSTEM_PROMPT =
   "You are building a small Node.js utility package inside an isolated temp project directory. "
   + "You have these tools: WebSearch, WriteFile, ReadFile, ListFiles, RunValidation. "
-  + "Use ONE code({calls, script}) tool call per phase — batch all independent operations into a single code call's calls[] array. "
+  + "Use ONE code({ script }) tool call per phase — inside your script, call tools with `await tools.<Name>(args)` or `await callTool(name, args)`. "
+  + "Batch independent calls with `await Promise.all([tools.A(...), tools.B(...)])`. "
   + "CRITICAL: ONLY your script's return value is visible to you. Raw tool results are NOT added to your context. "
   + "Your script MUST return any tool output you need to read next turn. "
-  + "For RunValidation, parse the result with JSON.parse(results.<id>.text) to read {exitCode, stdout, stderr} and return the parts you need. "
+  + "For RunValidation, parse the result with `JSON.parse(r.text)` to read {exitCode, stdout, stderr} and return the parts you need. "
   + "For WebSearch, return the snippets you will cite. "
+  + "Bake branching into the script — if the next step depends on a tool's result, call the next tool from inside the same script (don't return to the model). "
   + "Write at least: package.json, one src/*.mjs module, one test/*.test.mjs, and README.md. "
   + "Use ONLY Node built-ins (node:test, node:assert/strict, node:fs, node:path). No third-party packages. "
   + "After writing files, run RunValidation with argv [\"node\",\"--test\"] and iterate until exitCode === 0. "
@@ -344,8 +346,9 @@ async function main() {
     codeCalls: h0.codeCalls ?? 0,
     codeSubCalls: h0.codeSubCalls ?? 0,
     codeErrors: h0.codeErrors ?? 0,
+    codeWaves: h0.codeWaves ?? 0,
   };
-  console.log(`healthz before: codeMode=${h0.codeMode} codeCalls=${startCounts.codeCalls} codeSubCalls=${startCounts.codeSubCalls} codeErrors=${startCounts.codeErrors}`);
+  console.log(`healthz before: codeMode=${h0.codeMode} codeCalls=${startCounts.codeCalls} codeSubCalls=${startCounts.codeSubCalls} codeErrors=${startCounts.codeErrors} codeWaves=${startCounts.codeWaves}`);
 
   const toolCounts = { WebSearch: 0, WriteFile: 0, ReadFile: 0, ListFiles: 0, RunValidation: 0 };
   const validationResults = [];
@@ -423,6 +426,7 @@ async function main() {
     codeCalls: (h1.codeCalls ?? 0) - startCounts.codeCalls,
     codeSubCalls: (h1.codeSubCalls ?? 0) - startCounts.codeSubCalls,
     codeErrors: (h1.codeErrors ?? 0) - startCounts.codeErrors,
+    codeWaves: (h1.codeWaves ?? 0) - startCounts.codeWaves,
   };
 
   // --- Assertions ---
@@ -443,6 +447,8 @@ async function main() {
   check("independent node --test exits 0", independentTestExit === 0, `exitCode = ${independentTestExit}${independentTestStderr ? `; stderr: ${independentTestStderr.slice(0, 300)}` : ""}`);
   check("codeCalls delta > 0", deltas.codeCalls > 0, `delta = ${deltas.codeCalls}`);
   check("codeSubCalls delta > 0", deltas.codeSubCalls > 0, `delta = ${deltas.codeSubCalls}`);
+  check("codeWaves delta > 0", deltas.codeWaves > 0, `delta = ${deltas.codeWaves}`);
+  check("dependent chain: some code call drove multiple waves", deltas.codeWaves > deltas.codeCalls, `waves=${deltas.codeWaves} calls=${deltas.codeCalls}`);
   check("codeErrors delta === 0", deltas.codeErrors === 0, `delta = ${deltas.codeErrors}`);
 
   // --- Summary ---

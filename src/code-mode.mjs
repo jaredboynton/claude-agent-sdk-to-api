@@ -1,35 +1,66 @@
-// Code mode: deterministic code({ calls, script }) meta-tool helpers.
+// Code mode: dynamic `code({ script })` meta-tool helpers.
 //
-// The model declares all client tool invocations upfront in calls[]; the bridge
-// expands them for the client, collapses results, and runs script over a frozen
-// results map. node:vm is NOT a hard security boundary — acceptable for v1 on a
-// local daemon where the model is already authorized to request tool calls.
+// The model writes one async script that calls client tools via
+// `await tools.<Name>(args)` / `await callTool(name, args)`. The bridge runs the
+// script inside a Worker-contained VM; each awaited tool call becomes a wave of
+// synthetic client tool_use blocks. The SDK stays parked on the single `code`
+// MCP handler the whole time, so a K-step dependent tool chain collapses from
+// K model round-trips to 1.
+//
+// node:vm is NOT a hard security boundary — acceptable for v1 on a local daemon
+// where the model is already authorized to request tool calls. The Worker lets
+// the parent enforce wall-clock time and terminate, since vm timeout does not
+// bound async continuations after an await.
 
-import vm from "node:vm";
+import { Worker } from "node:worker_threads";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 
-const CALL_ID_RE = /^[A-Za-z_][A-Za-z0-9_-]{0,63}$/;
-const DEFAULT_SCRIPT_TIMEOUT_MS = Number(process.env.CODE_SCRIPT_TIMEOUT_MS || 10000);
+const DEFAULT_SCRIPT_TIMEOUT_MS = Number(process.env.CODE_SCRIPT_TIMEOUT_MS || 30000);
+const DEFAULT_MAX_WAVES = Number(process.env.CODE_MAX_WAVES || 32);
+const DEFAULT_MAX_CALLS = Number(process.env.CODE_MAX_CALLS || 64);
 const DEFAULT_SCRIPT_OUTPUT_MAX_BYTES = Number(process.env.CODE_SCRIPT_MAX_OUTPUT_BYTES || 32768);
+
+const WORKER_PATH = join(dirname(fileURLToPath(import.meta.url)), "code-mode-worker.mjs");
 
 export const CODE_MODE_APPEND = `
 
 <tool_use_guidance>
-When you need multiple tools in one turn, use ONE \`code\` tool call instead of separate tool calls.
-Put every client tool invocation in \`calls[]\` with a unique \`id\`, \`tool\` name, and \`args\`.
-Use \`script\` only to process the \`results\` object (keyed by call id) and return your final output.
-Only the script's return value is visible to you — raw tool results are not added to your context individually.
-Inside script, use \`results.<id>.text\` for each tool's text output. Parse it yourself when a tool returns JSON text.
-If a tool returns an error, summarize the error and keep going when possible instead of declaring the tool unavailable.
-Original client tools remain available for compatibility. Use direct tool calls instead of \`code\` only for interactive/user-input/approval/handoff tools, or when the tool description says its native UI/flow matters.
-For ordinary read/search/write/shell/validation work, batch independent calls through \`code\` whenever more than one tool call is useful.
+You have a single tool, \`code\`, that runs an async JavaScript program. Inside the program, call client tools with:
+
+\`\`\`
+const r = await tools.<Name>(args);          // any client tool below
+const r = await tools["Some-Tool-Name"](args); // non-identifier names
+const r = await callTool(name, args);          // generic form
+\`\`\`
+
+Each call returns \`{ text, raw, isError }\`. Use \`r.text\` (string) or \`JSON.parse(r.text)\` when the tool returns JSON.
+
+WHY THIS BEATS ONE-TOOL-AT-A-TIME: every turn you take re-reads the entire cached conversation, so round-trips dominate cost. A \`code\` call is ONE round-trip no matter how many tools it touches or how much branching it does. Tool waves inside \`code\` cost ZERO model cache reads.
+
+PATTERNS:
+- Bake branching into the script. If the next step depends on a tool's result, do NOT return to the model. Use \`if/else\`, loops, and computation, then call the next tool from inside the script. This collapses dependent chains (read → decide → grep → read) into one \`code\` call.
+- Parallelize independent calls with \`await Promise.all([tools.A(...), tools.B(...)])\` — they execute in one wave. Sequential \`await\`s are sequential waves (still one model round-trip, but more client round-trips).
+- Do the work in script: filter, count, join, diff, extract, summarize. Return only the conclusion. Raw tool output never enters your context — only the script's return value does.
+
+ORDERING / SAFETY:
+- Calls in the same wave run in parallel with no ordering guarantee. Do NOT batch order-dependent or side-effect-chained calls in one wave (create dir → write into it; write file → run command that reads it). Sequence those with separate \`await\`s.
+
+RETURN: the script's return value is the only thing you see. Keep it small — a verdict, a summary, a count, a few fields — never raw file contents or full search output.
+
+Use direct client tools (outside \`code\`) only for interactive / approval / user-input / handoff tools whose native flow matters; for ordinary read/search/write/shell/validation work, use \`code\`.
+
 Example:
+\`\`\`
 code({
-  calls: [
-    { id: "grep", tool: "Grep", args: { pattern: "foo", path: "/repo" } },
-    { id: "files", tool: "Glob", args: { pattern: "**/*.md", folder: "/repo" } }
-  ],
-  script: \`return { grepLines: results.grep.text.split("\\\\n").length, files: results.files.text };\`
+  script: \`
+    const list = await tools.ListFiles({ path: "." });
+    const mds = list.text.split("\\\\n").filter(p => p.endsWith(".md"));
+    const reads = await Promise.all(mds.slice(0, 5).map(p => tools.ReadFile({ path: p })));
+    return { count: mds.length, sampled: reads.map(r => r.text.slice(0, 200)) };
+  \`
 })
+\`\`\`
 </tool_use_guidance>`;
 
 export class CodeValidationError extends Error {
@@ -201,79 +232,30 @@ export function buildCodeToolDescription(clientTools) {
   const entries = [...(clientTools instanceof Map ? clientTools.entries() : Object.entries(clientTools || {}))];
   const toolBlocks = entries.map(([name, meta]) => describeClientTool(name, meta));
   return (
-    "Run multiple client tools with one model-visible tool call. "
-    + "Prefer this for non-interactive read/search/write/shell/validation batches; use original tools directly for interactive, approval, handoff, or native-UI flows. "
-    + "Declare every client tool invocation in calls[] up front, each as { id, tool, args }. "
+    "Run a full async JavaScript program that calls the client's tools and returns a summary. "
+    + "Prefer this for non-interactive read/search/write/shell/validation work; use original tools directly for interactive, approval, handoff, or native-UI flows. "
+    + "Call tools with `await tools.<Name>(args)`, `await tools[\"Any-Name\"]`, or `await callTool(name, args)`; each returns `{ text, raw, isError }` (JSON.parse r.text when the tool returns JSON). "
     + "args MUST match the TypeScript signature for that tool below: a trailing ? marks an optional field, "
     + "\"a\" | \"b\" lists the allowed literal values, and Array<T> is an array. "
     + "Descriptions, comments, defaults, examples, formats, and patterns come from the client schema; follow them exactly. "
-    + "The bridge executes all calls for the client in parallel, then runs script with a results object keyed by call id. "
-    + "Each script result entry is { text, raw }; use results.<id>.text, and JSON.parse it yourself when the tool returns JSON text. "
-    + "Return only the data you actually need from script — do not dump full file or search contents — "
-    + "since only the script's return value is seen by the assistant.\n\n"
+    + "Bake branching/loops into the script — if the next step depends on a tool's result, do NOT return to the model; call the next tool from inside the script. "
+    + "Wrap independent calls in `Promise.all([...])` to run them in one parallel wave; sequential `await`s are sequential waves. "
+    + "Do not put order-dependent or side-effect-chained calls (create dir → write into it) in one wave. "
+    + "Return only the conclusion — only the script's return value is seen by the assistant.\n\n"
     + (toolBlocks.length ? `Available tools:\n\n${toolBlocks.join("\n\n")}` : "Available tools: (none)")
   );
 }
 
 /**
- * Validate code({ calls, script }) and normalize call args through client schemas.
- * @param {object} input - raw code tool input
- * @param {Map|object} clientTools - name -> { description, input_schema }
- * @param {{ toolInputShape: Function, z: object }} deps
- * @returns {{ script: string, calls: Array<{ id, tool, args, syntheticArgs }> }}
+ * Validate `code({ script })`. Tool args are validated at call time, not here.
  */
-export function validateCodeInput(input, clientTools, { toolInputShape, z }) {
+export function validateCodeInput(input) {
   if (!input || typeof input !== "object") throw new CodeValidationError("code input must be an object");
-  const { calls, script } = input;
+  const { script } = input;
   if (typeof script !== "string" || !script.trim()) {
     throw new CodeValidationError("code input requires a non-empty script string");
   }
-  if (!Array.isArray(calls)) throw new CodeValidationError("code input requires calls[] array");
-
-  const toolsMap = clientTools instanceof Map ? clientTools : new Map(Object.entries(clientTools || {}));
-  const parsers = new Map();
-  for (const [name, meta] of toolsMap) {
-    const normalized = normalizeClientToolMeta(name, meta);
-    try {
-      parsers.set(name, z.fromJSONSchema(normalized.input_schema || { type: "object", properties: {} }, { unrepresentable: "any" }));
-    } catch {
-      try {
-        const shape = toolInputShape(normalized.input_schema || { type: "object", properties: {} });
-        parsers.set(name, z.object(shape));
-      } catch {
-        parsers.set(name, null);
-      }
-    }
-  }
-
-  const seenIds = new Set();
-  const normalized = [];
-  for (let i = 0; i < calls.length; i++) {
-    const c = calls[i];
-    if (!c || typeof c !== "object") throw new CodeValidationError(`calls[${i}] must be an object`);
-    const { id, tool, args } = c;
-    if (typeof id !== "string" || !CALL_ID_RE.test(id)) {
-      throw new CodeValidationError(`calls[${i}].id must match ${CALL_ID_RE}`);
-    }
-    if (seenIds.has(id)) throw new CodeValidationError(`duplicate call id: ${id}`);
-    seenIds.add(id);
-    if (typeof tool !== "string" || !toolsMap.has(tool)) {
-      throw new CodeValidationError(`calls[${i}].tool unknown or missing: ${String(tool)}`);
-    }
-    const rawArgs = args && typeof args === "object" && !Array.isArray(args) ? args : {};
-    const parser = parsers.get(tool);
-    let syntheticArgs = rawArgs;
-    if (parser) {
-      const r = parser.safeParse(rawArgs);
-      if (!r.success) {
-        throw new CodeValidationError(`calls[${i}].args invalid for ${tool}: ${r.error.message}`);
-      }
-      syntheticArgs = r.data;
-    }
-    normalized.push({ id, tool, args: syntheticArgs });
-  }
-
-  return { script, calls: normalized };
+  return { script };
 }
 
 /** Convert script return value (+ optional captured logs) to MCP CallToolResult text. */
@@ -294,80 +276,165 @@ export function formatCodeResult(value, logs = [], { maxBytes = DEFAULT_SCRIPT_O
 }
 
 /**
- * Run the model's script in a sandbox over frozen calls/results.
- * @returns {Promise<{ value: *, logs: string[] }>}
+ * Run the model's script in a Worker-contained VM. `dispatchWave(batch)` is
+ * called for each await wave; it must return an array of `{ text, raw, isError }`
+ * results in the same order as `batch` (or throw / return an `{ error }` shape
+ * which rejects the wave's calls).
+ *
+ * @param {string} script
+ * @param {{ toolNames: string[], dispatchWave: Function, timeoutMs?: number, maxWaves?: number, maxCalls?: number, signal?: AbortSignal }} opts
+ * @returns {Promise<{ value: *, logs: string[], waves: number, calls: number }>}
  */
-export function runCodeScript(script, { calls = [], results = {}, timeoutMs = DEFAULT_SCRIPT_TIMEOUT_MS } = {}) {
-  const logs = [];
-  const sandboxConsole = {
-    log: (...a) => logs.push(a.map(String).join(" ")),
-    warn: (...a) => logs.push(`[warn] ${a.map(String).join(" ")}`),
-    error: (...a) => logs.push(`[error] ${a.map(String).join(" ")}`),
-  };
+export function runCodeScriptDynamic(script, {
+  toolNames = [],
+  dispatchWave,
+  timeoutMs = DEFAULT_SCRIPT_TIMEOUT_MS,
+  maxWaves = DEFAULT_MAX_WAVES,
+  maxCalls = DEFAULT_MAX_CALLS,
+  signal,
+} = {}) {
+  return new Promise((resolve, reject) => {
+    let worker;
+    let settled = false;
+    let timer;
 
-  const frozenCalls = Object.freeze(structuredClone(calls));
-  const frozenResults = Object.freeze(
-    Object.fromEntries(
-      Object.entries(results).map(([k, v]) => [k, Object.freeze({ text: toolResultText(v), raw: v })]),
-    ),
-  );
+    const cleanup = () => {
+      if (timer) { clearTimeout(timer); timer = null; }
+      if (worker) {
+        try { worker.removeAllListeners(); } catch {}
+        try { worker.terminate(); } catch {}
+        worker = null;
+      }
+    };
 
-  const deny = (key) => {
-    const err = () => { throw new Error(`access to ${key} is denied in code mode scripts`); };
-    return err;
-  };
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(result);
+    };
 
-  const context = vm.createContext({
-    calls: frozenCalls,
-    results: frozenResults,
-    JSON,
-    Math,
-    console: sandboxConsole,
-    text: (x) => toolResultText(x?.raw ?? x),
-    json: (x) => {
-      const t = toolResultText(x?.raw ?? x);
-      try { return JSON.parse(t); } catch { return t; }
-    },
-    require: deny("require"),
-    process: { exit: deny("process.exit"), env: Object.freeze({}) },
-    globalThis: Object.freeze({}),
-    global: Object.freeze({}),
-    Buffer: deny("Buffer"),
-    fetch: deny("fetch"),
-    setTimeout: deny("setTimeout"),
-    setInterval: deny("setInterval"),
-  });
-
-  const wrapped = `(async () => { ${script} })()`;
-  const scriptObj = new vm.Script(wrapped, { filename: "code-mode-script.vm" });
-
-  let timer;
-  const timeout = new Promise((_, reject) => {
-    timer = setTimeout(() => {
-      const err = new Error(`code script did not complete within ${timeoutMs}ms`);
-      err.code = "code_script_timeout";
+    const fail = (err) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
       reject(err);
-    }, timeoutMs);
+    };
+
+    if (signal?.aborted) {
+      reject(new Error("code script aborted before start"));
+      return;
+    }
+
+    try {
+      worker = new Worker(WORKER_PATH);
+    } catch (e) {
+      reject(new Error(`failed to start code worker: ${e?.message || e}`));
+      return;
+    }
+
+    worker.on("message", async (msg) => {
+      if (!msg || typeof msg !== "object") return;
+      if (msg.type === "wave") {
+        // Dispatch to the bridge; bridge fabricates client tool calls and
+        // resolves with an array of { text, raw, isError } once all wave
+        // results arrive. Pipe the results (or error) back to the worker.
+        try {
+          const results = await dispatchWave(msg.wave, msg.calls || []);
+          if (settled) return;
+          let payload;
+          if (results && results.error) {
+            payload = { type: "wave_result", wave: msg.wave, error: results.error };
+          } else if (Array.isArray(results)) {
+            payload = { type: "wave_result", wave: msg.wave, results };
+          } else {
+            payload = { type: "wave_result", wave: msg.wave, error: "dispatchWave returned non-array" };
+          }
+          try { worker?.postMessage(payload); } catch {}
+        } catch (err) {
+          if (settled) return;
+          try {
+            worker?.postMessage({ type: "wave_result", wave: msg.wave, error: err?.message || String(err) });
+          } catch {}
+        }
+        return;
+      }
+      if (msg.type === "done") {
+        if (msg.error) {
+          finish({
+            value: null,
+            error: msg.error,
+            logs: msg.logs || [],
+            waves: msg.waves || 0,
+            calls: msg.calls || 0,
+          });
+        } else {
+          finish({
+            value: msg.value,
+            logs: msg.logs || [],
+            waves: msg.waves || 0,
+            calls: msg.calls || 0,
+          });
+        }
+      }
+    });
+
+    worker.on("error", (err) => {
+      fail(new Error(`code worker error: ${err?.message || err}`));
+    });
+
+    worker.on("exit", (code) => {
+      if (!settled) {
+        fail(new Error(`code worker exited unexpectedly (code=${code})`));
+      }
+    });
+
+    if (timeoutMs > 0) {
+      timer = setTimeout(() => {
+        if (settled) return;
+        // Give the worker a brief grace period, then terminate and resolve.
+        setTimeout(() => {
+          if (!settled) {
+            settled = true;
+            cleanup();
+            resolve({
+              value: null,
+              error: `code script did not complete within ${timeoutMs}ms`,
+              logs: [],
+              waves: 0,
+              calls: 0,
+              timedOut: true,
+            });
+          }
+        }, 250);
+      }, timeoutMs);
+    }
+
+    if (signal) {
+      signal.addEventListener("abort", () => {
+        if (settled) return;
+        fail(new Error("code script aborted"));
+      }, { once: true });
+    }
+
+    try {
+      worker.postMessage({
+        type: "run",
+        script,
+        toolNames,
+        maxWaves,
+        maxCalls,
+        timeoutMs,
+      });
+    } catch (e) {
+      fail(new Error(`failed to post run to worker: ${e?.message || e}`));
+    }
   });
-
-  const run = (async () => {
-    const out = scriptObj.runInContext(context, { timeout: timeoutMs });
-    return out instanceof Promise ? await out : out;
-  })();
-
-  return Promise.race([run, timeout])
-    .then((value) => ({ value, logs }))
-    .finally(() => clearTimeout(timer));
 }
 
 /** Zod raw shape for the code tool's input_schema (used by buildParkingMcpServer). */
 export function codeToolInputShape(z) {
   return {
-    calls: z.array(z.object({
-      id: z.string(),
-      tool: z.string(),
-      args: z.record(z.string(), z.unknown()).optional(),
-    })),
     script: z.string(),
   };
 }

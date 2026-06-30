@@ -50,7 +50,7 @@ import {
   CODE_MODE_APPEND,
   CodeValidationError,
   validateCodeInput,
-  runCodeScript,
+  runCodeScriptDynamic,
   buildCodeToolDescription,
   formatCodeResult,
   codeToolInputShape,
@@ -67,6 +67,9 @@ const TOOL_TIMEOUT_MS = Number(process.env.TOOL_TIMEOUT_MS || process.env.ACP_TO
 // SDK from emitting message_stop and the per-handler TOOL_TIMEOUT_MS somehow
 // doesn't fire).
 const TURN_TIMEOUT_MS = Number(process.env.TURN_TIMEOUT_MS || process.env.ACP_TURN_TIMEOUT_MS || 300000);
+const CODE_SCRIPT_TIMEOUT_MS = Number(process.env.CODE_SCRIPT_TIMEOUT_MS || 30000);
+const CODE_MAX_WAVES = Number(process.env.CODE_MAX_WAVES || 32);
+const CODE_MAX_CALLS = Number(process.env.CODE_MAX_CALLS || 64);
 const LOG_PREFIX = "[claude-agent-api]";
 
 // Race an HTTP turn promise against a wall-clock timeout. Resolves with the
@@ -350,7 +353,7 @@ function buildParkingMcpServer(tools, session, createServer = createSdkMcpServer
             const idx = session.orphanResolvers.indexOf(wrappedResolve);
             if (idx !== -1) session.orphanResolvers.splice(idx, 1);
           }
-          if (session.codeMode && originalName === "code" && id) clearCodeExpansion(session, id);
+          if (session.codeMode && originalName === "code" && id) clearCodeRun(session, id);
           session.lastActivity = Date.now();
           process.stderr.write(`${LOG_PREFIX} tool ${id ?? originalName} park timeout after ${TOOL_TIMEOUT_MS}ms; returning isError\n`);
           resolve({ content: [{ type: "text", text: `Tool result was not provided within ${TOOL_TIMEOUT_MS}ms` }], isError: true });
@@ -526,6 +529,7 @@ let totalFifoFallbacks = 0;
 let totalCodeCalls = 0;
 let totalCodeSubCalls = 0;
 let totalCodeErrors = 0;
+let totalCodeWaves = 0;
 let totalCacheReadTokens = 0;
 let totalCacheCreationTokens = 0;
 
@@ -615,6 +619,7 @@ function logTurnDone(session) {
       messages: m.messages,
       hit: read_hit_ratio(u.read, create),
       codeSubCalls: m.codeSubCalls,
+      codeWaves: m.codeWaves,
       scriptOutBytes: m.scriptOutBytes,
       ttftMs: ttft,
       durationMs: total,
@@ -695,19 +700,23 @@ function initMessageProjection(session) {
   };
 }
 
-function clearCodeExpansion(session, codeToolUseId) {
-  const exp = session.codeExpansions?.get(codeToolUseId);
-  if (exp) {
-    for (const c of exp.calls) session.syntheticToCode?.delete(c.syntheticId);
+function clearCodeRun(session, codeId) {
+  const run = session.codeRun;
+  if (run && run.codeId === codeId) {
+    session.codeRun = null;
   }
-  session.codeExpansions?.delete(codeToolUseId);
-  session.codePendingResults?.delete(codeToolUseId);
 }
 
 function clearAllCodeState(session) {
-  session.codeExpansions?.clear();
+  if (session.codeRun) {
+    session.codeRun.aborted = true;
+    if (session.codeRun.reject) {
+      try { session.codeRun.reject(new Error("code round abandoned")); } catch {}
+    }
+  }
+  session.codeRun = null;
   session.syntheticToCode?.clear();
-  session.codePendingResults?.clear();
+  session.codeDriving = false;
   session.suppressEndTurn = false;
 }
 
@@ -719,17 +728,16 @@ function hasActiveToolRound(session, { includeCurrentTurn = true } = {}) {
     session.streamedToolUses?.length ||
     session.toolUseAccum?.size ||
     (session.codeMode && (
-      session.codeExpansions?.size ||
+      session.codeRun ||
       session.syntheticToCode?.size ||
-      session.codePendingResults?.size ||
-      session.suppressEndTurn
+      session.codeDriving
     ))
   );
 }
 
-function syntheticIdFor(codeToolUseId, idx) {
+function syntheticIdFor(codeToolUseId, waveSeq, idx) {
   const short = String(codeToolUseId || "code").replace(/^toolu_/, "").slice(0, 8);
-  return `toolu_code_${short}_${idx}`;
+  return `toolu_code_${short}_w${waveSeq}_${idx}`;
 }
 
 function emitClientToolUse(session, { syntheticId, tool, args }) {
@@ -758,11 +766,13 @@ function internalResolveCode(session, codeToolUseId, result) {
   session.suppressEndTurn = true;
 }
 
-function expandCodeToolUse(session, codeToolUseId, input) {
-  const t0 = Date.now();
+// Start a dynamic code run: spin up the Worker-contained script, which will
+// emit waves of tool calls. The SDK is parked on the `code` MCP handler for
+// the entire run; each wave becomes a fabricated client tool turn.
+function startCodeRun(session, codeToolUseId, input) {
   let normalized;
   try {
-    normalized = validateCodeInput(input, session.clientTools, { toolInputShape, z });
+    normalized = validateCodeInput(input);
   } catch (e) {
     session.codeErrors = (session.codeErrors || 0) + 1;
     totalCodeErrors++;
@@ -775,86 +785,232 @@ function expandCodeToolUse(session, codeToolUseId, input) {
     return;
   }
 
-  const { script, calls } = normalized;
-  session.codeCalls = (session.codeCalls || 0) + 1;
-  totalCodeCalls++;
-
-  if (calls.length === 0) {
-    runCodeScript(script, { calls: [], results: {} })
-      .then(({ value, logs }) => {
-        internalResolveCode(session, codeToolUseId, formatCodeResult(value, logs));
-        process.stderr.write(`${LOG_PREFIX} code call ${codeToolUseId}: 0 sub-calls (pure script), execute=ok\n`);
-      })
-      .catch((e) => {
-        session.codeErrors = (session.codeErrors || 0) + 1;
-        totalCodeErrors++;
-        internalResolveCode(session, codeToolUseId, {
-          content: [{ type: "text", text: `code script error: ${e?.message || e}` }],
-          isError: true,
-        });
-      });
+  // One active code run per session.
+  if (session.codeRun) {
+    session.codeErrors = (session.codeErrors || 0) + 1;
+    totalCodeErrors++;
+    internalResolveCode(session, codeToolUseId, {
+      content: [{ type: "text", text: "only one active code run per session" }],
+      isError: true,
+    });
+    process.stderr.write(`${LOG_PREFIX} code call ${codeToolUseId}: rejected — another code run is active\n`);
     return;
   }
 
-  session.codeSubCalls = (session.codeSubCalls || 0) + calls.length;
-  totalCodeSubCalls += calls.length;
-  if (session.turnMetrics) session.turnMetrics.codeSubCalls += calls.length;
+  const { script } = normalized;
+  session.codeCalls = (session.codeCalls || 0) + 1;
+  totalCodeCalls++;
 
-  const expansionCalls = [];
-  for (let i = 0; i < calls.length; i++) {
-    const { id: userId, tool, args } = calls[i];
-    const syntheticId = syntheticIdFor(codeToolUseId, i);
-    expansionCalls.push({ syntheticId, userId, tool, args });
-    session.syntheticToCode.set(syntheticId, codeToolUseId);
-    emitClientToolUse(session, { syntheticId, tool, args });
-  }
+  const run = {
+    codeId: codeToolUseId,
+    script,
+    waveQueue: [],           // FIFO of waves waiting for an open HTTP request
+    currentWave: null,       // { waveNum, calls, results, pending, promise, resolve, reject }
+    waveSeq: 0,
+    waveCount: 0,
+    callCount: 0,
+    aborted: false,
+    preamble: null,          // preserved text/thinking blocks from the SDK code message
+    settled: false,
+  };
+  session.codeRun = run;
+  session.codeDriving = true;
+  session.suppressEndTurn = true; // swallow T0's message_stop while the run is active
 
-  session.codeExpansions.set(codeToolUseId, { script, calls: expansionCalls });
-  if (!session.codePendingResults.has(codeToolUseId)) {
-    session.codePendingResults.set(codeToolUseId, new Map());
-  }
-
-  const validateMs = Date.now() - t0;
-  process.stderr.write(
-    `${LOG_PREFIX} code call ${codeToolUseId}: ${calls.length} sub-calls (tools: ${calls.map((c) => c.tool).join(",")}), validate=${validateMs}ms\n`,
-  );
-}
-
-async function collapseAndResolveCode(session, codeToolUseId) {
-  const expansion = session.codeExpansions.get(codeToolUseId);
-  const pending = session.codePendingResults.get(codeToolUseId);
-  if (!expansion || !pending) return;
-
-  const results = {};
-  for (const { syntheticId, userId } of expansion.calls) {
-    results[userId] = pending.get(syntheticId);
-  }
-
+  const toolNames = [...session.clientTools.keys()];
   const t0 = Date.now();
-  let collapsed;
-  try {
-    const { value, logs } = await runCodeScript(expansion.script, {
-      calls: expansion.calls.map(({ userId, tool, args }) => ({ id: userId, tool, args })),
-      results,
-    });
-    collapsed = formatCodeResult(value, logs);
-    const scriptOut = collapsed.content?.[0]?.text?.length ?? 0;
-    if (session.turnMetrics) session.turnMetrics.scriptOutBytes += scriptOut;
-    process.stderr.write(
-      `${LOG_PREFIX} code call ${codeToolUseId}: execute=${Date.now() - t0}ms scriptOut=${scriptOut} bytes\n`,
-    );
-  } catch (e) {
+
+  run.promise = runCodeScriptDynamic(script, {
+    toolNames,
+    maxWaves: CODE_MAX_WAVES,
+    maxCalls: CODE_MAX_CALLS,
+    timeoutMs: CODE_SCRIPT_TIMEOUT_MS,
+    dispatchWave: (waveNum, calls) => dispatchCodeWave(session, codeToolUseId, waveNum, calls),
+  });
+
+  run.promise.then((result) => {
+    if (run.aborted) return;
+    run.settled = true;
+    const waves = result.waves || 0;
+    const calls = result.calls || 0;
+    session.codeWaves = (session.codeWaves || 0) + waves;
+    totalCodeWaves = (totalCodeWaves || 0) + waves;
+    if (session.turnMetrics) session.turnMetrics.codeWaves += waves;
+
+    let collapsed;
+    if (result.error) {
+      session.codeErrors = (session.codeErrors || 0) + 1;
+      totalCodeErrors++;
+      collapsed = {
+        content: [{ type: "text", text: `code script error: ${result.error}` }],
+        isError: true,
+      };
+      process.stderr.write(`${LOG_PREFIX} code call ${codeToolUseId}: failed (${result.error}) waves=${waves} calls=${calls}\n`);
+    } else {
+      collapsed = formatCodeResult(result.value, result.logs || []);
+      const scriptOut = collapsed.content?.[0]?.text?.length ?? 0;
+      if (session.turnMetrics) session.turnMetrics.scriptOutBytes += scriptOut;
+      process.stderr.write(
+        `${LOG_PREFIX} code call ${codeToolUseId}: done waves=${waves} calls=${calls} scriptOut=${scriptOut} bytes execute=${Date.now() - t0}ms\n`,
+      );
+    }
+
+    session.codeDriving = false;
+    clearCodeRun(session, codeToolUseId);
+    // Resolve the parked `code` MCP handler so the SDK emits the final answer.
+    resolveTool(session, codeToolUseId, collapsed);
+  }).catch((err) => {
+    if (run.aborted) return;
+    run.settled = true;
     session.codeErrors = (session.codeErrors || 0) + 1;
     totalCodeErrors++;
-    collapsed = {
-      content: [{ type: "text", text: `code script error: ${e?.message || e}` }],
+    session.codeDriving = false;
+    clearCodeRun(session, codeToolUseId);
+    internalResolveCode(session, codeToolUseId, {
+      content: [{ type: "text", text: `code script error: ${err?.message || err}` }],
       isError: true,
-    };
-    process.stderr.write(`${LOG_PREFIX} code call ${codeToolUseId}: script failed (${e?.message || e})\n`);
+    });
+    process.stderr.write(`${LOG_PREFIX} code call ${codeToolUseId}: worker error (${err?.message || err})\n`);
+  });
+
+  process.stderr.write(`${LOG_PREFIX} code call ${codeToolUseId}: starting dynamic run (tools: ${toolNames.length})\n`);
+}
+
+// Dispatch one wave of tool calls from the script. Fabricates a client-visible
+// assistant message containing synthetic tool_use blocks, closes the current
+// HTTP response, and returns a Promise that resolves with the wave's results
+// once the client POSTs them back.
+async function dispatchCodeWave(session, codeToolUseId, waveNum, calls) {
+  const run = session.codeRun;
+  if (!run || run.aborted) {
+    return calls.map(() => ({ text: "code run aborted", raw: null, isError: true }));
   }
 
-  clearCodeExpansion(session, codeToolUseId);
-  resolveTool(session, codeToolUseId, collapsed);
+  // Validate args against client schemas; unknown/invalid tools return isError
+  // to the script rather than fabricating an invalid client call.
+  const validated = [];
+  for (let i = 0; i < calls.length; i++) {
+    const { name, args } = calls[i];
+    const meta = session.clientTools.get(name);
+    if (!meta) {
+      validated.push({
+        syntheticId: null,
+        tool: name,
+        args,
+        inlineError: `unknown tool: ${name}`,
+      });
+      continue;
+    }
+    const parser = session.inputParsers?.get(name);
+    let syntheticArgs = args;
+    if (parser) {
+      const r = parser.safeParse(args && typeof args === "object" ? args : {});
+      if (!r.success) {
+        validated.push({
+          syntheticId: null,
+          tool: name,
+          args,
+          inlineError: `invalid args for ${name}: ${r.error.message}`,
+        });
+        continue;
+      }
+      syntheticArgs = r.data;
+    }
+    run.callCount++;
+    const syntheticId = syntheticIdFor(codeToolUseId, waveNum, i);
+    validated.push({ syntheticId, tool: name, args: syntheticArgs, inlineError: null });
+  }
+
+  // If all calls in this wave are inline errors, return them directly without
+  // fabricating a client turn.
+  const fabricatable = validated.filter((v) => v.syntheticId !== null);
+  if (fabricatable.length === 0) {
+    return validated.map((v) => ({ text: v.inlineError, raw: null, isError: true }));
+  }
+
+  // Build the wave entry. The bridge will fabricate a client turn when an HTTP
+  // request is available.
+  const waveEntry = {
+    waveNum,
+    calls: validated,
+    fabricatable,
+    results: new Array(validated.length).fill(null),
+    pending: new Set(fabricatable.map((v) => v.syntheticId)),
+    promise: null,
+    resolve: null,
+    reject: null,
+  };
+  waveEntry.promise = new Promise((res, rej) => { waveEntry.resolve = res; waveEntry.reject = rej; });
+
+  run.waveQueue.push(waveEntry);
+  run.waveSeq = waveNum;
+  run.waveCount++;
+
+  // Try to dispatch immediately if an HTTP turn is attached.
+  maybeDispatchQueuedWave(session);
+
+  const results = await waveEntry.promise;
+  return results;
+}
+
+// If an HTTP turn is attached and a wave is queued, fabricate the client turn.
+function maybeDispatchQueuedWave(session) {
+  const run = session.codeRun;
+  if (!run || run.aborted) return;
+  if (!session.currentTurn) return; // no open HTTP request to ride on
+  if (run.currentWave) return;      // a wave is already being served
+  const wave = run.waveQueue.shift();
+  if (!wave) return;
+  run.currentWave = wave;
+
+  const p = session._proj;
+  // Start a fresh fabricated assistant message.
+  writeEvent(session, { type: "message_start", message: { role: "assistant" } });
+
+  // Emit any preserved preamble (text/thinking from the SDK code message) on
+  // the first wave only.
+  if (wave.waveNum === 1 && run.preamble && run.preamble.length) {
+    for (const block of run.preamble) {
+      const idx = p.clientIndex++;
+      if (block.type === "text") {
+        writeEvent(session, {
+          type: "content_block_start",
+          index: idx,
+          content_block: { type: "text", text: block.text || "" },
+        });
+        writeEvent(session, {
+          type: "content_block_delta",
+          index: idx,
+          delta: { type: "text_delta", text: block.text || "" },
+        });
+        writeEvent(session, { type: "content_block_stop", index: idx });
+      }
+    }
+  }
+
+  // Emit synthetic tool_use blocks for fabricatable calls.
+  for (let i = 0; i < wave.calls.length; i++) {
+    const v = wave.calls[i];
+    if (v.syntheticId === null) continue; // inline error — no client block
+    session.syntheticToCode.set(v.syntheticId, run.codeId);
+    emitClientToolUse(session, { syntheticId: v.syntheticId, tool: v.tool, args: v.args });
+  }
+
+  // Close the fabricated message + HTTP turn.
+  writeEvent(session, {
+    type: "message_delta",
+    delta: { stop_reason: "tool_use" },
+  });
+  writeEvent(session, {
+    type: "message_stop",
+    message: { stop_reason: "tool_use" },
+  });
+
+  // endTurn closes the HTTP response; the SDK's code handler stays parked.
+  // We must NOT let endTurn resolve the current turn in a way that prevents
+  // the next client request from attaching. endTurn resolves currentTurn; the
+  // next client POST will attach a new one.
+  endTurn(session);
 }
 
 function remapIndex(session, sdkIndex) {
@@ -870,6 +1026,26 @@ function projectEvent(session, ev) {
 
   const p = session._proj;
   if (!p) return;
+
+  // While a dynamic code run is driving, suppress SDK messages entirely.
+  // The bridge fabricates client turns from script waves; the SDK's code
+  // message and its trailing framing are not client-visible.
+  if (session.codeDriving && session.codeRun) {
+    // Collect preamble (text/thinking) from the SDK code message so we can
+    // re-emit it on the first fabricated wave.
+    if (ev.type === "content_block_start") {
+      const cb = ev.content_block;
+      if (cb?.type === "text" || cb?.type === "thinking") {
+        session.codeRun.preamble = session.codeRun.preamble || [];
+        session.codeRun.preamble.push({ type: cb.type, text: cb.text || cb.thinking || "" });
+      }
+    }
+    // Update toolUseAccum so consumeSession's code-detection hook fires.
+    if (ev.type === "content_block_start" && ev.content_block?.type === "tool_use") {
+      // already handled by consumeSession
+    }
+    return;
+  }
 
   switch (ev.type) {
     case "message_start":
@@ -895,12 +1071,9 @@ function projectEvent(session, ev) {
       break;
     }
     case "content_block_stop": {
-      if (session.toolUseAccum.has(ev.index)) {
-        // toolUseAccum cleared before this in consumeSession — check streamed last entry
-      }
       const mapped = p.sdkToClient.get(ev.index);
       if (mapped === undefined) {
-        // code block or unmapped — handled in consumeSession expand hook
+        // code block or unmapped — handled in consumeSession start hook
         return;
       }
       writeEvent(session, { ...ev, index: mapped });
@@ -953,13 +1126,14 @@ function createSession(key, model, tools, callerSystem, bucket, { resume, codeMo
     inputParsers: new Map(),      // toolName -> z.object(shape); canonical parser mirroring MCP validateToolInput
     fifoFallbacks: 0,             // per-session count of correlation FIFO fallbacks (observable)
     clientTools: new Map(),       // code mode: name -> {description, input_schema}
-    codeExpansions: new Map(),    // codeToolUseId -> { script, calls: [{syntheticId,userId,tool,args}] }
-    syntheticToCode: new Map(),   // syntheticId -> codeToolUseId
-    codePendingResults: new Map(),// codeToolUseId -> Map(syntheticId -> CallToolResult)
+    codeRun: null,                // active dynamic code run: { codeId, resultPromise, waveQueue, currentWave, waveSeq, waveCount, callCount, aborted, resolve, reject, preamble }
+    syntheticToCode: new Map(),   // syntheticId -> codeId (for routing tool_results)
+    codeDriving: false,           // bridge controls visible client turns while SDK is parked on code
     suppressEndTurn: false,
     codeCalls: 0,
     codeSubCalls: 0,
     codeErrors: 0,
+    codeWaves: 0,
     currentTurn: null,            // { resolve } deferred for the active HTTP turn
     res: null,                    // current streaming HTTP response
     nonStream: null,              // { blocks, stopReason } when buffering for non-stream
@@ -1034,7 +1208,7 @@ async function consumeSession(session) {
             try { input = JSON.parse(a.partial || "{}"); } catch { input = {}; }
             session.streamedToolUses.push({ id: a.id, name: a.name, input });
             if (session.codeMode && a.name === "code") {
-              expandCodeToolUse(session, a.id, input);
+              startCodeRun(session, a.id, input);
             }
             session.toolUseAccum.delete(ev.index);
           }
@@ -1180,20 +1354,52 @@ sweeper.unref?.();
 
 async function resolveCodeModeToolResults(session, toolResults) {
   session.lastActivity = Date.now();
+  const run = session.codeRun;
   for (const tr of toolResults) {
     const codeId = session.syntheticToCode.get(tr.tool_use_id);
-    if (codeId) {
-      if (!session.codePendingResults.has(codeId)) {
-        session.codePendingResults.set(codeId, new Map());
-      }
-      session.codePendingResults.get(codeId).set(tr.tool_use_id, toCallToolResult(tr));
-      const expansion = session.codeExpansions.get(codeId);
-      if (expansion && session.codePendingResults.get(codeId).size === expansion.calls.length) {
-        await collapseAndResolveCode(session, codeId);
+    if (codeId && run && run.codeId === codeId && run.currentWave) {
+      // Route into the current wave.
+      const wave = run.currentWave;
+      const result = toCallToolResult(tr);
+      for (let i = 0; i < wave.calls.length; i++) {
+        if (wave.calls[i].syntheticId === tr.tool_use_id) {
+          wave.results[i] = {
+            text: result.content?.[0]?.text || "",
+            raw: result,
+            isError: !!result.isError,
+          };
+          wave.pending.delete(tr.tool_use_id);
+          session.syntheticToCode.delete(tr.tool_use_id);
+          break;
+        }
       }
     } else {
+      // Passthrough / native tool result.
       resolveTool(session, tr.tool_use_id, toCallToolResult(tr));
     }
+  }
+
+  // If the current wave is complete, resolve it and try to dispatch the next.
+  if (run && run.currentWave && run.currentWave.pending.size === 0) {
+    const wave = run.currentWave;
+    run.currentWave = null;
+
+    // Fill in inline errors for calls that had no syntheticId.
+    const results = wave.results.map((r, i) => {
+      if (r) return r;
+      return { text: wave.calls[i].inlineError || "(no result)", raw: null, isError: true };
+    });
+
+    // Update sub-call metrics.
+    const subCalls = wave.calls.filter((v) => v.syntheticId !== null).length;
+    session.codeSubCalls = (session.codeSubCalls || 0) + subCalls;
+    totalCodeSubCalls += subCalls;
+    if (session.turnMetrics) session.turnMetrics.codeSubCalls += subCalls;
+
+    wave.resolve(results);
+
+    // Try to dispatch the next queued wave into this same open request.
+    maybeDispatchQueuedWave(session);
   }
 }
 
@@ -1275,7 +1481,7 @@ async function handleMessages(req, res) {
   session.turnMetrics = {
     action, startedAt: Date.now(), firstEventAt: null, textDeltas: 0,
     usage: { input: 0, read: 0, create5m: 0, create1h: 0, output: 0 },
-    messages: 0, _curMsgOutput: 0, codeSubCalls: 0, scriptOutBytes: 0,
+    messages: 0, _curMsgOutput: 0, codeSubCalls: 0, codeWaves: 0, scriptOutBytes: 0,
   };
   const turnPromise = new Promise((resolve, reject) => {
     session.currentTurn = { resolve, reject };
@@ -1406,6 +1612,7 @@ export function startServer({ port = 32809, host = "127.0.0.1", account = null, 
         codeCalls: totalCodeCalls,
         codeSubCalls: totalCodeSubCalls,
         codeErrors: totalCodeErrors,
+        codeWaves: totalCodeWaves,
         cacheReadTokens: totalCacheReadTokens,
         cacheCreationTokens: totalCacheCreationTokens,
         cacheLog: cacheLogPath() || null,
@@ -1471,13 +1678,14 @@ export {
   buildResumeCatchupFrames,
   loadResumeIndex,
   createSession,
-  expandCodeToolUse,
-  collapseAndResolveCode,
+  startCodeRun,
+  dispatchCodeWave,
+  maybeDispatchQueuedWave,
   resolveCodeModeToolResults,
   projectEvent,
   initMessageProjection,
   clearAllCodeState,
-  clearCodeExpansion,
+  clearCodeRun,
   syntheticIdFor,
   internalResolveCode,
   endTurn,
@@ -1489,4 +1697,5 @@ export {
   totalCodeCalls,
   totalCodeSubCalls,
   totalCodeErrors,
+  totalCodeWaves,
 };

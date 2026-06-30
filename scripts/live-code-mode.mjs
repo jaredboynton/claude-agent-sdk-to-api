@@ -1,9 +1,9 @@
-// End-to-end verification for code mode (transparent expand/collapse).
+// End-to-end verification for dynamic code mode (script-first).
 //
-// Boot bridge with codeMode on (default), POST a prompt needing Grep+Glob.
-// Confirm turn1 client SSE has TWO tool_use (Grep, Glob) and NO `code` block.
-// POST tool_results; confirm turn2 completes promptly (no park timeout).
-// Optionally compare /healthz cache metrics with code mode off.
+// Boot bridge with codeMode on (default), POST a prompt whose answer requires
+// Grep+Glob. Confirm the client SSE shows TWO tool_use (Grep, Glob) and NO
+// `code` block (transparent expand). POST tool_results; confirm the script
+// completes and the model emits a final answer promptly (no park timeout).
 //
 //   node bin/cli.mjs run --no-self-update --profile <dir> --port 32822 &
 //   node scripts/live-code-mode.mjs 32822
@@ -13,7 +13,7 @@
 const PORT = Number(process.argv[2] || 32822);
 const HOST = "127.0.0.1";
 const BASE = `http://${HOST}:${PORT}`;
-const MODEL = "claude-opus-4-8";
+const MODEL = process.env.MODEL || "claude-opus-4-8";
 const STOP_BUDGET_MS = 120000;
 
 const TOOLS = [
@@ -67,36 +67,46 @@ function sseLines(res) {
   })();
 }
 
-async function consumeTurn(res, label) {
+// Read one HTTP response to body close, collecting all blocks across any
+// internal continuations. A single response may contain multiple assistant
+// messages (fabricated waves + final answer).
+async function consumeResponse(res, label) {
   const blocks = [];
   let stopReason = null;
   const toolUses = [];
   const start = Date.now();
+  let currentBlocks = [];
   for await (const { event, data } of sseLines(res)) {
-    if (event === "content_block_start") {
-      blocks[data.index] = JSON.parse(JSON.stringify(data.content_block || {}));
+    if (event === "message_start") {
+      currentBlocks = [];
+    } else if (event === "content_block_start") {
+      const cb = JSON.parse(JSON.stringify(data.content_block || {}));
+      currentBlocks[data.index] = cb;
     } else if (event === "content_block_delta") {
-      const b = blocks[data.index];
+      const b = currentBlocks[data.index];
       if (!b) continue;
       const d = data.delta || {};
       if (d.type === "text_delta") b.text = (b.text || "") + (d.text || "");
       if (d.type === "input_json_delta") b._partial = (b._partial || "") + (d.partial_json || "");
     } else if (event === "content_block_stop") {
-      const b = blocks[data.index];
-      if (b && b.type === "tool_use") {
+      const b = currentBlocks[data.index];
+      if (!b) continue;
+      if (b.type === "tool_use") {
         try { b.input = JSON.parse(b._partial || "{}"); } catch { b.input = {}; }
         delete b._partial;
         toolUses.push({ id: b.id, name: b.name, input: b.input });
       }
+      delete b._partial;
+      blocks.push(b);
     } else if (event === "message_delta") {
       if (data.delta?.stop_reason) stopReason = data.delta.stop_reason;
     } else if (event === "message_stop") {
-      return { blocks, stopReason, toolUses, elapsed: Date.now() - start };
+      // keep reading — body close is the real turn boundary
     } else if (event === "error") {
       throw new Error(`[${label}] stream error: ${JSON.stringify(data)}`);
     }
   }
-  throw new Error(`[${label}] stream ended without message_stop`);
+  return { blocks, stopReason, toolUses, elapsed: Date.now() - start };
 }
 
 async function postMessages(messages, { label, codeModeHeader } = {}) {
@@ -106,12 +116,13 @@ async function postMessages(messages, { label, codeModeHeader } = {}) {
     method: "POST",
     headers,
     body: JSON.stringify({ model: MODEL, max_tokens: 4096, stream: true, tools: TOOLS, messages }),
+    signal: AbortSignal.timeout(STOP_BUDGET_MS),
   });
   if (!res.ok || !res.body) {
     const text = await res.text().catch(() => "");
     throw new Error(`[${label}] HTTP ${res.status}: ${text.slice(0, 200)}`);
   }
-  return consumeTurn(res, label);
+  return consumeResponse(res, label);
 }
 
 async function healthz() {
@@ -120,12 +131,12 @@ async function healthz() {
 
 async function main() {
   const h0 = await healthz().catch(() => ({}));
-  console.log(`healthz: codeMode=${h0.codeMode} codeCalls=${h0.codeCalls} cacheReadTokens=${h0.cacheReadTokens}`);
+  console.log(`healthz: codeMode=${h0.codeMode} codeCalls=${h0.codeCalls} codeWaves=${h0.codeWaves}`);
 
   const userText =
-    "Use ONE code tool call (not separate Grep/Glob calls) to search pattern 'agent' in path "
+    "Use ONE code tool call to search pattern 'agent' in path "
     + "'/Users/jaredboynton/__devlocal/claude-agent-sdk-to-api' with Grep, and glob '**/*.mjs' in the same folder with Glob. "
-    + "In your script, return a JSON summary with grepLineCount and fileCount.";
+    + "In your script, use Promise.all to call both tools in parallel, then return a JSON summary { grepLineCount, fileCount }.";
 
   const turn1 = await postMessages([{ role: "user", content: [{ type: "text", text: userText }] }], { label: "turn1" });
   console.log(`turn1: stopReason=${turn1.stopReason} toolUses=${turn1.toolUses.length} elapsed=${turn1.elapsed}ms`);
@@ -167,10 +178,10 @@ async function main() {
   console.log(`turn2: stopReason=${turn2.stopReason} elapsed=${turn2.elapsed}ms total=${waited}ms`);
 
   const noHang = waited < STOP_BUDGET_MS;
-  console.log(noHang ? "PASS: collapse round-trip completed promptly." : "FAIL: turn2 hung (park timeout?).");
+  console.log(noHang ? "PASS: script + final answer completed promptly." : "FAIL: turn2 hung (park timeout?).");
 
   const h1 = await healthz().catch(() => ({}));
-  console.log(`healthz after: codeCalls=${h1.codeCalls} codeSubCalls=${h1.codeSubCalls} codeErrors=${h1.codeErrors} cacheReadTokens=${h1.cacheReadTokens}`);
+  console.log(`healthz after: codeCalls=${h1.codeCalls} codeSubCalls=${h1.codeSubCalls} codeWaves=${h1.codeWaves} codeErrors=${h1.codeErrors}`);
 
   process.exit(noHang && transparentOk ? 0 : 1);
 }

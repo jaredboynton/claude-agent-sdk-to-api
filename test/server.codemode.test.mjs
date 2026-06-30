@@ -1,4 +1,4 @@
-// Code mode unit tests — validation, sandbox, expand/collapse, lifecycle.
+// Code mode unit tests — dynamic runner, validation, sandbox, wave engine.
 // Run: node --test test/server.codemode.test.mjs
 
 import { test } from "node:test";
@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 
 import {
   validateCodeInput,
-  runCodeScript,
+  runCodeScriptDynamic,
   formatCodeResult,
   buildCodeToolDescription,
   CodeValidationError,
@@ -16,12 +16,14 @@ import {
   abandonToolRound,
   persistResumeIndex,
   createSession,
-  expandCodeToolUse,
-  collapseAndResolveCode,
+  startCodeRun,
+  dispatchCodeWave,
+  maybeDispatchQueuedWave,
   resolveCodeModeToolResults,
   projectEvent,
   initMessageProjection,
   clearAllCodeState,
+  clearCodeRun,
   syntheticIdFor,
   internalResolveCode,
   endTurn,
@@ -65,91 +67,57 @@ const CLIENT_TOOLS = new Map([
   ["Glob", { description: "glob", input_schema: GLOB_SCHEMA }],
 ]);
 
-const deps = { toolInputShape, z };
-
 function fakeCodeSession(overrides = {}) {
   return {
+    key: "k-test",
+    bucket: "b-test",
     codeMode: true,
     clientTools: CLIENT_TOOLS,
-    codeExpansions: new Map(),
+    codeRun: null,
     syntheticToCode: new Map(),
-    codePendingResults: new Map(),
+    codeDriving: false,
     suppressEndTurn: false,
     pendingTools: new Map(),
     resolvedResults: new Map(),
     orphanResolvers: [],
     streamedToolUses: [],
     toolUseAccum: new Map(),
+    inputParsers: new Map(),
     originalNames: new Set(["code"]),
     res: null,
     nonStream: null,
+    currentTurn: null,
     codeCalls: 0,
     codeSubCalls: 0,
     codeErrors: 0,
-    currentTurn: { resolve: () => {} },
+    codeWaves: 0,
+    turnMetrics: null,
     ...overrides,
   };
 }
 
-test("validateCodeInput accepts valid calls and injects defaults", () => {
-  const { calls, script } = validateCodeInput({
-    calls: [
-      { id: "grep", tool: "Grep", args: { pattern: "x", path: "/r" } },
-      { id: "files", tool: "Glob", args: { pattern: "*.md", folder: "/r" } },
-    ],
-    script: "return results;",
-  }, CLIENT_TOOLS, deps);
+// ---------------------------------------------------------------------------
+// validateCodeInput (script-only)
+// ---------------------------------------------------------------------------
 
-  assert.equal(script, "return results;");
-  assert.equal(calls.length, 2);
-  assert.equal(calls[0].args.output_mode, "content");
-  assert.equal(calls[1].args.case_sensitive, true);
+test("validateCodeInput accepts a valid script string", () => {
+  const { script } = validateCodeInput({ script: "return 1;" });
+  assert.equal(script, "return 1;");
 });
 
-test("validateCodeInput rejects duplicate ids, unknown tools, bad ids, bad args", () => {
-  assert.throws(
-    () => validateCodeInput({ calls: [{ id: "a", tool: "Grep", args: { pattern: "x", path: "/r" } }, { id: "a", tool: "Glob", args: { pattern: "*", folder: "/r" } }], script: "x" }, CLIENT_TOOLS, deps),
-    CodeValidationError,
-  );
-  assert.throws(
-    () => validateCodeInput({ calls: [{ id: "x", tool: "Nope", args: {} }], script: "x" }, CLIENT_TOOLS, deps),
-    CodeValidationError,
-  );
-  assert.throws(
-    () => validateCodeInput({ calls: [{ id: "1bad", tool: "Grep", args: { pattern: "x", path: "/r" } }], script: "x" }, CLIENT_TOOLS, deps),
-    CodeValidationError,
-  );
-  assert.throws(
-    () => validateCodeInput({ calls: [{ id: "g", tool: "Grep", args: { pattern: "x" } }], script: "x" }, CLIENT_TOOLS, deps),
-    CodeValidationError,
-  );
+test("validateCodeInput rejects missing/empty/non-string script", () => {
+  assert.throws(() => validateCodeInput({}), CodeValidationError);
+  assert.throws(() => validateCodeInput({ script: "" }), CodeValidationError);
+  assert.throws(() => validateCodeInput({ script: 123 }), CodeValidationError);
+  // Extra fields (like legacy calls[]) are ignored, not rejected.
+  const { script } = validateCodeInput({ calls: [], script: "x" });
+  assert.equal(script, "x");
+  assert.throws(() => validateCodeInput(null), CodeValidationError);
 });
 
-test("runCodeScript binds results and calls", async () => {
-  const { value } = await runCodeScript(
-    "return { n: results.a.text.length, tool: calls[0].tool };",
-    {
-      calls: [{ id: "a", tool: "Grep", args: { pattern: "x" } }],
-      results: { a: { content: [{ type: "text", text: "hello" }] } },
-      timeoutMs: 2000,
-    },
-  );
-  assert.equal(value.n, 5);
-  assert.equal(value.tool, "Grep");
-});
-
-test("runCodeScript denies require/process/setTimeout", async () => {
-  await assert.rejects(() => runCodeScript("require('fs');", { timeoutMs: 500 }), /denied/);
-  await assert.rejects(() => runCodeScript("process.exit(1);", { timeoutMs: 500 }), /denied/);
-  await assert.rejects(() => runCodeScript("setTimeout(()=>{},0);", { timeoutMs: 500 }), /denied/);
-});
-
-test("runCodeScript times out on infinite loop", async () => {
-  await assert.rejects(
-    () => runCodeScript("while(true){}", { timeoutMs: 100 }),
-    /did not complete|timed out/,
-  );
-});
+// ---------------------------------------------------------------------------
+// formatCodeResult
+// ---------------------------------------------------------------------------
 
 test("formatCodeResult pretty-prints objects", () => {
   const r = formatCodeResult({ a: 1 }, ["log line"]);
@@ -163,6 +131,10 @@ test("formatCodeResult rejects oversized script output", () => {
   assert.match(r.content[0].text, /exceeded 3 bytes/);
 });
 
+// ---------------------------------------------------------------------------
+// buildCodeToolDescription (TS signature rendering — unchanged from v0.1.6)
+// ---------------------------------------------------------------------------
+
 test("buildCodeToolDescription lists client tools", () => {
   const d = buildCodeToolDescription(CLIENT_TOOLS);
   assert.match(d, /Grep/);
@@ -171,20 +143,15 @@ test("buildCodeToolDescription lists client tools", () => {
 
 test("buildCodeToolDescription emits typed signatures with required/optional and enums", () => {
   const d = buildCodeToolDescription(CLIENT_TOOLS);
-  // required fields have no ?, optional fields have ?
   assert.match(d, /pattern: string/);
   assert.match(d, /path: string/);
   assert.match(d, /output_mode\?: "content" \| "files_with_matches" \| "count"/);
   assert.match(d, /case_sensitive\?: boolean/);
-  // required pattern/folder/path must NOT be marked optional
   assert.doesNotMatch(d, /pattern\?:/);
   assert.doesNotMatch(d, /folder\?:/);
-  // headings + typed args signature in codex style
   assert.match(d, /### Grep/);
   assert.match(d, /Grep\(args: \{/);
-  // guidance to avoid dumping full contents
-  assert.match(d, /do not dump full file or search contents/);
-  assert.match(d, /results\.<id>\.text/);
+  assert.match(d, /Return only the conclusion/);
 });
 
 test("buildCodeToolDescription renders the exact arg type that previously misfired (string, not object)", () => {
@@ -201,7 +168,6 @@ test("buildCodeToolDescription renders the exact arg type that previously misfir
   const d = buildCodeToolDescription(tools);
   assert.match(d, /### AskUser/);
   assert.match(d, /Ask the user a question/);
-  // questionnaire must be typed as a required string, with its description as a comment
   assert.match(d, /\/\/ the question text/);
   assert.match(d, /questionnaire: string;/);
   assert.doesNotMatch(d, /questionnaire\?:/);
@@ -221,7 +187,6 @@ test("buildCodeToolDescription does not hardcode client-specific DSLs", () => {
   const d = buildCodeToolDescription(tools);
   assert.match(d, /questionnaire: string/);
   assert.doesNotMatch(d, /\[question\]/);
-  assert.doesNotMatch(d, /Blue-green/);
 });
 
 test("buildCodeToolDescription propagates generic schema metadata", () => {
@@ -266,38 +231,161 @@ test("buildCodeToolDescription describes nested object and array arg types", () 
   assert.match(d, /opts\?: \{ a\?: number; \}/);
 });
 
-test("expandCodeToolUse synthesizes N client tool_use blocks with mapping", () => {
-  const events = [];
-  const session = fakeCodeSession({
-    res: {
-      writableEnded: false,
-      write: (s) => {
-        const m = s.match(/^data: (.+)\n\n$/m);
-        if (m) events.push(JSON.parse(m[1]));
-      },
-    },
-  });
-  initMessageProjection(session);
-
-  const codeId = "toolu_codeMain01";
-  expandCodeToolUse(session, codeId, {
-    calls: [
-      { id: "grep", tool: "Grep", args: { pattern: "x", path: "/r" } },
-      { id: "files", tool: "Glob", args: { pattern: "*.md", folder: "/r" } },
-    ],
-    script: "return { ok: true };",
-  });
-
-  assert.equal(session.codeExpansions.size, 1);
-  assert.equal(session.syntheticToCode.size, 2);
-  const starts = events.filter((e) => e.type === "content_block_start" && e.content_block?.type === "tool_use");
-  assert.equal(starts.length, 2);
-  assert.equal(starts[0].index, 0);
-  assert.equal(starts[1].index, 1);
-  assert.equal(starts.find((s) => s.content_block.name === "code"), undefined);
-  assert.equal(starts[0].content_block.name, "Grep");
-  assert.equal(starts[1].content_block.name, "Glob");
+test("buildCodeToolDescription script-first guidance mentions tools.X and Promise.all", () => {
+  const d = buildCodeToolDescription(new Map());
+  assert.match(d, /await tools\.<Name>\(args\)/);
+  assert.match(d, /Promise\.all/);
+  assert.match(d, /Bake branching/);
+  assert.match(d, /order-dependent/);
 });
+
+// ---------------------------------------------------------------------------
+// runCodeScriptDynamic (Worker-contained runner)
+// ---------------------------------------------------------------------------
+
+test("runCodeScriptDynamic: pure script, no tool calls", async () => {
+  const r = await runCodeScriptDynamic("return 1 + 2;", {
+    toolNames: [],
+    dispatchWave: async () => [],
+    timeoutMs: 5000,
+  });
+  assert.equal(r.value, 3);
+  assert.equal(r.waves, 0);
+  assert.equal(r.calls, 0);
+});
+
+test("runCodeScriptDynamic: one tool call (one wave)", async () => {
+  const r = await runCodeScriptDynamic(
+    "const r = await tools.Grep({ pattern: 'x', path: '/r' }); return r.text.toUpperCase();",
+    {
+      toolNames: ["Grep"],
+      dispatchWave: async (w, calls) => calls.map(c => ({ text: `out:${c.args.pattern}`, raw: null, isError: false })),
+      timeoutMs: 5000,
+    },
+  );
+  assert.equal(r.value, "OUT:X");
+  assert.equal(r.waves, 1);
+  assert.equal(r.calls, 1);
+});
+
+test("runCodeScriptDynamic: two sequential awaits (two waves)", async () => {
+  const r = await runCodeScriptDynamic(
+    "const a = await tools.A({}); const b = await tools.B({}); return a.text + b.text;",
+    {
+      toolNames: ["A", "B"],
+      dispatchWave: async (w, calls) => calls.map(c => ({ text: c.name, raw: null, isError: false })),
+      timeoutMs: 5000,
+    },
+  );
+  assert.equal(r.value, "AB");
+  assert.equal(r.waves, 2);
+  assert.equal(r.calls, 2);
+});
+
+test("runCodeScriptDynamic: Promise.all batches into one wave", async () => {
+  const r = await runCodeScriptDynamic(
+    "const [a, b] = await Promise.all([tools.A({}), tools.B({})]); return a.text + b.text;",
+    {
+      toolNames: ["A", "B"],
+      dispatchWave: async (w, calls) => calls.map(c => ({ text: c.name, raw: null, isError: false })),
+      timeoutMs: 5000,
+    },
+  );
+  assert.equal(r.value, "AB");
+  assert.equal(r.waves, 1);
+  assert.equal(r.calls, 2);
+});
+
+test("runCodeScriptDynamic: branching dependent on a result", async () => {
+  const r = await runCodeScriptDynamic(
+    "const a = await tools.Check({ n: 5 }); if (a.text === 'big') { const b = await tools.Big({}); return b.text; } return 'small';",
+    {
+      toolNames: ["Check", "Big"],
+      dispatchWave: async (w, calls) => calls.map(c => ({ text: c.args.n >= 5 ? 'big' : 'small', raw: null, isError: false })),
+      timeoutMs: 5000,
+    },
+  );
+  assert.equal(r.value, "small");
+  assert.equal(r.waves, 2);
+});
+
+test("runCodeScriptDynamic: tool error surfaced as isError (resolves, not rejects)", async () => {
+  const r = await runCodeScriptDynamic(
+    "const r = await tools.X({}); return r.isError;",
+    {
+      toolNames: ["X"],
+      dispatchWave: async (w, calls) => calls.map(c => ({ text: "boom", raw: null, isError: true })),
+      timeoutMs: 5000,
+    },
+  );
+  assert.equal(r.value, true);
+});
+
+test("runCodeScriptDynamic: timeout terminates the worker", async () => {
+  const r = await runCodeScriptDynamic("await new Promise(()=>{});", {
+    toolNames: [],
+    dispatchWave: async () => [],
+    timeoutMs: 300,
+  });
+  assert.equal(r.timedOut, true);
+  assert.ok(r.error.match(/did not complete|timed out/));
+});
+
+test("runCodeScriptDynamic: maxWaves limit returns isError per call", async () => {
+  const r = await runCodeScriptDynamic(
+    "const rs = []; for (let i = 0; i < 10; i++) rs.push(await tools.A({})); return rs.map(r => r.isError).filter(Boolean).length;",
+    {
+      toolNames: ["A"],
+      dispatchWave: async (w, calls) => calls.map(c => ({ text: "ok", raw: null, isError: false })),
+      timeoutMs: 5000,
+      maxWaves: 3,
+    },
+  );
+  // Waves 4-10 return isError, so 7 errors out of 10 calls.
+  assert.equal(r.value, 7);
+});
+
+test("runCodeScriptDynamic: callTool generic form works", async () => {
+  const r = await runCodeScriptDynamic(
+    "const r = await callTool('Grep', { pattern: 'x', path: '/r' }); return r.text;",
+    {
+      toolNames: ["Grep"],
+      dispatchWave: async (w, calls) => calls.map(c => ({ text: `out:${c.args.pattern}`, raw: null, isError: false })),
+      timeoutMs: 5000,
+    },
+  );
+  assert.equal(r.value, "out:x");
+});
+
+test("runCodeScriptDynamic: console.log captured", async () => {
+  const r = await runCodeScriptDynamic("console.log('hello', 'world'); return 42;", {
+    toolNames: [],
+    dispatchWave: async () => [],
+    timeoutMs: 5000,
+  });
+  assert.equal(r.value, 42);
+  assert.deepEqual(r.logs, ["hello world"]);
+});
+
+test("runCodeScriptDynamic: denies require/process/setTimeout", async () => {
+  for (const script of ["require('fs')", "process.exit(1)", "setTimeout(()=>{},0)"]) {
+    const r = await runCodeScriptDynamic(script, { toolNames: [], dispatchWave: async () => [], timeoutMs: 2000 });
+    assert.ok(r.error, `${script} should have errored`);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// syntheticIdFor (wave-component aware)
+// ---------------------------------------------------------------------------
+
+test("syntheticIdFor includes wave sequence", () => {
+  const id = syntheticIdFor("toolu_abc12345", 1, 0);
+  assert.match(id, /toolu_code_abc12345_w1_0/);
+});
+
+// ---------------------------------------------------------------------------
+// buildParkingMcpServer
+// ---------------------------------------------------------------------------
 
 test("buildParkingMcpServer exposes code plus original tools in code mode", () => {
   const session = fakeCodeSession({ inputParsers: new Map() });
@@ -315,164 +403,84 @@ test("buildParkingMcpServer exposes code plus original tools in code mode", () =
   assert.equal(session.clientTools.has("Grep"), true);
   assert.equal(session.clientTools.has("AskUser"), true);
   assert.equal(session.inputParsers.has("Grep"), true);
-  assert.equal(session.inputParsers.has("AskUser"), true);
 });
 
-test("projectEvent remaps indexes around suppressed code block", () => {
+// ---------------------------------------------------------------------------
+// projectEvent (buffered projection while codeDriving)
+// ---------------------------------------------------------------------------
+
+test("projectEvent suppresses SDK events while codeDriving", () => {
   const events = [];
   const session = fakeCodeSession({
-    res: {
-      writableEnded: false,
-      write: (s) => {
-        const m = s.match(/^data: (.+)\n\n$/m);
-        if (m) events.push(JSON.parse(m[1]));
-      },
-    },
+    codeDriving: true,
+    codeRun: { codeId: "c1", preamble: [] },
+    res: { writableEnded: false, write: (s) => { const m = s.match(/^data: (.+)\n\n$/m); if (m) events.push(JSON.parse(m[1])); } },
   });
   initMessageProjection(session);
-
   projectEvent(session, { type: "message_start", message: { role: "assistant" } });
-  projectEvent(session, {
-    type: "content_block_start",
-    index: 0,
-    content_block: { type: "text", text: "" },
-  });
-  session.toolUseAccum.set(1, { id: "toolu_c1", name: "code", partial: "" });
-  projectEvent(session, {
-    type: "content_block_start",
-    index: 1,
-    content_block: { type: "tool_use", id: "toolu_c1", name: "code", input: {} },
-  });
-  expandCodeToolUse(session, "toolu_c1", {
-    calls: [{ id: "g", tool: "Grep", args: { pattern: "a", path: "/b" } }],
-    script: "return 1;",
-  });
-  projectEvent(session, { type: "content_block_stop", index: 1 });
-  projectEvent(session, {
-    type: "content_block_start",
-    index: 2,
-    content_block: { type: "text", text: "" },
-  });
+  projectEvent(session, { type: "content_block_start", index: 0, content_block: { type: "text", text: "hi" } });
+  projectEvent(session, { type: "content_block_stop", index: 0 });
+  projectEvent(session, { type: "message_stop", message: { stop_reason: "end_turn" } });
+  // Nothing should reach the client while codeDriving.
+  assert.equal(events.length, 0);
+  // Preamble should have captured the text block.
+  assert.equal(session.codeRun.preamble.length, 1);
+  assert.equal(session.codeRun.preamble[0].text, "hi");
+});
 
+test("projectEvent projects normally when not codeDriving (no code block)", () => {
+  const events = [];
+  const session = fakeCodeSession({
+    res: { writableEnded: false, write: (s) => { const m = s.match(/^data: (.+)\n\n$/m); if (m) events.push(JSON.parse(m[1])); } },
+  });
+  initMessageProjection(session);
+  projectEvent(session, { type: "message_start", message: { role: "assistant" } });
+  projectEvent(session, { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } });
+  projectEvent(session, { type: "content_block_stop", index: 0 });
   const starts = events.filter((e) => e.type === "content_block_start");
-  const textStarts = starts.filter((e) => e.content_block?.type === "text");
-  assert.equal(textStarts[0].index, 0);
-  assert.equal(textStarts[1].index, 2);
+  assert.equal(starts.length, 1);
+  assert.equal(starts[0].content_block.type, "text");
 });
 
-test("collapse round-trip resolves one code result", async () => {
-  const session = fakeCodeSession();
-  const codeId = "toolu_main";
-  const syn0 = syntheticIdFor(codeId, 0);
-  const syn1 = syntheticIdFor(codeId, 1);
+// ---------------------------------------------------------------------------
+// abandonToolRound / clearAllCodeState
+// ---------------------------------------------------------------------------
 
-  session.codeExpansions.set(codeId, {
-    script: "return { g: results.grep.text, f: results.files.text };",
-    calls: [
-      { syntheticId: syn0, userId: "grep", tool: "Grep", args: {} },
-      { syntheticId: syn1, userId: "files", tool: "Glob", args: {} },
-    ],
-  });
-  session.syntheticToCode.set(syn0, codeId);
-  session.syntheticToCode.set(syn1, codeId);
-  session.codePendingResults.set(codeId, new Map([
-    [syn0, toCallToolResult({ content: [{ type: "text", text: "grep-out" }] })],
-    [syn1, toCallToolResult({ content: [{ type: "text", text: "glob-out" }] })],
-  ]));
-
-  let resolved = null;
-  session.pendingTools.set(codeId, (r) => { resolved = r; });
-
-  await collapseAndResolveCode(session, codeId);
-  assert.ok(resolved);
-  assert.match(resolved.content[0].text, /grep-out/);
-  assert.match(resolved.content[0].text, /glob-out/);
-  assert.equal(session.codeExpansions.size, 0);
-});
-
-test("resolveCodeModeToolResults accumulates until complete", async () => {
-  const session = fakeCodeSession();
-  const codeId = "toolu_acc";
-  const syn0 = syntheticIdFor(codeId, 0);
-  const syn1 = syntheticIdFor(codeId, 1);
-  session.codeExpansions.set(codeId, {
-    script: "return results.a.text + results.b.text;",
-    calls: [
-      { syntheticId: syn0, userId: "a", tool: "Grep", args: {} },
-      { syntheticId: syn1, userId: "b", tool: "Glob", args: {} },
-    ],
-  });
-  session.syntheticToCode.set(syn0, codeId);
-  session.syntheticToCode.set(syn1, codeId);
-
-  await resolveCodeModeToolResults(session, [
-    { tool_use_id: syn0, content: [{ type: "text", text: "A" }] },
-  ]);
-  assert.equal(session.pendingTools.size, 0);
-  assert.equal(session.codePendingResults.get(codeId)?.size, 1);
-
-  await resolveCodeModeToolResults(session, [
-    { tool_use_id: syn1, content: [{ type: "text", text: "B" }] },
-  ]);
-  assert.equal(session.codeExpansions.size, 0);
-});
-
-test("internal continuation: invalid code sets suppressEndTurn and stashes result", () => {
-  const session = fakeCodeSession();
-  initMessageProjection(session);
-  internalResolveCode(session, "toolu_bad", { content: [{ type: "text", text: "err" }], isError: true });
-  assert.equal(session.suppressEndTurn, true);
-  assert.equal(session.resolvedResults.get("toolu_bad")?.isError, true);
-
-  session.suppressEndTurn = true;
-  let ended = false;
-  session.currentTurn = { resolve: () => { ended = true; } };
-  endTurn(session);
-  assert.equal(session.suppressEndTurn, false);
-  assert.equal(ended, false);
-});
-
-test("expandCodeToolUse validation error uses internal continuation", () => {
-  const session = fakeCodeSession();
-  initMessageProjection(session);
-  expandCodeToolUse(session, "toolu_val", { calls: [{ id: "bad!", tool: "Grep", args: {} }], script: "return 1;" });
-  assert.equal(session.suppressEndTurn, true);
-  assert.equal(session.codeExpansions.size, 0);
-  assert.equal(session._proj.syntheticCount, 0);
-});
-
-test("abandonToolRound clears code maps", () => {
-  const session = fakeCodeSession({ suppressEndTurn: true });
-  session.codeExpansions.set("x", { script: "", calls: [] });
+test("abandonToolRound clears code run and maps", () => {
+  const session = fakeCodeSession({ suppressEndTurn: true, codeDriving: true });
+  session.codeRun = { codeId: "x", aborted: false, reject: () => {} };
   session.syntheticToCode.set("y", "x");
-  session.codePendingResults.set("x", new Map());
   abandonToolRound(session);
-  assert.equal(session.codeExpansions.size, 0);
+  assert.equal(session.codeRun, null);
   assert.equal(session.syntheticToCode.size, 0);
+  assert.equal(session.codeDriving, false);
   assert.equal(session.suppressEndTurn, false);
 });
 
-test("hasActiveToolRound includes direct and code-mode parked work", () => {
+test("hasActiveToolRound includes code run and codeDriving", () => {
   const session = fakeCodeSession({ currentTurn: null });
   assert.equal(hasActiveToolRound(session), false);
-  session.currentTurn = { resolve: () => {} };
+  session.codeRun = { codeId: "c1" };
   assert.equal(hasActiveToolRound(session), true);
-  assert.equal(hasActiveToolRound(session, { includeCurrentTurn: false }), false);
-  session.currentTurn = null;
-  session.pendingTools.set("toolu_1", () => {});
-  assert.equal(hasActiveToolRound(session), true);
-  session.pendingTools.clear();
-  session.codeExpansions.set("code_1", { script: "", calls: [] });
+  session.codeRun = null;
+  session.codeDriving = true;
   assert.equal(hasActiveToolRound(session), true);
   clearAllCodeState(session);
   assert.equal(hasActiveToolRound(session), false);
 });
 
+// ---------------------------------------------------------------------------
+// persistResumeIndex (no-op for code mode)
+// ---------------------------------------------------------------------------
+
 test("persistResumeIndex is no-op for code-mode sessions", () => {
   const session = { codeMode: true, sdkSessionId: "sdk-1", seenCount: 2, seenHash: "abc" };
   persistResumeIndex(session, "model", "sys", []);
-  // no throw; guarded by codeMode check (disk write would need serverProfileDir anyway)
 });
+
+// ---------------------------------------------------------------------------
+// findSession with synthetic tool blocks (multi-wave)
+// ---------------------------------------------------------------------------
 
 test("findSession works with synthetic tool blocks in client history", () => {
   sessions.clear();
@@ -493,32 +501,14 @@ test("findSession works with synthetic tool blocks in client history", () => {
     first,
     {
       role: "assistant",
-      content: [{ type: "tool_use", id: "toolu_code_ab_0", name: "Grep", input: { pattern: "x", path: "/r" } }],
+      content: [{ type: "tool_use", id: "toolu_code_ab_w1_0", name: "Grep", input: { pattern: "x", path: "/r" } }],
     },
     {
       role: "user",
-      content: [{ type: "tool_result", tool_use_id: "toolu_code_ab_0", content: [{ type: "text", text: "ok" }] }],
+      content: [{ type: "tool_result", tool_use_id: "toolu_code_ab_w1_0", content: [{ type: "text", text: "ok" }] }],
     },
   ];
   const found = findSession(extended, sys);
   assert.ok(found);
   sessions.clear();
-});
-
-test("non-stream projection via accumulateStreamEvent drops code and inserts synthetic", () => {
-  const blocks = [];
-  const session = fakeCodeSession({ nonStream: { blocks, stopReason: "end_turn" } });
-  initMessageProjection(session);
-
-  projectEvent(session, { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "toolu_c", name: "code", input: {} } });
-  expandCodeToolUse(session, "toolu_c", {
-    calls: [{ id: "g", tool: "Grep", args: { pattern: "p", path: "/x" } }],
-    script: "return 1;",
-  });
-  projectEvent(session, { type: "content_block_stop", index: 0 });
-
-  const toolBlocks = blocks.filter(Boolean).filter((b) => b.type === "tool_use");
-  assert.equal(toolBlocks.length, 1);
-  assert.equal(toolBlocks[0].name, "Grep");
-  assert.equal(toolBlocks.some((b) => b.name === "code"), false);
 });
