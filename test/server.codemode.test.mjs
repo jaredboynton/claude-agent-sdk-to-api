@@ -242,6 +242,21 @@ test("buildCodeToolDescription script-first guidance mentions tools.X and Promis
   assert.match(d, /DEFAULT TO BATCHING/);
 });
 
+test("buildCodeToolDescription includes intelligent-logic and anchored-edit guidance", () => {
+  const d = buildCodeToolDescription(new Map());
+  // logic: real control flow, not one await per script
+  assert.match(d, /Write real logic/);
+  assert.match(d, /retry/i);
+  assert.match(d, /fan-out\+reduce/);
+  assert.match(d, /not one await per script/);
+  // editing: anchored search/replace, unique anchor, minimal hunk, read-then-edit
+  assert.match(d, /anchored search\/replace/);
+  assert.match(d, /unique multi-line anchor/);
+  assert.match(d, /minimal hunk/);
+  assert.match(d, /read-then-edit/);
+  assert.match(d, /avoid full-file or whole-line rewrites/);
+});
+
 // ---------------------------------------------------------------------------
 // runCodeScriptDynamic (Worker-contained runner)
 // ---------------------------------------------------------------------------
