@@ -499,6 +499,45 @@ test("projectEvent projects normally when not codeDriving (no code block)", () =
   assert.equal(starts[0].content_block.type, "text");
 });
 
+test("fabricated wave message_start carries a usage object (no undefined input_tokens)", () => {
+  const events = [];
+  const session = fakeCodeSession({
+    model: "claude-opus-4-8",
+    currentTurn: { resolve: () => {} },
+    res: { writableEnded: false, write: (s) => { const m = s.match(/^data: (.+)\n\n$/m); if (m) events.push(JSON.parse(m[1])); } },
+  });
+  initMessageProjection(session);
+  const codeId = "toolu_code_main";
+  const syn0 = syntheticIdFor(codeId, 1, 0);
+  session.codeRun = {
+    codeId,
+    aborted: false,
+    currentWave: null,
+    preamble: null,
+    waveQueue: [{
+      waveNum: 1,
+      calls: [{ syntheticId: syn0, tool: "Grep", args: { pattern: "x", path: "/r" }, inlineError: null }],
+      results: [null],
+      pending: new Set([syn0]),
+    }],
+  };
+  maybeDispatchQueuedWave(session);
+  const start = events.find((e) => e.type === "message_start");
+  assert.ok(start, "should emit a fabricated message_start");
+  assert.ok(start.message, "message_start has a message object");
+  assert.ok(start.message.usage, "message has usage");
+  assert.equal(typeof start.message.usage.input_tokens, "number");
+  assert.equal(start.message.role, "assistant");
+  assert.equal(start.message.model, "claude-opus-4-8");
+  // message_delta also carries usage.output_tokens
+  const delta = events.find((e) => e.type === "message_delta");
+  assert.ok(delta?.usage, "message_delta has usage");
+  assert.equal(typeof delta.usage.output_tokens, "number");
+  // and the synthetic Grep tool_use was emitted
+  const tu = events.find((e) => e.type === "content_block_start" && e.content_block?.type === "tool_use");
+  assert.equal(tu.content_block.name, "Grep");
+});
+
 // ---------------------------------------------------------------------------
 // abandonToolRound / clearAllCodeState
 // ---------------------------------------------------------------------------

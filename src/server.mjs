@@ -993,8 +993,29 @@ function maybeDispatchQueuedWave(session) {
   run.currentWave = wave;
 
   const p = session._proj;
-  // Start a fresh fabricated assistant message.
-  writeEvent(session, { type: "message_start", message: { role: "assistant" } });
+  // Start a fresh fabricated assistant message. The client (and its subagent
+  // accounting) reads message.usage.input_tokens, so a bare { role } here
+  // throws "undefined is not an object (evaluating 'o.input_tokens')". Emit a
+  // complete message envelope with a usage object (zeroed — the real token
+  // accounting rides on the SDK's own message_start/message_delta events).
+  writeEvent(session, {
+    type: "message_start",
+    message: {
+      id: `msg_${randomUUID().replace(/-/g, "").slice(0, 24)}`,
+      type: "message",
+      role: "assistant",
+      model: session.model,
+      content: [],
+      stop_reason: null,
+      stop_sequence: null,
+      usage: {
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+      },
+    },
+  });
 
   // Emit any preserved preamble (text/thinking from the SDK code message) on
   // the first wave only.
@@ -1025,10 +1046,13 @@ function maybeDispatchQueuedWave(session) {
     emitClientToolUse(session, { syntheticId: v.syntheticId, tool: v.tool, args: v.args });
   }
 
-  // Close the fabricated message + HTTP turn.
+  // Close the fabricated message + HTTP turn. message_delta carries a usage
+  // object in the real API; include a zeroed one so clients that read
+  // delta.usage.output_tokens don't trip over undefined.
   writeEvent(session, {
     type: "message_delta",
-    delta: { stop_reason: "tool_use" },
+    delta: { stop_reason: "tool_use", stop_sequence: null },
+    usage: { output_tokens: 0 },
   });
   writeEvent(session, {
     type: "message_stop",
