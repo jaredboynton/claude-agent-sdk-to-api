@@ -96,7 +96,10 @@ When enabled (the default), the bridge collapses the client's N tools into one d
 
 **Security:** scripts run in `node:vm`, which is not a hard sandbox. The daemon is local and the model is already authorized to request tools, but do not expose this to untrusted callers without hardening (e.g. `isolated-vm`).
 
-Live validation: `node scripts/live-code-mode.mjs <port>` (requires a running bridge).
+Live validation (requires a running bridge):
+
+- `node scripts/live-code-mode.mjs <port>` — smoke test: one expand/collapse round-trip with mocked tool results; confirms the client stream is transparent (no `code` block) and the collapse completes without a park timeout.
+- `node scripts/live-code-mode-agent-task.mjs <port>` — thorough agent workflow: drives a real research-to-code-to-validate task (web search, multi-file generation in a temp project, allowlisted command validation, iterative fixes) and asserts code mode stayed transparent under a multi-turn, multi-tool workload. Requires network for `WebSearch`. Env: `MAX_TURNS`, `KEEP_CODE_MODE_FIXTURE=1`, `MODEL`.
 
 ## Environment knobs
 
