@@ -113,7 +113,7 @@ Live validation (requires a running bridge):
 | `TOOL_TIMEOUT_MS` | `1800000` | Parked-tool watchdog; returns an error result so the loop survives |
 | `HEARTBEAT_MS` | `15000` | SSE keep-alive interval |
 | `CODE_SCRIPT_TIMEOUT_MS` | `0` (no cap) | Optional Worker wall-clock cap on a `code` script's own compute; `0` = unlimited |
-| `CODE_SCRIPT_MAX_OUTPUT_BYTES` | `32768` | Maximum collapsed code result before returning a "summarize smaller" error |
+| `CODE_SCRIPT_MAX_OUTPUT_BYTES` | `0` (no cap) | Optional max bytes for a code script's return value before returning a "summarize smaller" error; `0` = unlimited |
 | `CODE_MAX_WAVES` | `0` (unlimited) | Optional cap on tool-call waves per `code` run; `0` = unlimited |
 | `CODE_MAX_CALLS` | `0` (unlimited) | Optional cap on total tool calls per `code` run; `0` = unlimited |
 | `X-Code-Mode` | (default on) | Per-request header: `0` disables, `1` enables code mode |

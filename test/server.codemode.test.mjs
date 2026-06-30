@@ -133,6 +133,13 @@ test("formatCodeResult rejects oversized script output", () => {
   assert.match(r.content[0].text, /exceeded 3 bytes/);
 });
 
+test("formatCodeResult does not cap output by default (no truncation)", () => {
+  const big = "x".repeat(200000); // ~200KB, far over the old 32KB cap
+  const r = formatCodeResult(big);
+  assert.equal(r.isError, undefined);
+  assert.equal(r.content[0].text.length, 200000);
+});
+
 // ---------------------------------------------------------------------------
 // buildCodeToolDescription (TS signature rendering — unchanged from v0.1.6)
 // ---------------------------------------------------------------------------

@@ -23,7 +23,7 @@ import { dirname, join } from "node:path";
 const DEFAULT_SCRIPT_TIMEOUT_MS = Number(process.env.CODE_SCRIPT_TIMEOUT_MS || 0);
 const DEFAULT_MAX_WAVES = Number(process.env.CODE_MAX_WAVES || 0);
 const DEFAULT_MAX_CALLS = Number(process.env.CODE_MAX_CALLS || 0);
-const DEFAULT_SCRIPT_OUTPUT_MAX_BYTES = Number(process.env.CODE_SCRIPT_MAX_OUTPUT_BYTES || 32768);
+const DEFAULT_SCRIPT_OUTPUT_MAX_BYTES = Number(process.env.CODE_SCRIPT_MAX_OUTPUT_BYTES || 0); // 0 = no cap
 
 const WORKER_PATH = join(dirname(fileURLToPath(import.meta.url)), "code-mode-worker.mjs");
 
