@@ -2173,7 +2173,10 @@ const OAUTH_PASS_THROUGH_PATHS = new Set([
 // Forward an OAuth usage request to the real Anthropic endpoint, preserving
 // the client's Authorization header. The proxy does not see or store the
 // token. Used so Claude Code's statusbar rate_limits populate correctly when
-// ANTHROPIC_BASE_URL points at this proxy.
+// ANTHROPIC_BASE_URL points at this proxy. Claude Code only issues this GET
+// once it treats the base URL as first-party — the launcher sets
+// _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1 for that; without it the TUI
+// suppresses the fetch entirely (so this handler is never called).
 async function forwardOauthUsage(req, res, rawUrl) {
   const headers = { "accept": "application/json" };
   const auth = req.headers["authorization"];
@@ -2185,6 +2188,10 @@ async function forwardOauthUsage(req, res, rawUrl) {
     const up = await fetch(upstream, { method: "GET", headers, signal: AbortSignal.timeout(8000) });
     const contentType = up.headers.get("content-type") || "application/json";
     const body = Buffer.from(await up.arrayBuffer());
+    // Observable: log status + path (never the token) so a working pass-through
+    // is distinct from "never called". A 401 here means the TUI sent no/stale
+    // bearer, not a proxy fault.
+    process.stderr.write(`${LOG_PREFIX} oauth usage pass-through ${up.status} ${rawUrl}\n`);
     res.writeHead(up.status, { "content-type": contentType, "content-length": body.length });
     res.end(body);
   } catch (e) {
