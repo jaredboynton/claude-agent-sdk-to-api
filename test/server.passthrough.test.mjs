@@ -117,25 +117,47 @@ test("anthropicPassthroughHeaders forwards auth and anthropic headers", () => {
   assert.equal(headers.accept, "text/event-stream");
 });
 
-test("rateLimitHeadersFromInfo normalizes SDK utilization values", () => {
+test("rateLimitHeadersFromInfo emits paired utilization+reset headers Claude Code parses", () => {
+  // Both -utilization AND -reset are required per window (binary fn `zda`);
+  // reset is coerced to unix seconds. ISO input.
   assert.deepEqual(
     rateLimitHeadersFromInfo({
-      five_hour: { utilization: 23.5, resetsAt: "2026-01-01T00:00:00Z" },
-      seven_day: { used_percentage: 0.412 },
+      five_hour: { utilization: 49, resets_at: "2026-07-01T04:00:00.000Z" },
+      seven_day: { utilization: 53, resets_at: "2026-07-04T23:00:00.000Z" },
     }),
     {
-      "anthropic-ratelimit-unified-5h-utilization": "0.235",
-      "anthropic-ratelimit-unified-7d-utilization": "0.412",
+      "anthropic-ratelimit-unified-5h-utilization": "0.49",
+      "anthropic-ratelimit-unified-5h-reset": String(Math.round(Date.parse("2026-07-01T04:00:00.000Z") / 1000)),
+      "anthropic-ratelimit-unified-7d-utilization": "0.53",
+      "anthropic-ratelimit-unified-7d-reset": String(Math.round(Date.parse("2026-07-04T23:00:00.000Z") / 1000)),
     },
   );
+  // A window missing its reset is dropped entirely (CC would discard it).
+  assert.deepEqual(
+    rateLimitHeadersFromInfo({ five_hour: { utilization: 23.5 } }),
+    {},
+  );
+  // Clamps out-of-range utilization; accepts unix-seconds reset as-is.
   assert.deepEqual(
     rateLimitHeadersFromInfo({
-      five_hour: { utilization: -5 },
-      seven_day: { utilization: 250 },
+      five_hour: { utilization: -5, resets_at: 1782878400 },
+      seven_day: { utilization: 250, resets_at: 1782878400 },
     }),
     {
       "anthropic-ratelimit-unified-5h-utilization": "0",
+      "anthropic-ratelimit-unified-5h-reset": "1782878400",
       "anthropic-ratelimit-unified-7d-utilization": "1",
+      "anthropic-ratelimit-unified-7d-reset": "1782878400",
+    },
+  );
+  // Accepts the nested `rate_limits` wrapper from the get_usage control method.
+  assert.deepEqual(
+    rateLimitHeadersFromInfo({
+      rate_limits: { five_hour: { utilization: 0.4, resets_at: 1782878400 } },
+    }),
+    {
+      "anthropic-ratelimit-unified-5h-utilization": "0.4",
+      "anthropic-ratelimit-unified-5h-reset": "1782878400",
     },
   );
 });

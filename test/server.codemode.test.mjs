@@ -553,8 +553,8 @@ test("writeEvent injects latest rate-limit headers before first SSE chunk", () =
     },
   });
   rememberRateLimitHeaders(session, {
-    five_hour: { utilization: 23.5 },
-    seven_day: { utilization: 0.412 },
+    five_hour: { utilization: 23.5, resets_at: 1782878400 },
+    seven_day: { utilization: 0.412, resets_at: 1782878400 },
   });
 
   writeEvent(session, { type: "message_stop" });
@@ -562,8 +562,23 @@ test("writeEvent injects latest rate-limit headers before first SSE chunk", () =
   assert.equal(session.res.statusCode, 200);
   assert.equal(session.res.headers["content-type"], "text/event-stream");
   assert.equal(session.res.headers["anthropic-ratelimit-unified-5h-utilization"], "0.235");
+  assert.equal(session.res.headers["anthropic-ratelimit-unified-5h-reset"], "1782878400");
   assert.equal(session.res.headers["anthropic-ratelimit-unified-7d-utilization"], "0.412");
+  assert.equal(session.res.headers["anthropic-ratelimit-unified-7d-reset"], "1782878400");
   assert.match(chunks[0], /^event: message_stop\n/);
+});
+
+test("rememberRateLimitHeaders merges partial get_usage windows across turns", () => {
+  const session = fakeCodeSession();
+  rememberRateLimitHeaders(session, { five_hour: { utilization: 39, resets_at: 1782878400 } });
+  rememberRateLimitHeaders(session, { seven_day: { utilization: 51, resets_at: 1782878400 } });
+
+  assert.deepEqual(session.rateLimitHeaders, {
+    "anthropic-ratelimit-unified-5h-utilization": "0.39",
+    "anthropic-ratelimit-unified-5h-reset": "1782878400",
+    "anthropic-ratelimit-unified-7d-utilization": "0.51",
+    "anthropic-ratelimit-unified-7d-reset": "1782878400",
+  });
 });
 
 test("dispatchCodeWave emits immediately on the attached HTTP turn", async () => {

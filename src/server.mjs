@@ -620,13 +620,37 @@ function rateLimitUtilization(info) {
   return normalizeRateLimitUtilization(info.utilization ?? info.used_percentage ?? info.used_percent);
 }
 
+// Coerce a reset timestamp to unix SECONDS (Claude Code parses `Number(header)`
+// and treats it as epoch seconds). Accepts unix seconds, unix millis, or an
+// ISO-8601 string (the shape the SDK get_usage control method returns).
+function rateLimitResetSeconds(value) {
+  if (value == null) return null;
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value > 1e11 ? Math.round(value / 1000) : Math.round(value);
+  }
+  const parsed = Date.parse(String(value));
+  if (Number.isFinite(parsed)) return Math.round(parsed / 1000);
+  return null;
+}
+
+// Build the exact unified rate-limit headers Claude Code parses (binary fn
+// `zda`): for each window it requires BOTH `-<abbrev>-utilization` (0..1) AND
+// `-<abbrev>-reset` (unix seconds) or it drops the window entirely. Abbrevs are
+// `5h` (five_hour) and `7d` (seven_day). The statusline turns utilization*100
+// into the `used_percentage` it renders.
 function rateLimitHeadersFromInfo(rateLimitInfo) {
   if (!rateLimitInfo || typeof rateLimitInfo !== "object") return {};
+  if (rateLimitInfo.rate_limits) return rateLimitHeadersFromInfo(rateLimitInfo.rate_limits);
   const headers = {};
-  const fiveHour = rateLimitUtilization(rateLimitInfo.five_hour);
-  if (fiveHour != null) headers["anthropic-ratelimit-unified-5h-utilization"] = String(fiveHour);
-  const sevenDay = rateLimitUtilization(rateLimitInfo.seven_day);
-  if (sevenDay != null) headers["anthropic-ratelimit-unified-7d-utilization"] = String(sevenDay);
+  for (const [key, abbrev] of [["five_hour", "5h"], ["seven_day", "7d"]]) {
+    const window = rateLimitInfo[key];
+    if (!window || typeof window !== "object") continue;
+    const util = rateLimitUtilization(window);
+    const reset = rateLimitResetSeconds(window.resets_at ?? window.resetsAt);
+    if (util == null || reset == null) continue;
+    headers[`anthropic-ratelimit-unified-${abbrev}-utilization`] = String(util);
+    headers[`anthropic-ratelimit-unified-${abbrev}-reset`] = String(reset);
+  }
   return headers;
 }
 
@@ -635,17 +659,38 @@ let lastRateLimitHeaders = {};
 function rememberRateLimitHeaders(session, rateLimitInfo) {
   const headers = rateLimitHeadersFromInfo(rateLimitInfo);
   if (!Object.keys(headers).length) return headers;
-  session.rateLimitHeaders = headers;
-  session.rateLimitResetsAt = {
-    five_hour: rateLimitInfo?.five_hour?.resetsAt ?? rateLimitInfo?.five_hour?.resets_at,
-    seven_day: rateLimitInfo?.seven_day?.resetsAt ?? rateLimitInfo?.seven_day?.resets_at,
-  };
-  lastRateLimitHeaders = headers;
+  if (session) session.rateLimitHeaders = { ...(session.rateLimitHeaders || {}), ...headers };
+  lastRateLimitHeaders = { ...lastRateLimitHeaders, ...headers };
   return headers;
 }
 
 function latestRateLimitHeaders(session) {
-  return { ...(session?.rateLimitHeaders || lastRateLimitHeaders || {}) };
+  const own = session?.rateLimitHeaders;
+  if (own && Object.keys(own).length) return { ...own };
+  return { ...(lastRateLimitHeaders || {}) };
+}
+
+// The SDK stream's `rate_limit_event` carries only a flat status/resetsAt and
+// (on Max plans) NO utilization percentage. The real 5h/7d utilization the
+// statusline needs lives behind the SDK control method get_usage, which returns
+// the nested { five_hour:{utilization}, seven_day:{utilization} } shape (0-100).
+// Pull it on demand and cache the synthesized headers on the session + globally.
+// Guarded so only one refresh is in flight per session.
+async function refreshRateLimitsFromControl(session) {
+  if (!session || session.rateLimitRefreshing) return;
+  const fn = session.query?.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET;
+  if (typeof fn !== "function") return;
+  session.rateLimitRefreshing = true;
+  try {
+    const usage = await fn.call(session.query);
+    if (usage?.rate_limits_available && usage.rate_limits) {
+      rememberRateLimitHeaders(session, usage.rate_limits);
+    }
+  } catch (e) {
+    process.stderr.write(`${LOG_PREFIX} rate-limit usage refresh failed: ${String(e?.message || e).slice(0, 120)}\n`);
+  } finally {
+    session.rateLimitRefreshing = false;
+  }
 }
 
 function ensureSseHeaders(session) {
@@ -1612,6 +1657,10 @@ async function consumeSession(session) {
       if (msg.session_id) session.sdkSessionId = msg.session_id;
       if (msg.type === "rate_limit_event") {
         rememberRateLimitHeaders(session, msg.rate_limit_info ?? msg.rate_limit_event?.rate_limit_info);
+        // The event itself often lacks utilization; fetch the nested 5h/7d
+        // utilization from the SDK control method and cache it for this and
+        // future turns' response headers.
+        refreshRateLimitsFromControl(session);
       } else if (msg.type === "stream_event" && msg.event) {
         const ev = msg.event;
         noteStreamTiming(session, ev);
@@ -2337,11 +2386,11 @@ export function startServer({ port = 32809, host = "127.0.0.1", account = null, 
         return jsonResp(res, 200, { input_tokens: 1 });
       }
     }
-    // OAuth usage / rate-limit pass-through. Claude Code may probe private
-    // usage endpoints through ANTHROPIC_BASE_URL to populate statusbar
-    // rate_limits. The proxy talks upstream through the Claude Agent SDK
-    // (which does not expose these endpoints), so forward the request to the
-    // real Anthropic OAuth endpoint with the client's Authorization header.
+    // OAuth usage pass-through. Claude Code may probe private usage endpoints
+    // through ANTHROPIC_BASE_URL for auxiliary statusbar data. The proxy talks
+    // upstream through the Claude Agent SDK (which does not expose these
+    // endpoints), so forward the request to the real Anthropic OAuth endpoint
+    // with the client's Authorization header.
     // The proxy never sees or stores the token. Limited to a known-safe
     // upstream host and an allowlist of paths.
     if (req.method === "GET" && OAUTH_PASS_THROUGH_PATHS.has(url)) {
