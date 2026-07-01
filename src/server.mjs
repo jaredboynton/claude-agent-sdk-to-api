@@ -1838,6 +1838,61 @@ async function resolveCodeModeToolResults(session, toolResults) {
   }
 }
 
+// Claude Code prompt/agent hooks (Stop, SubagentStop, PreToolUse, etc.) call the
+// Messages API with output_config.format (structured JSON). The SDK bridge cannot
+// honor that — it injects the claude_code preset, CODE_MODE_APPEND, and MCP tools,
+// so hook eval gets narrative text instead of {"ok": true/false} and Claude Code
+// reports "JSON validation failed". Passthrough those requests to api.anthropic.com.
+function needsStructuredOutputPassthrough(reqBody) {
+  if (!reqBody || typeof reqBody !== "object") return false;
+  if (reqBody.output_config?.format) return true;
+  // Legacy field Claude Code still accepts during the structured-outputs transition.
+  if (reqBody.output_format) return true;
+  return false;
+}
+
+function anthropicPassthroughHeaders(req) {
+  const headers = { accept: req.headers["accept"] || "application/json" };
+  const ct = req.headers["content-type"];
+  if (ct) headers["content-type"] = Array.isArray(ct) ? ct.join(",") : String(ct);
+  const auth = req.headers["authorization"];
+  if (auth) headers["authorization"] = Array.isArray(auth) ? auth.join(",") : String(auth);
+  const beta = req.headers["anthropic-beta"];
+  if (beta) headers["anthropic-beta"] = Array.isArray(beta) ? beta.join(",") : String(beta);
+  const version = req.headers["anthropic-version"];
+  if (version) headers["anthropic-version"] = Array.isArray(version) ? version.join(",") : String(version);
+  return headers;
+}
+
+async function forwardAnthropicMessages(req, res, rawBody, rawUrl) {
+  try {
+    const upstream = new URL(anthropicApiOrigin() + rawUrl);
+    const up = await fetch(upstream, {
+      method: "POST",
+      headers: anthropicPassthroughHeaders(req),
+      body: rawBody,
+      signal: AbortSignal.timeout(600000),
+    });
+    const outHeaders = {};
+    for (const h of ["content-type", "cache-control", "request-id", "anthropic-ratelimit-requests-limit"]) {
+      const v = up.headers.get(h);
+      if (v) outHeaders[h] = v;
+    }
+    res.writeHead(up.status, outHeaders);
+    if (up.body) {
+      for await (const chunk of up.body) {
+        if (!res.writableEnded) res.write(chunk);
+      }
+    }
+    if (!res.writableEnded) res.end();
+  } catch (e) {
+    process.stderr.write(`${LOG_PREFIX} structured-output pass-through failed: ${e?.message || e}\n`);
+    if (!res.headersSent) {
+      jsonResp(res, 502, { type: "error", error: { type: "api_error", message: `upstream messages fetch failed: ${e?.message || e}` } });
+    } else if (!res.writableEnded) res.end();
+  }
+}
+
 async function handleMessages(req, res) {
   let body = "";
   for await (const chunk of req) body += chunk;
@@ -1846,6 +1901,11 @@ async function handleMessages(req, res) {
     reqBody = JSON.parse(body);
   } catch (e) {
     return jsonResp(res, 400, { type: "error", error: { type: "invalid_request_error", message: "invalid JSON body" } });
+  }
+
+  if (needsStructuredOutputPassthrough(reqBody)) {
+    process.stderr.write(`${LOG_PREFIX} structured-output pass-through stream=${reqBody.stream !== false}\n`);
+    return forwardAnthropicMessages(req, res, body, req.url || "/v1/messages");
   }
 
   const { model: rawModel, messages, system, stream, tools } = reqBody;
@@ -2098,7 +2158,9 @@ async function handleMessages(req, res) {
 // Anthropic OAuth usage endpoint (the same one ~/.claude-/statusline.py calls
 // out-of-band for extra_usage). Limited to a known-safe upstream host so the
 // pass-through can never be redirected by the client.
-const ANTHROPIC_API_ORIGIN = "https://api.anthropic.com";
+function anthropicApiOrigin() {
+  return process.env.ANTHROPIC_API_ORIGIN || "https://api.anthropic.com";
+}
 const OAUTH_PASS_THROUGH_PATHS = new Set([
   "/api/oauth/usage",
 ]);
@@ -2114,7 +2176,7 @@ async function forwardOauthUsage(req, res, rawUrl) {
   const beta = req.headers["anthropic-beta"];
   if (beta) headers["anthropic-beta"] = Array.isArray(beta) ? beta.join(",") : String(beta);
   try {
-    const upstream = new URL(ANTHROPIC_API_ORIGIN + rawUrl);
+    const upstream = new URL(anthropicApiOrigin() + rawUrl);
     const up = await fetch(upstream, { method: "GET", headers, signal: AbortSignal.timeout(8000) });
     const contentType = up.headers.get("content-type") || "application/json";
     const body = Buffer.from(await up.arrayBuffer());
@@ -2295,6 +2357,9 @@ export {
   modelObject,
   resolveCwd,
   isValidCwd,
+  needsStructuredOutputPassthrough,
+  anthropicPassthroughHeaders,
+  forwardAnthropicMessages,
   totalCodeCalls,
   totalCodeSubCalls,
   totalCodeErrors,
