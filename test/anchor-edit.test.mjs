@@ -386,3 +386,51 @@ test("patchCodeEditDescription documents both paths and use-one-or-the-other", (
   assert.match(d, /old_string/);
   assert.match(d, /ORIGINAL NATIVE DESC/);
 });
+
+// ---------------------------------------------------------------------------
+// Partial-snapshot detection (default Reads cap at 2000 lines with no marker)
+// ---------------------------------------------------------------------------
+
+test("annotateReadResult flags a from-line-1 read of exactly 2000 lines as partial", () => {
+  const state = createAnchorState();
+  const lines = Array.from({ length: 2000 }, (_, i) => `line ${i + 1}`);
+  const { anchored } = annotateReadResult(state, "/big.js", gutter(lines));
+  assert.equal(anchored, true);
+  const file = state.files.get("/big.js");
+  assert.equal(file.partial, true);
+  // Partial snapshots skip minimization: translate emits the full-span old_string.
+  const anchors = file.anchors;
+  const t = translateEditInput(state, "Edit", {
+    file_path: "/big.js",
+    start_anchor: anchors[0],
+    end_anchor: anchors[2],
+    new_string: "line 1\nCHANGED\nline 3",
+  });
+  assert.equal(t.ok, true);
+  assert.equal(t.input.old_string, "line 1\nline 2\nline 3");
+});
+
+test("annotateReadResult with complete:true trusts the caller on large stitched reads", () => {
+  const state = createAnchorState();
+  const lines = Array.from({ length: 2500 }, (_, i) => `line ${i + 1}`);
+  annotateReadResult(state, "/stitched.js", gutter(lines), { complete: true });
+  const file = state.files.get("/stitched.js");
+  assert.equal(file.partial, false);
+  // Minimization is active and unique against the full snapshot.
+  const t = translateEditInput(state, "Edit", {
+    file_path: "/stitched.js",
+    start_anchor: file.anchors[9],
+    end_anchor: file.anchors[11],
+    new_string: "line 10\nCHANGED\nline 12",
+  });
+  assert.equal(t.ok, true);
+  // Minimized below the full span ("line 11" alone is a substring of "line 110"
+  // etc., so the minimizer grows back one suffix line to stay unique).
+  assert.equal(t.input.old_string, "line 11\nline 12");
+});
+
+test("annotateReadResult with complete:false forces partial on a short read", () => {
+  const state = createAnchorState();
+  annotateReadResult(state, "/short.js", gutter(["a", "b", "c"]), { complete: false });
+  assert.equal(state.files.get("/short.js").partial, true);
+});

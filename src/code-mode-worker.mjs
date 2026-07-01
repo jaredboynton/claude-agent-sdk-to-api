@@ -15,6 +15,7 @@
 
 import vm from "node:vm";
 import { parentPort } from "node:worker_threads";
+import { createHash, randomUUID } from "node:crypto";
 
 let pending = [];
 let flushing = false;
@@ -288,11 +289,23 @@ function findToolDoc(nameOrPath) {
   )) || null;
 }
 
+// Name-weighted scoring: an exact-name hit must outrank a tool whose long docs
+// merely mention the term. Cap 20 (was 8 — too small to page through a large
+// MCP-heavy catalog; codemode.list() covers full enumeration).
 function searchToolDocs(query = "") {
   const terms = String(query || "").toLowerCase().split(/[^a-z0-9_$.-]+/).filter(Boolean);
   const scored = toolDocs.map((doc) => {
-    const haystack = `${doc.name} ${doc.path} ${doc.summary} ${doc.docs}`.toLowerCase();
-    const score = terms.length ? terms.reduce((n, term) => n + (haystack.includes(term) ? 1 : 0), 0) : 1;
+    const name = doc.name.toLowerCase();
+    const path = doc.path.toLowerCase();
+    const summary = doc.summary.toLowerCase();
+    const docs = doc.docs.toLowerCase();
+    const score = terms.length
+      ? terms.reduce((n, term) => n
+          + (name === term ? 8 : 0)
+          + (name !== term && name.includes(term) ? 4 : 0)
+          + (path.includes(term) ? 2 : 0)
+          + (summary.includes(term) || docs.includes(term) ? 1 : 0), 0)
+      : 1;
     return {
       path: doc.path,
       name: doc.name,
@@ -303,7 +316,7 @@ function searchToolDocs(query = "") {
   return scored
     .filter((item) => item.score > 0)
     .sort((a, b) => b.score - a.score || a.name.localeCompare(b.name))
-    .slice(0, 8)
+    .slice(0, 20)
     .map(({ score: _score, ...item }) => item);
 }
 
@@ -338,6 +351,12 @@ function buildCodemodeGlobal() {
     // Fetch the full text of a previously truncated result. Resolved inline by
     // the bridge from the session artifact store — no client turn is fabricated.
     recall: (id) => callTool("__recall", { id: String(id ?? "") }),
+    // Daemon-side syntax check of the real file (js/mjs/cjs, py, json, sh) —
+    // resolved inline by the bridge, no client turn. Check `.isError`.
+    verify: (path) => callTool("__verify", { path: String(path ?? "") }),
+    // Full catalog enumeration (worker-local, zero waves). search() caps at 20;
+    // this is the complete list.
+    list: () => toolDocs.map((d) => ({ name: d.name, path: d.path, summary: d.summary })),
   });
 }
 
@@ -368,6 +387,10 @@ async function runScript(script, toolNames) {
     warn: (...a) => workerLogs.push(`[warn] ${a.map(String).join(" ")}`),
     error: (...a) => workerLogs.push(`[error] ${a.map(String).join(" ")}`),
   };
+  // Aliases models reach for constantly; a missing console.info is a whole
+  // wasted run ("console.info is not a function"), not a safety win.
+  sandboxConsole.info = sandboxConsole.log;
+  sandboxConsole.debug = sandboxConsole.log;
   const deny = (key) => () => { throw new Error(`access to ${key} is denied in code mode scripts`); };
 
   const context = vm.createContext({
@@ -383,6 +406,21 @@ async function runScript(script, toolNames) {
     console: sandboxConsole,
     TextEncoder,
     TextDecoder,
+    // Pure data helpers models expect everywhere. None grant I/O or scheduling
+    // (the actual sandbox concerns); their absence just crashes otherwise-fine
+    // scripts with a bare ReferenceError.
+    structuredClone,
+    URL,
+    URLSearchParams,
+    atob,
+    btoa,
+    queueMicrotask,
+    crypto: Object.freeze({
+      randomUUID,
+      // Sync hex sha256 — webcrypto's async ArrayBuffer subtle.digest is a
+      // footgun in short scripts; this covers dedupe keys and content hashes.
+      sha256: (data) => createHash("sha256").update(String(data ?? "")).digest("hex"),
+    }),
     require: deny("require"),
     process: { exit: deny("process.exit"), env: Object.freeze({}) },
     globalThis: Object.freeze({}),
@@ -402,13 +440,29 @@ async function runScript(script, toolNames) {
   // We provide a throwing callback, but node still surfaces its own message
   // unless run with --experimental-vm-modules; normalizeRunError() below
   // rewrites either form into a clear denial the script can catch/recover from.
-  const scriptObj = new vm.Script(wrapped, {
-    filename: "code-mode-script.vm",
-    lineOffset: -1,
-    importModuleDynamically: () => {
-      throw new Error("dynamic import() is denied in code mode scripts");
-    },
-  });
+  let scriptObj;
+  try {
+    scriptObj = new vm.Script(wrapped, {
+      filename: "code-mode-script.vm",
+      lineOffset: -1,
+      importModuleDynamically: () => {
+        throw new Error("dynamic import() is denied in code mode scripts");
+      },
+    });
+  } catch (e) {
+    // Compile-time SyntaxError: its stack head is `code-mode-script.vm:N`, the
+    // offending source line, and a caret — but the message alone carries no
+    // location, so the model would guess (each guess is a paid round-trip).
+    // Bake the line number and the stack head into the message.
+    if (e instanceof SyntaxError) {
+      const head = String(e.stack || "").split("\n").slice(0, 3).join("\n");
+      const m = head.match(/code-mode-script\.vm:(\d+)/);
+      const err = new SyntaxError(m ? `${e.message} (line ${m[1]})\n${head}` : e.message);
+      err.stack = ""; // location already in the message; no script-owned frames exist
+      throw err;
+    }
+    throw e;
+  }
   // No vm timeout: scripts may run as long as they need (long tool waves,
   // big in-script aggregation). The bridge's session lifecycle is the backstop.
   const out = scriptObj.runInContext(context);
@@ -418,16 +472,23 @@ async function runScript(script, toolNames) {
 const workerLogs = [];
 
 // Rewrite node's dynamic-import internals message into a clear denial.
-// Otherwise keep the first script-owned stack frame so the model sees WHERE
-// in its script the throw happened (line numbers align via lineOffset).
+// Otherwise keep up to 3 script-owned stack frames so the model sees WHERE in
+// its script the throw happened AND the call path that got there (line numbers
+// align via lineOffset). Only true `at ...` frames qualify — SyntaxError stacks
+// carry source/caret lines that must not be mistaken for frames (their
+// location is already baked into the message at compile time).
 function normalizeRunError(err) {
   const msg = err?.message || String(err);
   if (/dynamic import callback|experimental-vm-modules/i.test(msg)) {
     return "dynamic import() is denied in code mode scripts";
   }
   const stack = typeof err?.stack === "string" ? err.stack : "";
-  const frame = stack.split("\n").find((l) => l.includes("code-mode-script.vm"));
-  return frame ? `${msg} (at ${frame.trim().replace(/^at\s+/, "")})` : msg;
+  const frames = stack.split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l.startsWith("at ") && l.includes("code-mode-script.vm"))
+    .slice(0, 3)
+    .map((l) => l.replace(/^at\s+/, ""));
+  return frames.length ? `${msg} (at ${frames.join(" <- ")})` : msg;
 }
 
 parentPort.on("message", async (msg) => {

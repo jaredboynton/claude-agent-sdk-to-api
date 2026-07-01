@@ -79,6 +79,18 @@ import {
   ANCHORED_READ_TOOLS,
   ANCHORED_EDIT_TOOLS,
 } from "./anchor-edit.mjs";
+import {
+  classifyToolFailure,
+  verifyEditsOnDisk,
+  planFreshnessWindow,
+  planChunkedRead,
+  stitchReadResults,
+  editRecoveryDisabled,
+  EDIT_RECOVERY_MAX_ROUNDS,
+  NOTE_RECOVERED,
+  NOTE_FRESHNESS_HINT,
+} from "./read-recovery.mjs";
+import { checkerFor, runSyntaxCheck, collectGitSnapshot } from "./local-checks.mjs";
 
 const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS || process.env.ACP_SESSION_TTL_MS || 10800000); // 3 h
 const HEARTBEAT_MS = Number(process.env.HEARTBEAT_MS || process.env.ACP_HEARTBEAT_MS || 15000);
@@ -99,6 +111,14 @@ const CODE_MAX_CALLS = Number(process.env.CODE_MAX_CALLS || 0); // 0 = unlimited
 // they survive clearAllCodeState/abandonToolRound and die with the session.
 const CODE_STATE_MAX_BYTES = Number(process.env.CODE_STATE_MAX_BYTES || 2 * 1024 * 1024);
 const CODE_ARTIFACT_BUDGET_BYTES = Number(process.env.CODE_ARTIFACT_BUDGET_BYTES || 4 * 1024 * 1024);
+// Daemon-side local checks: codemode.verify() timeout, the failures-only
+// post-edit auto-check backstop, and the session-start git snapshot seeded
+// into the script's `state.git`.
+const CODE_VERIFY_TIMEOUT_MS = Number(process.env.CODE_VERIFY_TIMEOUT_MS || 5000);
+const CODE_POST_EDIT_CHECKS = process.env.CODE_POST_EDIT_CHECKS !== "0";
+const CODE_POST_EDIT_CHECK_BUDGET_MS = 3000;
+const CODE_GIT_SNAPSHOT = process.env.CODE_GIT_SNAPSHOT !== "0";
+const CODE_CHECKED_EDIT_TOOLS = new Set(["Edit", "MultiEdit", "Write"]);
 const LOG_PREFIX = "[claude-agent-api]";
 
 // Per-request working directory.
@@ -631,15 +651,35 @@ function mergeLateTool(session, t) {
 
 // Deliver queued late-tool announcements on a code tool_result. Mutates the
 // result's first text block in place and clears the queue once delivered.
+// Append one in-band note to a collapsed code result. Tool_result text is
+// append-only transcript: it extends the cache incrementally and never touches
+// the frozen description bytes — the safe channel for all dynamic info.
+function appendCodeResultNote(collapsed, note) {
+  const block = collapsed?.content?.[0];
+  if (!block || typeof block.text !== "string" || !note) return collapsed;
+  block.text = block.text ? `${block.text}\n\n${note}` : note;
+  return collapsed;
+}
+
 function appendPendingToolNotice(session, collapsed) {
   if (!session.pendingToolNotice?.size) return collapsed;
-  const block = collapsed?.content?.[0];
-  if (!block || typeof block.text !== "string") return collapsed;
   const names = [...session.pendingToolNotice].sort();
   const note = `[new tools available (not in the docs above): ${names.join(", ")} — call them normally; docs via codemode.describe(${JSON.stringify(names[0])})]`;
-  block.text = block.text ? `${block.text}\n\n${note}` : note;
+  appendCodeResultNote(collapsed, note);
   session.pendingToolNotice = null;
   return collapsed;
+}
+
+// Serialized byte size of the script's `state`. Plain JSON.stringify counts a
+// Map/Set as "{}", so Map/Set-heavy state would dodge the cap entirely; the
+// replacer expands them to their entries for counting purposes only.
+function stateByteSize(state) {
+  const json = JSON.stringify(state, (_k, v) => {
+    if (v instanceof Map) return { "@map": [...v.entries()] };
+    if (v instanceof Set) return { "@set": [...v.values()] };
+    return v;
+  });
+  return Buffer.byteLength(json ?? "null", "utf8");
 }
 
 // Deep-remove cache_control from a content block (client TTLs conflict with the
@@ -890,6 +930,7 @@ let totalCodeCalls = 0;
 let totalCodeSubCalls = 0;
 let totalCodeErrors = 0;
 let totalCodeWaves = 0;
+let totalCodeRecoveries = 0;
 let totalCacheReadTokens = 0;
 let totalCacheCreationTokens = 0;
 let totalMimicryDetections = 0;
@@ -1026,6 +1067,7 @@ function logTurnDone(session) {
       spills: m.spills,
       stateBytes: m.stateBytes,
       codeErrors: m.codeErrors,
+      ...(m.codeRecoveries ? { codeRecoveries: m.codeRecoveries } : {}),
       ...(session.descHash ? { descHash: session.descHash } : {}),
       ...(m.coldReason ? { coldReason: m.coldReason } : {}),
       ttftMs: ttft,
@@ -1212,6 +1254,9 @@ function notifyTurnAttached(session) {
     }
   }
   fabricateCurrentWave(session);
+  // Recovery parts queued while the turn sink was gone (client disconnected
+  // mid-POST) flush on the next attached turn.
+  fabricateRecoveryTurn(session);
 }
 
 function clearCodeRun(session, codeId) {
@@ -1356,6 +1401,13 @@ function startCodeRun(session, codeToolUseId, input) {
   session.codeDriving = true;
   session.suppressEndTurn = true; // swallow T0's message_stop while the run is active
 
+  // Seed the session-start git snapshot into `state.git` exactly once. The
+  // one-time flag respects a script that deliberately deletes state.git.
+  if (session.gitSnapshot && !session.gitSeeded) {
+    if (session.codeState.git === undefined) session.codeState.git = session.gitSnapshot;
+    session.gitSeeded = true;
+  }
+
   const toolNames = [...session.clientTools.keys()];
   const toolDocs = buildCodeToolCatalog(session.clientTools);
   const t0 = Date.now();
@@ -1372,7 +1424,7 @@ function startCodeRun(session, codeToolUseId, input) {
     dispatchWave: (waveNum, calls) => dispatchCodeWave(session, codeToolUseId, waveNum, calls),
   });
 
-  run.promise.then((result) => {
+  run.promise.then(async (result) => {
     if (run.aborted) return;
     run.settled = true;
     const waves = result.waves || 0;
@@ -1383,18 +1435,23 @@ function startCodeRun(session, codeToolUseId, input) {
 
     // Persist the script's `state` (success AND error: progress stashed before
     // a throw must survive). Over-cap keeps the previous state — losing new
-    // progress beats silently dropping everything. Byte size via JSON is an
-    // approximation (Maps/Sets serialize as {}), fine for a guard rail.
+    // progress beats silently dropping everything — and the model is TOLD via
+    // an in-band note: a silent drop means its next script assumes the stash
+    // succeeded and finds `state` mysteriously reverted.
+    let stateNote = null;
     if (result.state && typeof result.state === "object") {
       try {
-        const bytes = Buffer.byteLength(JSON.stringify(result.state), "utf8");
+        const bytes = stateByteSize(result.state);
         if (bytes <= CODE_STATE_MAX_BYTES) {
           session.codeState = result.state;
           if (session.turnMetrics) session.turnMetrics.stateBytes = bytes;
         } else {
+          stateNote = `[state NOT saved this call: ${bytes} bytes > ${CODE_STATE_MAX_BYTES} cap; the previous state was kept. Delete large entries (raw file text, full tool outputs) from state before returning.]`;
           process.stderr.write(`${LOG_PREFIX} code call ${codeToolUseId}: state over cap (${bytes} > ${CODE_STATE_MAX_BYTES} bytes); keeping previous state\n`);
         }
-      } catch {}
+      } catch (e) {
+        stateNote = `[state NOT saved this call: serialization failed (${String(e?.message || e).slice(0, 120)}); the previous state was kept]`;
+      }
     }
 
     let collapsed;
@@ -1420,6 +1477,36 @@ function startCodeRun(session, codeToolUseId, input) {
       process.stderr.write(
         `${LOG_PREFIX} code call ${codeToolUseId}: done waves=${waves} calls=${calls} scriptOut=${scriptOut} bytes execute=${Date.now() - t0}ms\n`,
       );
+    }
+
+    if (stateNote) appendCodeResultNote(collapsed, stateNote);
+
+    // Post-edit auto-check backstop (failures only): the daemon syntax-checks
+    // files this run successfully edited, at zero client/model cost. A clean
+    // check appends NOTHING; paths the script already codemode.verify()-ed are
+    // skipped. Bounded by a hard budget so the final answer is never held
+    // hostage; any failure here must never break result delivery.
+    if (CODE_POST_EDIT_CHECKS && run.editedPaths?.size) {
+      try {
+        const paths = [...run.editedPaths].filter((p) => !run.verifiedPaths?.has(p));
+        const checks = paths.map((p) => runSyntaxCheck(p, { cwd: session.cwd, timeoutMs: CODE_VERIFY_TIMEOUT_MS }));
+        let timer;
+        const deadline = new Promise((res) => {
+          timer = setTimeout(() => res(null), CODE_POST_EDIT_CHECK_BUDGET_MS);
+          timer.unref?.();
+        });
+        const settled = await Promise.race([Promise.all(checks), deadline]);
+        clearTimeout(timer);
+        if (Array.isArray(settled)) {
+          for (const res of settled) {
+            if (res.ok || res.reason || run.verifiedPaths?.has(res.resolvedPath)) continue;
+            const tail = res.output.split("\n").slice(0, 3).join("\n");
+            appendCodeResultNote(collapsed, `[post-edit check] ${res.checker} failed for ${res.path}:\n${tail}`);
+          }
+        }
+      } catch (e) {
+        process.stderr.write(`${LOG_PREFIX} post-edit check failed: ${String(e?.message || e).slice(0, 120)}\n`);
+      }
     }
 
     appendPendingToolNotice(session, collapsed);
@@ -1475,6 +1562,27 @@ async function dispatchCodeWave(session, codeToolUseId, waveNum, calls) {
       });
       continue;
     }
+    // codemode.verify: daemon-side syntax check of the real file, resolved
+    // inline (same machinery as __recall) — zero client round-trips, zero
+    // model round-trips. Paths verified here are skipped by the post-edit
+    // auto-check backstop.
+    if (name === "__verify" && !session.clientTools.has("__verify")) {
+      const res = await runSyntaxCheck(String(args?.path ?? ""), { cwd: session.cwd, timeoutMs: CODE_VERIFY_TIMEOUT_MS });
+      // Record both spellings so the post-edit backstop can dedupe whether the
+      // edit args used the raw or the resolved path.
+      (run.verifiedPaths ||= new Set()).add(String(args?.path ?? ""));
+      if (res.resolvedPath) run.verifiedPaths.add(res.resolvedPath);
+      validated.push({
+        syntheticId: null,
+        tool: name,
+        args,
+        inlineError: null,
+        inlineResult: res.ok
+          ? { text: `OK ${res.checker}: ${res.path}`, raw: null, isError: false }
+          : { text: res.output || res.reason || "check failed", raw: null, isError: true },
+      });
+      continue;
+    }
     const meta = session.clientTools.get(name);
     if (!meta) {
       validated.push({
@@ -1519,6 +1627,48 @@ async function dispatchCodeWave(session, codeToolUseId, waveNum, calls) {
       }
       syntheticArgs = r.data;
     }
+    // Large-Read auto-split: the client hard-caps Read at 25k tokens (with an
+    // error) and 2000 lines (SILENTLY — the model gets a truncated result with
+    // no marker). Both break the read->edit loop on big files, so a Read that
+    // cannot come back whole is dispatched as N windowed Reads and stitched
+    // into ONE script-visible result. The daemon stats the file locally to
+    // plan the windows; if it can't, the single call proceeds and the client
+    // produces the real error.
+    if (name === "Read" && typeof syntheticArgs?.file_path === "string") {
+      const plan = planChunkedRead({
+        filePath: syntheticArgs.file_path,
+        cwd: session.cwd,
+        offset: syntheticArgs.offset,
+        limit: syntheticArgs.limit,
+      });
+      if (plan?.tooLarge) {
+        validated.push({
+          syntheticId: null,
+          tool: name,
+          args,
+          inlineError: `file too large to read whole (${plan.totalLines} lines, ~${plan.estTokens} tokens); read a window with offset/limit or use Grep`,
+        });
+        continue;
+      }
+      if (plan?.chunks?.length > 1) {
+        run.callCount++;
+        const parts = plan.chunks.map((c, k) => ({
+          syntheticId: syntheticIdFor(codeToolUseId, waveNum, `${i}c${k}`),
+          args: { ...syntheticArgs, offset: c.offset, limit: c.limit },
+        }));
+        validated.push({
+          syntheticId: parts[0].syntheticId,
+          tool: name,
+          args: syntheticArgs,
+          inlineError: null,
+          anchorPlan: null,
+          parts,
+          partResults: new Array(parts.length).fill(null),
+          stitch: { coversWholeFile: !!plan.coversWholeFile },
+        });
+        continue;
+      }
+    }
     run.callCount++;
     const syntheticId = syntheticIdFor(codeToolUseId, waveNum, i);
     validated.push({ syntheticId, tool: name, args: syntheticArgs, inlineError: null, anchorPlan });
@@ -1540,7 +1690,11 @@ async function dispatchCodeWave(session, codeToolUseId, waveNum, calls) {
     calls: validated,
     fabricatable,
     results: new Array(validated.length).fill(null),
-    pending: new Set(fabricatable.map((v) => v.syntheticId)),
+    // Multi-part calls (chunked Reads) contribute one pending id per part;
+    // the wave resolves only when every part of every call has come back.
+    pending: new Set(fabricatable.flatMap((v) => (v.parts ?? [v]).map((p) => p.syntheticId))),
+    partIndex: null,          // lazy Map<syntheticId, {callIdx, partIdx}> (see waveSlotFor)
+    recoveryParts: null,      // queued recovery tool_uses awaiting fabrication (freshness retries)
     dispatched: false,
     promise: null,
     resolve: null,
@@ -1580,25 +1734,7 @@ function fabricateCurrentWave(session) {
   wave.dispatched = true;
 
   const p = session._proj;
-  // Start a fresh fabricated assistant message. The client (and its subagent
-  // accounting) reads message.usage.input_tokens, so a bare { role } here
-  // throws "undefined is not an object (evaluating 'o.input_tokens')". Emit a
-  // complete message envelope with a usage object — but replay the last real
-  // upstream usage instead of zeros, so statusbar context does not bounce to
-  // zero between real upstream messages during a code-mode tool wave.
-  writeEvent(session, {
-    type: "message_start",
-    message: {
-      id: `msg_${randomUUID().replace(/-/g, "").slice(0, 24)}`,
-      type: "message",
-      role: "assistant",
-      model: session.model,
-      content: [],
-      stop_reason: null,
-      stop_sequence: null,
-      usage: clientVisibleUsage(session),
-    },
-  });
+  beginFabricatedMessage(session);
 
   // Emit any preserved preamble (text/thinking from the SDK code message) on
   // the first wave only.
@@ -1621,18 +1757,49 @@ function fabricateCurrentWave(session) {
     }
   }
 
-  // Emit synthetic tool_use blocks for fabricatable calls.
+  // Emit synthetic tool_use blocks for fabricatable calls. A multi-part call
+  // (chunked Read) emits one block per part; the results stitch back into a
+  // single script-visible entry in resolveCodeModeToolResults.
   for (let i = 0; i < wave.calls.length; i++) {
     const v = wave.calls[i];
     if (v.syntheticId === null) continue; // inline error — no client block
-    session.syntheticToCode.set(v.syntheticId, run.codeId);
-    emitClientToolUse(session, { syntheticId: v.syntheticId, tool: v.tool, args: v.args });
+    for (const part of v.parts ?? [v]) {
+      session.syntheticToCode.set(part.syntheticId, run.codeId);
+      emitClientToolUse(session, { syntheticId: part.syntheticId, tool: v.tool, args: part.args });
+    }
   }
 
-  // Close the fabricated message + HTTP turn. message_delta carries a usage
-  // object in the real API; include one (replaying last known output tokens)
-  // so clients that read delta.usage.output_tokens don't trip over undefined
-  // and the statusbar doesn't bounce to zero during a code-mode tool wave.
+  finishFabricatedMessage(session);
+}
+
+// Fabricated assistant-message envelope shared by fabricateCurrentWave and
+// fabricateRecoveryTurn. The client (and its subagent accounting) reads
+// message.usage.input_tokens, so a bare { role } would throw "undefined is not
+// an object (evaluating 'o.input_tokens')" — emit a complete envelope with a
+// usage object, replaying the last real upstream usage instead of zeros so
+// statusbar context does not bounce to zero during a code-mode tool wave.
+function beginFabricatedMessage(session) {
+  writeEvent(session, {
+    type: "message_start",
+    message: {
+      id: `msg_${randomUUID().replace(/-/g, "").slice(0, 24)}`,
+      type: "message",
+      role: "assistant",
+      model: session.model,
+      content: [],
+      stop_reason: null,
+      stop_sequence: null,
+      usage: clientVisibleUsage(session),
+    },
+  });
+}
+
+// Close the fabricated message + HTTP turn. message_delta carries a usage
+// object in the real API; include one (replaying last known output tokens) so
+// clients that read delta.usage.output_tokens don't trip over undefined.
+// endTurn closes the HTTP response; the SDK's code handler stays parked, and
+// the next client POST attaches a fresh turn.
+function finishFabricatedMessage(session) {
   writeEvent(session, {
     type: "message_delta",
     delta: { stop_reason: "tool_use", stop_sequence: null },
@@ -1642,12 +1809,29 @@ function fabricateCurrentWave(session) {
     type: "message_stop",
     message: { stop_reason: "tool_use" },
   });
-
-  // endTurn closes the HTTP response; the SDK's code handler stays parked.
-  // We must NOT let endTurn resolve the current turn in a way that prevents
-  // the next client request from attaching. endTurn resolves currentTurn; the
-  // next client POST will attach a new one.
   endTurn(session);
+}
+
+// Fabricate a recovery turn: the queued recovery tool_uses (freshness
+// re-Read + Edit retry pairs, or re-planned chunked Reads) go to the client as
+// ONE synthetic assistant message on the currently attached turn. The client
+// executes a message's tool_uses in order (Edit is not concurrency-safe, so
+// its recovery Read completes — refreshing the client's read state — before
+// the Edit retry runs). Costs one local client round-trip, zero model
+// round-trips; the parked `code` script never observes it.
+function fabricateRecoveryTurn(session) {
+  const run = session.codeRun;
+  if (!run || run.aborted) return;
+  const wave = run.currentWave;
+  if (!wave || !wave.recoveryParts?.length) return;
+  if (!session.currentTurn || !hasTurnSink(session)) return; // notifyTurnAttached retries
+  const parts = wave.recoveryParts;
+  wave.recoveryParts = null;
+  beginFabricatedMessage(session);
+  for (const part of parts) {
+    emitClientToolUse(session, { syntheticId: part.syntheticId, tool: part.tool, args: part.args });
+  }
+  finishFabricatedMessage(session);
 }
 
 function remapIndex(session, sdkIndex) {
@@ -1802,6 +1986,16 @@ function createSession(key, model, tools, callerSystem, bucket, { resume, cwd = 
     closed: false,
     turnMetrics: null,
   };
+
+  // Ambient git context, captured once per session (fire-and-forget; ~50ms
+  // typical, ready long before the first code run). Seeded into the script's
+  // `state.git` — state costs ZERO transcript bytes unless a script touches
+  // it, so this is cache-safe by construction, unlike appending to a result.
+  if (CODE_GIT_SNAPSHOT) {
+    collectGitSnapshot(cwd)
+      .then((snap) => { if (snap && !session.closed) session.gitSnapshot = snap; })
+      .catch(() => {});
+  }
 
   const mcpServer = buildParkingMcpServer(tools, session, createSdkMcpServer, frozenToolset);
   // Warm-window resume: tools the client added since the frozen toolset was
@@ -2089,50 +2283,261 @@ sweeper.unref?.();
 // Request handling.
 // ----------------------------------------------------------------------------
 
+// Map a synthetic tool_use id to its wave slot. Built lazily over the wave's
+// calls (a multi-part chunked Read contributes one entry per part) and extended
+// in place when recovery ids are queued mid-wave.
+function waveSlotFor(wave, id) {
+  if (!wave.partIndex) {
+    wave.partIndex = new Map();
+    for (let i = 0; i < wave.calls.length; i++) {
+      const v = wave.calls[i];
+      if (v.syntheticId === null) continue;
+      const parts = v.parts ?? [v];
+      for (let k = 0; k < parts.length; k++) {
+        wave.partIndex.set(parts[k].syntheticId, { callIdx: i, partIdx: k, kind: "call" });
+      }
+    }
+  }
+  return wave.partIndex.get(id) || null;
+}
+
+// The edit chain an Edit/MultiEdit call would apply (native shape — anchor
+// translation already ran at dispatch).
+function editsOf(call) {
+  if (call.tool === "MultiEdit") return Array.isArray(call.args?.edits) ? call.args.edits : [];
+  return [call.args];
+}
+
+// Queue a freshness-recovery round for a failed Edit/MultiEdit: a small
+// windowed Read of the edit site (any successful Read refreshes the client's
+// per-file read state) followed by the identical edit. Both ride ONE
+// fabricated message; the client executes them in order.
+function queueEditRecovery(session, run, wave, callIdx, verified) {
+  const call = wave.calls[callIdx];
+  const round = (call.recoveryRounds = (call.recoveryRounds || 0) + 1);
+  const firstEdit = editsOf(call)[0] || {};
+  const window = planFreshnessWindow({
+    content: verified.content,
+    line: verified.line,
+    oldString: firstEdit.old_string,
+  });
+  const readId = syntheticIdFor(run.codeId, wave.waveNum, `${callIdx}r${round}R`);
+  const editId = syntheticIdFor(run.codeId, wave.waveNum, `${callIdx}r${round}E`);
+  waveSlotFor(wave, readId); // force partIndex construction
+  wave.partIndex.set(readId, { callIdx, partIdx: 0, kind: "recovery-read" });
+  wave.partIndex.set(editId, { callIdx, partIdx: 0, kind: "edit-retry" });
+  wave.pending.add(readId);
+  wave.pending.add(editId);
+  session.syntheticToCode.set(readId, run.codeId);
+  session.syntheticToCode.set(editId, run.codeId);
+  (wave.recoveryParts ||= []).push(
+    { syntheticId: readId, tool: "Read", args: { file_path: call.args.file_path, offset: window.offset, limit: window.limit } },
+    { syntheticId: editId, tool: call.tool, args: call.args },
+  );
+  session.codeRecoveries = (session.codeRecoveries || 0) + 1;
+  totalCodeRecoveries++;
+  if (session.turnMetrics) session.turnMetrics.codeRecoveries = (session.turnMetrics.codeRecoveries || 0) + 1;
+  process.stderr.write(`${LOG_PREFIX} auto-recovering stale-read ${call.tool} on ${call.args.file_path} (round ${round}) key=${session.key.slice(0, 8)}\n`);
+}
+
+// Reactive fallback when a single Read comes back with the client's 25k-token
+// refusal (explicit big limit, or the file grew past the dispatch-time plan):
+// convert the call into a multi-part chunked Read and queue the chunks as a
+// recovery round.
+function queueChunkedReadRecovery(session, run, wave, callIdx, plan) {
+  const call = wave.calls[callIdx];
+  const round = (call.recoveryRounds = (call.recoveryRounds || 0) + 1);
+  const parts = plan.chunks.map((c, k) => ({
+    syntheticId: syntheticIdFor(run.codeId, wave.waveNum, `${callIdx}r${round}c${k}`),
+    args: { ...call.args, offset: c.offset, limit: c.limit },
+  }));
+  call.parts = parts;
+  call.partResults = new Array(parts.length).fill(null);
+  call.stitch = { coversWholeFile: !!plan.coversWholeFile };
+  waveSlotFor(wave, parts[0].syntheticId); // force partIndex construction
+  for (let k = 0; k < parts.length; k++) {
+    wave.partIndex.set(parts[k].syntheticId, { callIdx, partIdx: k, kind: "call" });
+    wave.pending.add(parts[k].syntheticId);
+    session.syntheticToCode.set(parts[k].syntheticId, run.codeId);
+    (wave.recoveryParts ||= []).push({ syntheticId: parts[k].syntheticId, tool: call.tool, args: parts[k].args });
+  }
+  session.codeRecoveries = (session.codeRecoveries || 0) + 1;
+  totalCodeRecoveries++;
+  if (session.turnMetrics) session.turnMetrics.codeRecoveries = (session.turnMetrics.codeRecoveries || 0) + 1;
+  process.stderr.write(`${LOG_PREFIX} re-dispatching oversized Read of ${call.args.file_path} as ${parts.length} chunks key=${session.key.slice(0, 8)}\n`);
+}
+
+// Finalize a call slot: anchor-annotate Reads, reconcile confirmed anchored
+// edits, store the entry, and (for `complete` stitched reads) mark the anchor
+// snapshot full-file so minimization stays sound.
+function finalizeWaveEntry(session, wave, callIdx, entry, { complete } = {}) {
+  const call = wave.calls[callIdx];
+  if (session.anchorState && !entry.isError) {
+    if (ANCHORED_READ_TOOLS.has(call.tool) && call.args?.file_path) {
+      const { text: annotated, anchored } = annotateReadResult(
+        session.anchorState, call.args.file_path, entry.text, { complete },
+      );
+      if (anchored) entry.anchored = annotated;
+    }
+    if (call.anchorPlan) {
+      try { reconcileEdit(session.anchorState, call.anchorPlan); }
+      catch (e) { process.stderr.write(`${LOG_PREFIX} anchor reconcile failed for ${call.anchorPlan?.path}: ${String(e?.message || e).slice(0, 120)}\n`); }
+    }
+  }
+  // Successful edits to checkable files feed the post-edit auto-check backstop.
+  if (!entry.isError && CODE_CHECKED_EDIT_TOOLS.has(call.tool)
+      && typeof call.args?.file_path === "string" && checkerFor(call.args.file_path)) {
+    const run = session.codeRun;
+    if (run) (run.editedPaths ||= new Set()).add(call.args.file_path);
+  }
+  wave.results[callIdx] = entry;
+}
+
 async function resolveCodeModeToolResults(session, toolResults) {
   session.lastActivity = Date.now();
   const run = session.codeRun;
   for (const tr of toolResults) {
     const codeId = session.syntheticToCode.get(tr.tool_use_id);
-    if (codeId && run && run.codeId === codeId && run.currentWave) {
-      // Route into the current wave.
-      const wave = run.currentWave;
-      const result = toCallToolResult(tr);
-      for (let i = 0; i < wave.calls.length; i++) {
-        if (wave.calls[i].syntheticId === tr.tool_use_id) {
-          const text = result.content?.[0]?.text || "";
-          const entry = {
-            text,
-            raw: result,
-            isError: !!result.isError,
-          };
-          // Anchor editing: if this was a Read, cache the snapshot and expose an
-          // `.anchored` view (text with per-line anchor tokens) so the script can
-          // pass start_anchor/end_anchor to a later Edit. `.text` stays clean so
-          // scripts deriving old_string from raw bytes keep working unchanged.
-          // If this was a confirmed (non-error) anchored Edit, reconcile the
-          // snapshot so its anchors stay live for the next edit (Dirac-style),
-          // even within the same wave/script, without a re-Read.
-          if (session.anchorState && !result.isError) {
-            const call = wave.calls[i];
-            if (call && ANCHORED_READ_TOOLS.has(call.tool) && call.args?.file_path) {
-              const { text: annotated, anchored } = annotateReadResult(session.anchorState, call.args.file_path, text);
-              if (anchored) entry.anchored = annotated;
-            }
-            if (call && call.anchorPlan) {
-              try { reconcileEdit(session.anchorState, call.anchorPlan); }
-              catch (e) { process.stderr.write(`${LOG_PREFIX} anchor reconcile failed for ${call.anchorPlan?.path}: ${String(e?.message || e).slice(0, 120)}\n`); }
-            }
-          }
-          wave.results[i] = entry;
-          wave.pending.delete(tr.tool_use_id);
-          session.syntheticToCode.delete(tr.tool_use_id);
-          break;
-        }
-      }
-    } else {
+    if (!(codeId && run && run.codeId === codeId && run.currentWave)) {
       process.stderr.write(`${LOG_PREFIX} ignoring unmatched code-mode tool_result id=${tr.tool_use_id}\n`);
+      continue;
     }
+    const wave = run.currentWave;
+    const slot = waveSlotFor(wave, tr.tool_use_id);
+    if (!slot) {
+      process.stderr.write(`${LOG_PREFIX} ignoring unindexed code-mode tool_result id=${tr.tool_use_id}\n`);
+      continue;
+    }
+    wave.pending.delete(tr.tool_use_id);
+    session.syntheticToCode.delete(tr.tool_use_id);
+    const call = wave.calls[slot.callIdx];
+    const result = toCallToolResult(tr);
+    const text = result.content?.[0]?.text || "";
+    const isError = !!result.isError;
+
+    // Recovery-read result: consumed and discarded. NEVER fed to the anchor
+    // cache — a small freshness window must not overwrite a full snapshot —
+    // and even an error is ignored: the paired edit-retry (already emitted in
+    // the same fabricated message) is authoritative.
+    if (slot.kind === "recovery-read") continue;
+
+    // Edit-retry result: on success the original slot resolves as a success
+    // with an in-band recovery note; on a repeat freshness failure we
+    // re-verify (the content may have changed BETWEEN rounds) and either loop
+    // within the budget or surface the truth.
+    if (slot.kind === "edit-retry") {
+      if (!isError) {
+        call.recovered = true;
+        finalizeWaveEntry(session, wave, slot.callIdx, {
+          text: `${text}\n\n${NOTE_RECOVERED}`,
+          raw: result,
+          isError: false,
+        });
+        continue;
+      }
+      const cls = classifyToolFailure(call.tool, text);
+      if (cls && (cls.kind === "stale-read" || cls.kind === "not-read")
+          && call.recoveryRounds < EDIT_RECOVERY_MAX_ROUNDS && !editRecoveryDisabled()) {
+        const verified = verifyEditsOnDisk({ filePath: call.args.file_path, cwd: session.cwd, edits: editsOf(call) });
+        if (verified.ok) {
+          queueEditRecovery(session, run, wave, slot.callIdx, verified);
+          continue;
+        }
+        finalizeWaveEntry(session, wave, slot.callIdx, {
+          text: `${text}\n\n[proxy verified on disk: ${verified.reason} — the file content actually changed; Read the region again (a windowed Read with offset/limit is enough for large files) before re-editing]`,
+          raw: result,
+          isError: true,
+        });
+        continue;
+      }
+      finalizeWaveEntry(session, wave, slot.callIdx, {
+        text: cls ? `${text}\n\n${NOTE_FRESHNESS_HINT}` : text,
+        raw: result,
+        isError: true,
+      });
+      continue;
+    }
+
+    // Multi-part chunked Read: park the part, assemble when the set completes.
+    if (call.parts) {
+      call.partResults[slot.partIdx] = { text, isError };
+      if (!call.partResults.every((r) => r !== null)) continue;
+      const failed = call.partResults.findIndex((r) => r.isError);
+      if (failed >= 0) {
+        finalizeWaveEntry(session, wave, slot.callIdx, {
+          text: `chunked read failed at offset ${call.parts[failed].args.offset}: ${call.partResults[failed].text}`,
+          raw: null,
+          isError: true,
+        });
+      } else {
+        const { text: stitched } = stitchReadResults(call.partResults.map((r) => r.text));
+        finalizeWaveEntry(session, wave, slot.callIdx, {
+          text: stitched,
+          raw: null,
+          isError: false,
+        }, { complete: call.stitch?.coversWholeFile === true ? true : undefined });
+      }
+      continue;
+    }
+
+    // Single-part failures the daemon can absorb.
+    if (isError) {
+      const cls = classifyToolFailure(call.tool, text);
+      if (cls?.kind === "read-too-large") {
+        const plan = planChunkedRead({
+          filePath: call.args.file_path,
+          cwd: session.cwd,
+          offset: call.args.offset,
+          limit: call.args.limit,
+        });
+        if (plan?.chunks?.length && (call.recoveryRounds || 0) < EDIT_RECOVERY_MAX_ROUNDS) {
+          queueChunkedReadRecovery(session, run, wave, slot.callIdx, plan);
+          continue;
+        }
+        finalizeWaveEntry(session, wave, slot.callIdx, {
+          text: `${text}\n\n${NOTE_FRESHNESS_HINT}`,
+          raw: result,
+          isError: true,
+        });
+        continue;
+      }
+      if (cls && (cls.kind === "stale-read" || cls.kind === "not-read")) {
+        // Write has nothing to verify against (no old_string): retrying would
+        // silently clobber whatever changed, so it only gets the hint.
+        const recoverable = (call.tool === "Edit" || call.tool === "MultiEdit")
+          && !editRecoveryDisabled()
+          && (call.recoveryRounds || 0) < EDIT_RECOVERY_MAX_ROUNDS;
+        if (recoverable) {
+          const verified = verifyEditsOnDisk({ filePath: call.args.file_path, cwd: session.cwd, edits: editsOf(call) });
+          if (verified.ok) {
+            queueEditRecovery(session, run, wave, slot.callIdx, verified);
+            continue;
+          }
+          finalizeWaveEntry(session, wave, slot.callIdx, {
+            text: `${text}\n\n[proxy verified on disk: ${verified.reason} — the file content actually changed; Read the region again (a windowed Read with offset/limit is enough for large files) before re-editing]`,
+            raw: result,
+            isError: true,
+          });
+          continue;
+        }
+        finalizeWaveEntry(session, wave, slot.callIdx, {
+          text: `${text}\n\n${NOTE_FRESHNESS_HINT}`,
+          raw: result,
+          isError: true,
+        });
+        continue;
+      }
+    }
+
+    // Normal single-part result (the pre-existing path).
+    finalizeWaveEntry(session, wave, slot.callIdx, { text, raw: result, isError });
+  }
+
+  // Queued recovery tool_uses ride out on the freshly attached turn as one
+  // fabricated message — before the completion check, which cannot fire while
+  // their pending ids are outstanding.
+  if (run?.currentWave?.recoveryParts?.length) {
+    fabricateRecoveryTurn(session);
   }
 
   // If the current wave is complete, resolve it and try to dispatch the next.
@@ -2152,7 +2557,7 @@ async function resolveCodeModeToolResults(session, toolResults) {
     for (let i = 0; i < wave.calls.length; i++) {
       const v = wave.calls[i];
       if (v.syntheticId === null) continue; // inline errors/recalls are not completed client work
-      (run.ledger ||= []).push(ledgerEntry(v.tool, v.args, !!results[i]?.isError));
+      (run.ledger ||= []).push(ledgerEntry(v.tool, v.args, !!results[i]?.isError, v.recovered ? "auto-recovered stale read" : undefined));
     }
 
     // Update sub-call metrics.
@@ -2399,7 +2804,7 @@ async function handleMessages(req, res) {
     action, startedAt: Date.now(), firstEventAt: null, textDeltas: 0,
     usage: { input: 0, read: 0, create5m: 0, create1h: 0, output: 0 },
     messages: 0, _curMsgOutput: 0, codeSubCalls: 0, codeWaves: 0, scriptOutBytes: 0,
-    scriptInBytes: 0, spills: 0, stateBytes: 0, codeErrors: 0, coldReason,
+    scriptInBytes: 0, spills: 0, stateBytes: 0, codeErrors: 0, codeRecoveries: 0, coldReason,
   };
   const turnPromise = new Promise((resolve, reject) => {
     session.currentTurn = { resolve, reject };
@@ -2716,6 +3121,8 @@ export {
   registerClientTool,
   mergeLateTool,
   appendPendingToolNotice,
+  appendCodeResultNote,
+  stateByteSize,
   hasActiveToolRound,
   pushColdStartFrames,
   noteStreamTiming,

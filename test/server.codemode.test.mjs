@@ -1378,3 +1378,113 @@ test("appendPendingToolNotice announces once then clears the queue", () => {
   assert.equal(again.content[0].text, "next");
 });
 
+
+// ---------------------------------------------------------------------------
+// Worker runtime surface: verify/list, search scoring, new globals, errors
+// ---------------------------------------------------------------------------
+
+test("runCodeScriptDynamic: codemode.list enumerates the full catalog (beyond search caps)", async () => {
+  const docs = Array.from({ length: 30 }, (_, i) => ({
+    name: `Tool${i}`, path: `tools.Tool${i}`, summary: `summary ${i}`, docs: `### Tool${i}`,
+  }));
+  const r = await runCodeScriptDynamic(
+    "return { count: codemode.list().length, first: codemode.list()[0].name };",
+    { toolNames: docs.map((d) => d.name), toolDocs: docs, dispatchWave: async () => [], timeoutMs: 5000 },
+  );
+  assert.equal(r.value.count, 30);
+  assert.equal(r.value.first, "Tool0");
+});
+
+test("runCodeScriptDynamic: search ranks exact name hits first and returns up to 20", async () => {
+  const docs = [
+    { name: "Read", path: "tools.Read", summary: "read a file", docs: "### Read" },
+    ...Array.from({ length: 25 }, (_, i) => ({
+      name: `Other${i}`, path: `tools.Other${i}`, summary: "can read things", docs: "### mentions read in docs",
+    })),
+  ];
+  const r = await runCodeScriptDynamic(
+    'const hits = codemode.search("read"); return { count: hits.length, top: hits[0].name };',
+    { toolNames: docs.map((d) => d.name), toolDocs: docs, dispatchWave: async () => [], timeoutMs: 5000 },
+  );
+  assert.equal(r.value.top, "Read", "exact name outranks docs mentions");
+  assert.equal(r.value.count, 20);
+});
+
+test("runCodeScriptDynamic: codemode.verify dispatches a __verify call", async () => {
+  const waves = [];
+  const r = await runCodeScriptDynamic(
+    'const v = await codemode.verify("src/x.mjs"); return { ok: !v.isError, text: v.text };',
+    {
+      toolNames: [],
+      dispatchWave: async (_wave, calls) => {
+        waves.push(calls);
+        return [{ text: "OK node: src/x.mjs", raw: null, isError: false }];
+      },
+      timeoutMs: 5000,
+    },
+  );
+  assert.deepEqual(waves[0], [{ name: "__verify", args: { path: "src/x.mjs" } }]);
+  assert.equal(r.value.ok, true);
+});
+
+test("runCodeScriptDynamic: new safe globals are usable", async () => {
+  const r = await runCodeScriptDynamic(
+    `
+      const clone = structuredClone({ a: [1, 2] });
+      clone.a.push(3);
+      const u = new URL("https://x.dev/p?q=1");
+      const b64 = btoa("hi");
+      const round = atob(b64);
+      let micro = false;
+      queueMicrotask(() => { micro = true; });
+      await Promise.resolve();
+      const uuid = crypto.randomUUID();
+      const hash = crypto.sha256("abc");
+      console.info("info works");
+      console.debug("debug works");
+      return { a: clone.a, host: u.host, q: u.searchParams.get("q"), b64, round, micro, uuidOk: /^[0-9a-f-]{36}$/.test(uuid), hash };
+    `,
+    { toolNames: [], dispatchWave: async () => [], timeoutMs: 5000 },
+  );
+  assert.deepEqual(r.value.a, [1, 2, 3]);
+  assert.equal(r.value.host, "x.dev");
+  assert.equal(r.value.q, "1");
+  assert.equal(r.value.round, "hi");
+  assert.equal(r.value.micro, true);
+  assert.equal(r.value.uuidOk, true);
+  assert.equal(r.value.hash, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+  assert.deepEqual(r.logs, ["info works", "debug works"]);
+});
+
+test("runCodeScriptDynamic: denied globals still throw", async () => {
+  const r = await runCodeScriptDynamic(
+    "try { fetch('https://x'); } catch (e) { return e.message; }",
+    { toolNames: [], dispatchWave: async () => [], timeoutMs: 5000 },
+  );
+  assert.match(r.value, /denied in code mode scripts/);
+});
+
+test("runCodeScriptDynamic: runtime error reports up to 3 script-owned frames", async () => {
+  const r = await runCodeScriptDynamic(
+    `
+      function inner() { throw new Error("boom"); }
+      function outer() { inner(); }
+      outer();
+    `,
+    { toolNames: [], dispatchWave: async () => [], timeoutMs: 5000 },
+  );
+  assert.ok(r.error, "script should error");
+  assert.match(r.error, /boom \(at /);
+  assert.match(r.error, /<-/, "multiple frames joined");
+  const frames = r.error.split("<-").length;
+  assert.ok(frames >= 2 && frames <= 3, `expected 2-3 frames, got ${frames}`);
+});
+
+test("runCodeScriptDynamic: SyntaxError carries a line number", async () => {
+  const r = await runCodeScriptDynamic(
+    "const ok = 1;\nconst x = ;\nreturn ok;",
+    { toolNames: [], dispatchWave: async () => [], timeoutMs: 5000 },
+  );
+  assert.ok(r.error, "script should error");
+  assert.match(r.error, /line 2/);
+});

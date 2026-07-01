@@ -89,7 +89,17 @@ function normPath(p) {
 // (gutter-stripped) bytes. Returns { text, anchored }. On any shape we don't
 // recognize (no gutter), returns the original text with anchored:false so the
 // caller passes it through untouched.
-export function annotateReadResult(state, filePath, text) {
+//
+// `complete` (tri-state): the caller may assert the text covers the whole file
+// (true — e.g. a server-stitched chunked read) or definitely does not (false).
+// When unset, the heuristic treats a from-line-1 read of >= 2000 lines as
+// truncated: Claude Code's default Read stops at 2000 lines with NO error
+// marker, so a 2761-line file would otherwise be cached as a complete snapshot
+// and minimizeEdit's uniqueness minimization could emit old_strings that are
+// ambiguous against the real disk bytes. A genuinely-2000-line file gets
+// misflagged partial — safely conservative (minimization is skipped and the
+// full-span old_string is always correct).
+export function annotateReadResult(state, filePath, text, { complete } = {}) {
   const path = normPath(filePath);
   if (!path || typeof text !== "string" || !text) return { text, anchored: false };
 
@@ -124,7 +134,9 @@ export function annotateReadResult(state, filePath, text) {
     lines,
     anchors,
     startLine,
-    partial: startLine !== 1,
+    partial: complete === true ? false
+      : complete === false ? true
+      : (startLine !== 1 || lines.length >= 2000),
     lineByCore,
     fullText: lines.join("\n"),
   });
@@ -469,6 +481,9 @@ export function patchCodeEditDescription(toolName, original = "") {
     "can make several edits to the same file in sequence (await them one after " +
     "another) using anchors from the original Read \u2014 no re-Read needed. The " +
     "native old_string/new_string form still works unchanged if you prefer to " +
-    "copy bytes from r.text. Use one form or the other per edit, not both.";
+    "copy bytes from r.text. Use one form or the other per edit, not both. " +
+    "Anchors are the most reliable way to edit large files. Stale-read " +
+    "failures are auto-recovered by the proxy; an edit error you still see " +
+    "means the file content really changed.";
   return `${note}\n\n${original}`.trim();
 }
