@@ -21,7 +21,7 @@ import { dirname, join } from "node:path";
 import { homedir, platform } from "node:os";
 import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync } from "node:fs";
 
-import { setupAuth, resolveProfileDir, readProfileAccount, expandHome } from "../src/auth.mjs";
+import { setupAuth, resolveProfileDir, readProfileAccount, expandHome, preflightProfileDir } from "../src/auth.mjs";
 import { startServer } from "../src/server.mjs";
 import { loadProfilesConfig, defaultConfigPath } from "../src/config.mjs";
 import { startAutoUpdateLoop, defaultStatePath } from "../src/self-update.mjs";
@@ -73,6 +73,20 @@ function cmdRun(args) {
       (auth.account?.email ? ` account=${auth.account.email}` : "") +
       "\n"
   );
+  for (const r of auth.preflight.repaired) {
+    process.stderr.write(`claude-agent-api: profile preflight: repaired ${r.entry} (${r.reason}) -> ${r.target}\n`);
+  }
+  if (auth.preflight.warnings.length) {
+    process.stderr.write(
+      `claude-agent-api: profile preflight: ${auth.preflight.warnings.length} dangling symlink(s) not auto-repaired (run doctor for details)\n`
+    );
+  }
+  if (!auth.preflight.ok) {
+    die(
+      `profile dir ${auth.configDir} is unusable:\n` +
+        auth.preflight.errors.map((e) => `  ${e.entry}: ${e.reason}`).join("\n")
+    );
+  }
   startServer({
     port, host, account: auth.account, profileDir: auth.configDir, version: PKG.version,
     cacheLog: args["cache-log"] ?? process.env.CACHE_LOG,
@@ -195,10 +209,30 @@ async function cmdDoctor(args) {
     const free = await portFree(p.port, p.host);
     if (!loggedIn) problems++;
     if (!free) problems++;
+
+    const pre = preflightProfileDir(p.configDir, { repair: !!args.fix });
+    problems += pre.errors.length;
+    let dirLine;
+    if (pre.repaired.length) {
+      dirLine = `profile dir: ${pre.repaired.length} REPAIRED (${pre.repaired.map((r) => r.entry).join(", ")})`;
+    } else if (pre.errors.length) {
+      dirLine =
+        `profile dir: ${pre.errors.length} BROKEN entr(ies):\n` +
+        pre.errors.map((e) => `          ${e.entry}: ${e.reason}`).join("\n") +
+        `\n          fix: rerun doctor with --fix`;
+    } else {
+      dirLine = "profile dir: OK";
+    }
+    if (pre.warnings.length) {
+      const names = pre.warnings.slice(0, 6).map((w) => w.entry).join(", ");
+      dirLine += `\n      profile dir: ${pre.warnings.length} other dangling symlink(s) (${names}${pre.warnings.length > 6 ? ", ..." : ""})`;
+    }
+
     process.stdout.write(
       `  ${p.name.padEnd(16)} configDir=${p.configDir}\n` +
         `      login: ${loggedIn ? `OK (${acct.email})` : "NOT CONFIRMED (no oauthAccount in .claude.json)"}\n` +
-        `      port ${p.port}: ${free ? "free" : "IN USE"}\n`
+        `      port ${p.port}: ${free ? "free" : "IN USE"}\n` +
+        `      ${dirLine}\n`
     );
   }
   if (problems) die(`${problems} problem(s) found`, 1);
@@ -299,7 +333,7 @@ function usage() {
       `  claude-agent-api uninstall [--config profiles.json]\n` +
       `  claude-agent-api list      [--config profiles.json]\n` +
       `  claude-agent-api status    [--config profiles.json]\n` +
-      `  claude-agent-api doctor    [--config profiles.json | --profile <dir> --port <n>]\n`
+      `  claude-agent-api doctor    [--config profiles.json | --profile <dir> --port <n>] [--fix]\n`
   );
 }
 

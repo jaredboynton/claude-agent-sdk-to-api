@@ -128,3 +128,19 @@ Applying the reduction bands to the cache buckets, with a batchability haircut (
 - Normal-mode baseline: scan `~/.claude-/projects/**/*.jsonl`, **group assistant events by `message.id`** (dedupe usage, but union split `tool_use` blocks per response), and read `tool_result` body sizes from user events.
 - Code-mode receipts (implemented): run with `--cache-log` (or `CACHE_LOG=1`) to append per-turn `read`/`create`(5m/1h)/`input`/`output` rows plus `codeSubCalls`/`codeWaves`/`scriptOutBytes` to `<profileDir>/cache-log.jsonl`, keyed by `conv`. `p_c = Σ codeSubCalls / Σ codeWaves`; `c = Σ scriptOutBytes/4 / (Σ codeSubCalls · ρ)`.
 - Org bill: scale the per-$1M table in §5 to your own annual agentic spend.
+
+---
+
+## 8. Shipped levers (2026-07-01)
+
+The write-dominated shape in §6 drove a batch of changes targeting the remaining cost drivers. All `code` tool-description text changes shipped together in one release (a description edit invalidates the cached tools block exactly once).
+
+- **Truncate-and-spill output cap** — `CODE_SCRIPT_MAX_OUTPUT_BYTES` now defaults to 16 KB. Over-cap returns are truncated head+tail (never errored — the old error-and-discard forced a full redo round-trip) and the full text is stored as a session artifact fetchable via `codemode.recall(id)` (resolved inline by the bridge: zero client turns, zero transcript bytes). Console output is capped per-line (2 KB) and per-run (8 KB). Attacks the heavy tail in `ρ`/`c` directly.
+- **Persistent `state` global** — scripts carry a `state` object across `code` calls in one conversation (2 MB cap, survives script errors, dies with the session). Follow-up scripts read `state.index` instead of re-reading files: fewer client tool executions, shorter scripts (`scriptInBytes` is transcript, written at 2×), smaller returns.
+- **Structured script errors** — a failing script now returns the error with the failing line (`code-mode-script.vm:N`), a completed-call ledger (`ok Read(...)` / `ERR Edit(...)`), and capped console, so the model continues instead of redoing completed waves.
+- **Deterministic tool ordering** — the `code` description sorts tool blocks by name, so clients that vary tool order still share the cross-conversation prefix.
+- **Wider SDK resume** — resume-index TTL 30 min → 24 h (resume validity is transcript-based, not cache-based; even past the 1h cache TTL a resume beats re-priming), 64 → 256 entries, and code-mode conversations now use mimicry-safe `resume-catchup` for small non-tool_result tails (tool_result tails stay hard-excluded — synthetic ids are unroutable after resume).
+- **`sleep(ms)` + `codemode.retry()`** — the sandbox previously denied `setTimeout`, so model-written backoff loops threw; retry loops are a proven script shape in the harness corpus.
+- **Telemetry for receipts** — per-turn rows now add `scriptInBytes`, `spills`, `stateBytes`, `codeErrors`, and `coldReason` (`resume-rejected(prefix-mismatch)`, `cwd-mismatch(...)`, ...), so the next re-run of §7 can attribute write reductions to each lever and quantify cache-cold causes.
+
+Re-run the §7 analysis after ~2 weeks of cache-log under these changes; expected movement: `scriptOutBytes` p90 down (cap), repeat-Read rate down (`state`), post-error redo rate down (ledger), and `action` distribution shifting cold → resume/resume-catchup.

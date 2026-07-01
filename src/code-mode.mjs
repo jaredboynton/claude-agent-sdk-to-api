@@ -23,7 +23,16 @@ import { dirname, join } from "node:path";
 const DEFAULT_SCRIPT_TIMEOUT_MS = Number(process.env.CODE_SCRIPT_TIMEOUT_MS || 0);
 const DEFAULT_MAX_WAVES = Number(process.env.CODE_MAX_WAVES || 0);
 const DEFAULT_MAX_CALLS = Number(process.env.CODE_MAX_CALLS || 0);
-const DEFAULT_SCRIPT_OUTPUT_MAX_BYTES = Number(process.env.CODE_SCRIPT_MAX_OUTPUT_BYTES || 0); // 0 = no cap
+// Output IS transcript: every byte returned is cache-written at 2x once and
+// re-read on every later turn, so oversized returns get truncated head+tail
+// (never errored — the run's work is preserved) with the full text spilled to a
+// session artifact reachable via codemode.recall(). 0 = no cap.
+const DEFAULT_SCRIPT_OUTPUT_MAX_BYTES = Number(process.env.CODE_SCRIPT_MAX_OUTPUT_BYTES ?? 16384);
+const TRUNCATE_HEAD_BYTES = 6144;
+const TRUNCATE_TAIL_BYTES = 2048;
+const CONSOLE_LINE_MAX = 2048;
+const CONSOLE_TOTAL_MAX = 8192;
+const LEDGER_MAX_ENTRIES = 30;
 
 const WORKER_PATH = join(dirname(fileURLToPath(import.meta.url)), "code-mode-worker.mjs");
 
@@ -183,8 +192,16 @@ function toolAccessPath(name) {
   return JS_IDENT_RE.test(name) ? `tools.${name}` : `tools[${jsonLiteral(name)}]`;
 }
 
-export function buildCodeToolCatalog(clientTools) {
+// Byte-stable ordering: the rendered description is part of the cached tools
+// block, so a client that varies tool order must not churn it across
+// conversations. Plain < compare (not localeCompare) for cross-machine stability.
+function sortedToolEntries(clientTools) {
   const entries = [...(clientTools instanceof Map ? clientTools.entries() : Object.entries(clientTools || {}))];
+  return entries.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+}
+
+export function buildCodeToolCatalog(clientTools) {
+  const entries = sortedToolEntries(clientTools);
   return entries.map(([name, meta]) => {
     const normalized = normalizeClientToolMeta(name, meta);
     const docs = describeClientTool(name, normalized);
@@ -200,16 +217,17 @@ export function buildCodeToolCatalog(clientTools) {
 
 /** Build dynamic description for the single `code` MCP tool. */
 export function buildCodeToolDescription(clientTools) {
-  const entries = [...(clientTools instanceof Map ? clientTools.entries() : Object.entries(clientTools || {}))];
+  const entries = sortedToolEntries(clientTools);
   const toolBlocks = entries.map(([name, meta]) => describeClientTool(name, meta));
   return (
     "Run a full async JavaScript program that calls the client's tools and returns a summary. "
     + "Favor intelligent logic, batching, and parallelism: every independent tool call should run in one `Promise.all` or `codemode.batch` wave. Push branching, loops, retries, and aggregation into this script instead of returning to the model between dependent steps. There is no time, wave, or call limit by default. "
     + "All client tools are available only through this script runtime; do not expect original tools outside `code`. "
-    + "Runtime API: `await tools.<Name>(args)`, `await tools[\"Any-Name\"](args)`, `await callTool(name, args)`, or `await codemode.call(name, args)`. `codemode.batch([['Tool', args], ...])` starts independent calls together. `codemode.search(query)` finds matching tool docs, and `codemode.describe(nameOrPath)` returns focused TypeScript-shaped docs for one tool. "
+    + "Runtime API: `await tools.<Name>(args)`, `await tools[\"Any-Name\"](args)`, `await callTool(name, args)`, or `await codemode.call(name, args)`. `codemode.batch([['Tool', args], ...])` starts independent calls together. `codemode.search(query)` finds matching tool docs, and `codemode.describe(nameOrPath)` returns focused TypeScript-shaped docs for one tool. `await sleep(ms)` pauses (30s cap per call); `await codemode.retry(fn, { attempts, delayMs })` retries a failing async thunk with linear backoff. "
     + "Each tool call returns a string-like `ToolResult` with `{ text, raw, isError }`, optional `.anchored`, `.json()` for JSON text, and `.lines({ trim, nonEmpty })` for line processing. Prefer `.text` for clarity, but string methods like `.includes()` and `.split()` work directly on the result. "
+    + "`state` is a persistent object that survives across `code` calls in this conversation (it may be empty after long gaps or restarts): stash parsed files, indexes, and intermediate results there instead of returning them or re-reading files in the next call. "
     + "Only batch independent calls. If B's args depend on A's result, or the calls have ordered side effects, use separate awaits. For edits, read first; use exact bytes from the read result or start_anchor/end_anchor from `.anchored` when available, and never parallelize multiple edits to the same file. "
-    + "Return a compact decision-ready object: status, counts, paths with line numbers, first failing assertion or error tail, and exact snippets needed for the next step. Keep raw reads, full diffs, test logs, and large arrays inside local variables. "
+    + "Return a compact decision-ready object: status, counts, paths with line numbers, first failing assertion or error tail, and exact snippets needed for the next step. Keep raw reads, full diffs, test logs, and large arrays inside local variables or `state`. Oversized returns are truncated head+tail; the full text is kept as a session artifact you can fetch with `await codemode.recall(id)` in a later `code` call. "
     + "The signatures below are TypeScript-shaped docs only; write executable JavaScript, not TypeScript syntax. Args must match the signature: ? means optional, literal unions list allowed values, and Array<T> is an array. Schema descriptions, defaults, examples, formats, and patterns are authoritative.\n\n"
     + (toolBlocks.length ? `Available tools:\n\n${toolBlocks.join("\n\n")}` : "Available tools: (none)")
   );
@@ -227,21 +245,97 @@ export function validateCodeInput(input) {
   return { script };
 }
 
-/** Convert script return value (+ optional captured logs) to MCP CallToolResult text. */
-export function formatCodeResult(value, logs = [], { maxBytes = DEFAULT_SCRIPT_OUTPUT_MAX_BYTES } = {}) {
-  let text;
-  if (value === undefined || value === null) text = "";
-  else if (typeof value === "string") text = value;
-  else text = JSON.stringify(value, null, 2);
-  const logText = (logs || []).filter(Boolean).join("\n");
-  if (logText) text = text ? `${text}\n\n[console]\n${logText}` : `[console]\n${logText}`;
+// Cap console output for the transcript-bound text; the uncapped original
+// still reaches the spill artifact.
+function capConsole(rawLog) {
+  if (!rawLog) return { text: "", truncated: false };
+  let truncated = false;
+  let lines = rawLog.split("\n").map((line) => {
+    if (line.length <= CONSOLE_LINE_MAX) return line;
+    truncated = true;
+    return `${line.slice(0, CONSOLE_LINE_MAX)} ...[line truncated]`;
+  });
+  let text = lines.join("\n");
+  if (text.length > CONSOLE_TOTAL_MAX) {
+    truncated = true;
+    text = `${text.slice(0, CONSOLE_TOTAL_MAX)}\n...[console truncated]`;
+  }
+  return { text, truncated };
+}
+
+function stringifyReturnValue(value) {
+  if (value === undefined || value === null) return "";
+  if (typeof value === "string") return value;
+  return JSON.stringify(value, null, 2);
+}
+
+/**
+ * Convert script return value (+ optional captured logs) to MCP CallToolResult
+ * text. Oversized output is truncated head+tail — never errored, so the run's
+ * work is preserved. When `onSpill` is provided it receives the full
+ * untruncated text and must return an artifact id, which the truncation notice
+ * points at (`codemode.recall(id)`).
+ */
+export function formatCodeResult(value, logs = [], { maxBytes = DEFAULT_SCRIPT_OUTPUT_MAX_BYTES, onSpill } = {}) {
+  const body = stringifyReturnValue(value);
+  const rawLog = (logs || []).filter(Boolean).join("\n");
+  const full = rawLog ? (body ? `${body}\n\n[console]\n${rawLog}` : `[console]\n${rawLog}`) : body;
+
+  const capped = capConsole(rawLog);
+  let text = capped.text ? (body ? `${body}\n\n[console]\n${capped.text}` : `[console]\n${capped.text}`) : body;
+  let truncated = capped.truncated;
+
   if (maxBytes > 0 && Buffer.byteLength(text, "utf8") > maxBytes) {
-    return {
-      content: [{ type: "text", text: `code script output exceeded ${maxBytes} bytes; return a smaller summary instead of raw tool output` }],
-      isError: true,
-    };
+    truncated = true;
+    const totalBytes = Buffer.byteLength(text, "utf8");
+    const head = text.slice(0, TRUNCATE_HEAD_BYTES);
+    const tail = text.slice(-TRUNCATE_TAIL_BYTES);
+    text = `${head}\n...[${totalBytes} bytes total; middle omitted]...\n${tail}`;
+  }
+
+  if (truncated) {
+    let note = "[output truncated";
+    if (onSpill) {
+      try {
+        const id = onSpill(full);
+        if (id) note += `; full text stored as artifact ${JSON.stringify(String(id))} — use await codemode.recall(${JSON.stringify(String(id))}) in a later code call`;
+      } catch {}
+    }
+    note += "]";
+    text = `${text}\n\n${note}`;
   }
   return { content: [{ type: "text", text }] };
+}
+
+function argsPreviewText(args) {
+  let s;
+  try { s = JSON.stringify(args ?? {}); } catch { s = "{}"; }
+  return s.length > 80 ? `${s.slice(0, 77)}...` : s;
+}
+
+/** One compact ledger line per dispatched call: `ok Read({"file_path":...})`. */
+export function ledgerEntry(tool, args, isError) {
+  return { tool, ok: !isError, argsPreview: argsPreviewText(args) };
+}
+
+/**
+ * Structured script-error result: the error plus evidence of completed work so
+ * the model writes a follow-up script instead of redoing finished calls. A bare
+ * `code script error: <msg>` throws away N waves of client tool executions and
+ * forces a full redo round-trip (full-prefix cache read + new suffix write).
+ */
+export function formatCodeError(error, { ledger = [], logs = [], waves = 0, calls = 0 } = {}) {
+  const lines = [`code script error: ${error}`];
+  if (waves || calls) lines.push(`completed before failure: waves=${waves} calls=${calls}`);
+  if (ledger.length) {
+    lines.push("completed calls (do NOT repeat the successful ones — write a follow-up script that continues from here; `state` still holds anything you stashed):");
+    const shown = ledger.slice(0, LEDGER_MAX_ENTRIES);
+    for (const e of shown) lines.push(`  ${e.ok ? "ok " : "ERR"} ${e.tool}(${e.argsPreview})`);
+    if (ledger.length > shown.length) lines.push(`  (+${ledger.length - shown.length} more)`);
+  }
+  const capped = capConsole((logs || []).filter(Boolean).join("\n"));
+  if (capped.text) lines.push(`[console]\n${capped.text}`);
+  return { content: [{ type: "text", text: lines.join("\n") }], isError: true };
 }
 
 /**
@@ -251,8 +345,8 @@ export function formatCodeResult(value, logs = [], { maxBytes = DEFAULT_SCRIPT_O
  * which rejects the wave's calls).
  *
  * @param {string} script
- * @param {{ toolNames: string[], toolDocs?: Array<{name:string,path?:string,summary?:string,docs?:string}>, dispatchWave: Function, timeoutMs?: number, maxWaves?: number, maxCalls?: number, signal?: AbortSignal }} opts
- * @returns {Promise<{ value: *, logs: string[], waves: number, calls: number }>}
+ * @param {{ toolNames: string[], toolDocs?: Array<{name:string,path?:string,summary?:string,docs?:string}>, dispatchWave: Function, timeoutMs?: number, maxWaves?: number, maxCalls?: number, signal?: AbortSignal, state?: object }} opts
+ * @returns {Promise<{ value: *, logs: string[], waves: number, calls: number, state?: object }>}
  */
 export function runCodeScriptDynamic(script, {
   toolNames = [],
@@ -262,6 +356,7 @@ export function runCodeScriptDynamic(script, {
   maxWaves = DEFAULT_MAX_WAVES,
   maxCalls = DEFAULT_MAX_CALLS,
   signal,
+  state,
 } = {}) {
   return new Promise((resolve, reject) => {
     let worker;
@@ -327,6 +422,8 @@ export function runCodeScriptDynamic(script, {
         return;
       }
       if (msg.type === "done") {
+        // `state` comes back on success AND error paths: a script that threw
+        // after stashing progress must not lose that progress.
         if (msg.error) {
           finish({
             value: null,
@@ -334,6 +431,7 @@ export function runCodeScriptDynamic(script, {
             logs: msg.logs || [],
             waves: msg.waves || 0,
             calls: msg.calls || 0,
+            state: msg.state,
           });
         } else {
           finish({
@@ -341,6 +439,7 @@ export function runCodeScriptDynamic(script, {
             logs: msg.logs || [],
             waves: msg.waves || 0,
             calls: msg.calls || 0,
+            state: msg.state,
           });
         }
       }
@@ -392,6 +491,7 @@ export function runCodeScriptDynamic(script, {
         toolDocs,
         maxWaves,
         maxCalls,
+        state: state && typeof state === "object" ? state : {},
       });
     } catch (e) {
       fail(new Error(`failed to post run to worker: ${e?.message || e}`));

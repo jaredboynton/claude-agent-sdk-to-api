@@ -9,9 +9,12 @@ import { join } from "node:path";
 import { mkdirSync, readFileSync, writeFileSync, renameSync } from "node:fs";
 import { dirname } from "node:path";
 
-export const MAX_INDEX_ENTRIES = 64;
+export const MAX_INDEX_ENTRIES = 256;
 export const MAX_CATCHUP_TAIL = 6;
-export const INDEX_ENTRY_TTL_MS = 30 * 60 * 1000; // 30 min
+// Resume validity is transcript-based, not cache-based: even past the 1h
+// prompt-cache TTL, SDK resume beats narrative priming (native transcript, no
+// mimicry risk, no re-render write). 24h covers overnight gaps.
+export const INDEX_ENTRY_TTL_MS = 24 * 60 * 60 * 1000;
 
 export function profileKey(profileDir) {
   if (!profileDir) return "default";
@@ -65,6 +68,7 @@ function pruneEntries(entries, now = Date.now()) {
  * @param {boolean} [opts.codeMode]
  * @param {(messages: object[], n: number) => string} opts.hashMessages
  * @param {(system: string, messages: object[]) => string} opts.bucketKey
+ * @param {object} [opts.trace] - optional; receives `reason` when no candidate is returned (cache-cold telemetry)
  */
 export function findResumeCandidate({
   entries,
@@ -75,18 +79,28 @@ export function findResumeCandidate({
   lastIsToolResult,
   codeMode = false,
   hashMessages,
+  trace,
 }) {
   const now = Date.now();
-  const candidates = pruneEntries(entries || [], now)
+  const pruned = pruneEntries(entries || [], now);
+  const inBucket = pruned
     .filter((e) => e.profileKey === profileKey && e.bucket === bucket)
     .filter((e) => !e.model || e.model === model)
-    .filter((e) => !!e.codeMode === !!codeMode)
+    .filter((e) => !!e.codeMode === !!codeMode);
+  const candidates = inBucket
     .filter((e) => messages.length >= e.seenCount)
     .filter((e) => hashMessages(messages, e.seenCount) === e.seenHash)
     .sort((a, b) => b.seenCount - a.seenCount);
 
   const best = candidates[0];
-  if (!best?.sdkSessionId) return null;
+  if (!best?.sdkSessionId) {
+    if (trace) {
+      trace.reason = !pruned.length ? "empty-index"
+        : !inBucket.length ? "no-bucket-entry"
+        : "prefix-mismatch";
+    }
+    return null;
+  }
 
   // Drop synthesized `role: "system"` metadata (attachments / reminders /
   // recaps that Claude Code appends after the real payload) before classifying
@@ -94,26 +108,28 @@ export function findResumeCandidate({
   // `assistant + user` continuation into a multi-message catchup (or block a
   // `tool_result + system` tail from being recognized as a tool-loop tail).
   const tail = messages.slice(best.seenCount).filter((m) => m && m.role !== "system");
-  if (tail.length === 0) return null;
+  if (tail.length === 0) {
+    if (trace) trace.reason = "empty-tail";
+    return null;
+  }
 
-  // Code mode: ONLY clean user-turn resume is safe. A tool_result tail carries
-  // synthetic toolu_code_* ids that a freshly-resumed SDK session cannot route,
-  // and resume-catchup would re-render the tail as narrative (the very mimicry
-  // we are avoiding). Anything else falls through to cold + safe priming.
-  if (codeMode) {
-    if (lastIsToolResult) return null;
-    if (tail.length === 1 && tail[0]?.role === "user") {
-      return { mode: "resume", sdkSessionId: best.sdkSessionId, seenCount: best.seenCount, tail };
-    }
-    if (tail.length === 2 && tail[0]?.role === "assistant" && tail[1]?.role === "user") {
-      return { mode: "resume", sdkSessionId: best.sdkSessionId, seenCount: best.seenCount, tail };
-    }
+  // Code mode: a tool_result tail is a HARD exclusion — it carries synthetic
+  // toolu_code_* ids that a freshly-resumed SDK session cannot route, and
+  // resume-catchup would re-render them as narrative (the very mimicry we
+  // avoid). Non-tool_result tails are safe under the same rules as normal
+  // mode: clean single/pair tails resume directly, small multi-message tails
+  // go through the mimicry-safe catchup renderer (detector watches output).
+  if (codeMode && lastIsToolResult) {
+    if (trace) trace.reason = "code-tool-result-tail";
     return null;
   }
 
   // Evicted mid tool-loop: only resume if tail is small; caller handles frames.
   if (lastIsToolResult) {
-    if (tail.length > MAX_CATCHUP_TAIL) return null;
+    if (tail.length > MAX_CATCHUP_TAIL) {
+      if (trace) trace.reason = "tail-too-long";
+      return null;
+    }
     return { mode: "resume-catchup", sdkSessionId: best.sdkSessionId, seenCount: best.seenCount, tail };
   }
 
@@ -129,6 +145,7 @@ export function findResumeCandidate({
     return { mode: "resume-catchup", sdkSessionId: best.sdkSessionId, seenCount: best.seenCount, tail };
   }
 
+  if (trace) trace.reason = "tail-too-long";
   return null;
 }
 

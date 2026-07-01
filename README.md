@@ -138,16 +138,18 @@ Every `Read` result inside code mode also carries an `.anchored` view with stabl
 | `TOOL_TIMEOUT_MS` | `1800000` | Parked-tool watchdog; returns an error result so the loop survives |
 | `HEARTBEAT_MS` | `15000` | SSE keep-alive interval |
 | `CODE_SCRIPT_TIMEOUT_MS` | `0` (no cap) | Optional Worker wall-clock cap on a `code` script's own compute; `0` = unlimited |
-| `CODE_SCRIPT_MAX_OUTPUT_BYTES` | `0` (no cap) | Optional max bytes for a code script's return value before returning a "summarize smaller" error; `0` = unlimited |
+| `CODE_SCRIPT_MAX_OUTPUT_BYTES` | `16384` | Max bytes for a code script's return value (+console); over-cap output is truncated head+tail (never errored) with the full text spilled to a session artifact reachable via `codemode.recall(id)`; `0` = unlimited |
 | `CODE_MAX_WAVES` | `0` (unlimited) | Optional cap on tool-call waves per `code` run; `0` = unlimited |
 | `CODE_MAX_CALLS` | `0` (unlimited) | Optional cap on total tool calls per `code` run; `0` = unlimited |
+| `CODE_STATE_MAX_BYTES` | `2097152` | Cap on the persistent `state` object code scripts carry across calls in one conversation; over-cap keeps the previous state |
+| `CODE_ARTIFACT_BUDGET_BYTES` | `4194304` | Per-session byte budget for truncation-spill artifacts (`codemode.recall`); oldest evicted first |
 | `x-claude-cwd` | (header) | Per-request working directory baked into the SDK env block; must be an existing absolute dir |
 | `CLAUDE_PROXY_CWD` | `process.cwd()` | Daemon-wide working-directory fallback when no valid `x-claude-cwd` header is sent |
 | `CACHE_LOG` | (off) | `1`/`true` → append a per-turn usage row to `<profileDir>/cache-log.jsonl`; or set a path. Also `--cache-log [path]` on `run`, or `"cacheLog": true` per profile |
 
 ## Cache log (per-turn usage receipts)
 
-With `--cache-log` (or `CACHE_LOG=1`), the bridge appends one JSON line per completed HTTP turn capturing the turn's `read`/`create` (cache-read / cache-creation), `input`, and `output` tokens, plus `conv` (conversation id), `model`, `codeSubCalls`, `codeWaves`, and `scriptOutBytes`. Cache tokens come from the authoritative `message_start` usage and are summed across all upstream messages in the turn (including code-mode internal continuations). Group by `conv` and price with the Opus card to turn the [code-mode savings model](docs/code-mode-cache-savings.md) into measured receipts. The writer is opt-in, append-only (survives restarts), and never throws into the request path. `/healthz` reports the active `cacheLog` path.
+With `--cache-log` (or `CACHE_LOG=1`), the bridge appends one JSON line per completed HTTP turn capturing the turn's `read`/`create` (cache-read / cache-creation), `input`, and `output` tokens, plus `conv` (conversation id), `model`, `codeSubCalls`, `codeWaves`, `scriptOutBytes`, `scriptInBytes`, `spills` (truncation-spill artifacts stored), `stateBytes` (persistent `state` size), `codeErrors`, and — on cache-cold turns — `coldReason` (why SDK resume was not possible, e.g. `resume-rejected(prefix-mismatch)` or `cwd-mismatch(...)`). Cache tokens come from the authoritative `message_start` usage and are summed across all upstream messages in the turn (including code-mode internal continuations). Group by `conv` and price with the Opus card to turn the [code-mode savings model](docs/code-mode-cache-savings.md) into measured receipts. The writer is opt-in, append-only (survives restarts), and never throws into the request path. `/healthz` reports the active `cacheLog` path.
 
 ## Tests
 

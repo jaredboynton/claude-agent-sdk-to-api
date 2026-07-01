@@ -40,6 +40,7 @@ import { isDeepStrictEqual } from "node:util";
 import { statSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { query, createSdkMcpServer, z } from "./sdk.mjs";
+import { preflightProfileDir } from "./auth.mjs";
 import {
   profileKey,
   defaultIndexPath,
@@ -56,6 +57,8 @@ import {
   buildCodeToolDescription,
   buildCodeToolCatalog,
   formatCodeResult,
+  formatCodeError,
+  ledgerEntry,
   codeToolInputShape,
   normalizeClientToolMeta,
 } from "./code-mode.mjs";
@@ -86,6 +89,11 @@ const TOOL_TIMEOUT_MS = Number(process.env.TOOL_TIMEOUT_MS || process.env.ACP_TO
 const CODE_SCRIPT_TIMEOUT_MS = Number(process.env.CODE_SCRIPT_TIMEOUT_MS || 0); // 0 = no cap
 const CODE_MAX_WAVES = Number(process.env.CODE_MAX_WAVES || 0); // 0 = unlimited
 const CODE_MAX_CALLS = Number(process.env.CODE_MAX_CALLS || 0); // 0 = unlimited
+// Session-lifetime stores backing code mode's `state` global and truncation
+// spill artifacts (codemode.recall). Conversation memory, not tool-round state:
+// they survive clearAllCodeState/abandonToolRound and die with the session.
+const CODE_STATE_MAX_BYTES = Number(process.env.CODE_STATE_MAX_BYTES || 2 * 1024 * 1024);
+const CODE_ARTIFACT_BUDGET_BYTES = Number(process.env.CODE_ARTIFACT_BUDGET_BYTES || 4 * 1024 * 1024);
 const LOG_PREFIX = "[claude-agent-api]";
 
 // Per-request working directory.
@@ -927,6 +935,11 @@ function logTurnDone(session) {
       codeSubCalls: m.codeSubCalls,
       codeWaves: m.codeWaves,
       scriptOutBytes: m.scriptOutBytes,
+      scriptInBytes: m.scriptInBytes,
+      spills: m.spills,
+      stateBytes: m.stateBytes,
+      codeErrors: m.codeErrors,
+      ...(m.coldReason ? { coldReason: m.coldReason } : {}),
       ttftMs: ttft,
       durationMs: total,
     });
@@ -1154,6 +1167,24 @@ function hasActiveToolRound(session, { includeCurrentTurn = true } = {}) {
   );
 }
 
+// Store the full text of a truncated code result; oldest-first eviction keeps
+// the per-session store under CODE_ARTIFACT_BUDGET_BYTES (never evicts the
+// artifact just stored).
+function storeCodeArtifact(session, text) {
+  session.codeArtifacts = session.codeArtifacts || new Map();
+  const id = `a${++session.codeArtifactSeq}`;
+  session.codeArtifacts.set(id, { text: String(text ?? ""), ts: Date.now() });
+  let total = 0;
+  for (const v of session.codeArtifacts.values()) total += v.text.length;
+  for (const [k, v] of session.codeArtifacts) {
+    if (total <= CODE_ARTIFACT_BUDGET_BYTES || k === id) break;
+    total -= v.text.length;
+    session.codeArtifacts.delete(k);
+  }
+  if (session.turnMetrics) session.turnMetrics.spills += 1;
+  return id;
+}
+
 function syntheticIdFor(codeToolUseId, waveSeq, idx) {
   const short = String(codeToolUseId || "code").replace(/^toolu_/, "").slice(0, 8);
   return `toolu_code_${short}_w${waveSeq}_${idx}`;
@@ -1231,6 +1262,7 @@ function startCodeRun(session, codeToolUseId, input) {
     aborted: false,
     preamble: null,          // preserved text/thinking blocks from the SDK code message
     settled: false,
+    ledger: [],              // completed-call evidence for the structured error result
   };
   session.codeRun = run;
   session.codeDriving = true;
@@ -1239,6 +1271,7 @@ function startCodeRun(session, codeToolUseId, input) {
   const toolNames = [...session.clientTools.keys()];
   const toolDocs = buildCodeToolCatalog(session.clientTools);
   const t0 = Date.now();
+  if (session.turnMetrics) session.turnMetrics.scriptInBytes += Buffer.byteLength(script, "utf8");
 
   run.promise = runCodeScriptDynamic(script, {
     toolNames,
@@ -1247,6 +1280,7 @@ function startCodeRun(session, codeToolUseId, input) {
     maxCalls: CODE_MAX_CALLS,
     timeoutMs: CODE_SCRIPT_TIMEOUT_MS,
     signal: run.abortController.signal,
+    state: session.codeState,
     dispatchWave: (waveNum, calls) => dispatchCodeWave(session, codeToolUseId, waveNum, calls),
   });
 
@@ -1259,17 +1293,40 @@ function startCodeRun(session, codeToolUseId, input) {
     totalCodeWaves = (totalCodeWaves || 0) + waves;
     if (session.turnMetrics) session.turnMetrics.codeWaves += waves;
 
+    // Persist the script's `state` (success AND error: progress stashed before
+    // a throw must survive). Over-cap keeps the previous state — losing new
+    // progress beats silently dropping everything. Byte size via JSON is an
+    // approximation (Maps/Sets serialize as {}), fine for a guard rail.
+    if (result.state && typeof result.state === "object") {
+      try {
+        const bytes = Buffer.byteLength(JSON.stringify(result.state), "utf8");
+        if (bytes <= CODE_STATE_MAX_BYTES) {
+          session.codeState = result.state;
+          if (session.turnMetrics) session.turnMetrics.stateBytes = bytes;
+        } else {
+          process.stderr.write(`${LOG_PREFIX} code call ${codeToolUseId}: state over cap (${bytes} > ${CODE_STATE_MAX_BYTES} bytes); keeping previous state\n`);
+        }
+      } catch {}
+    }
+
     let collapsed;
     if (result.error) {
       session.codeErrors = (session.codeErrors || 0) + 1;
       totalCodeErrors++;
-      collapsed = {
-        content: [{ type: "text", text: `code script error: ${result.error}` }],
-        isError: true,
-      };
+      if (session.turnMetrics) session.turnMetrics.codeErrors += 1;
+      collapsed = formatCodeError(result.error, {
+        ledger: run.ledger,
+        logs: result.logs || [],
+        waves,
+        calls,
+      });
+      const scriptOut = collapsed.content?.[0]?.text?.length ?? 0;
+      if (session.turnMetrics) session.turnMetrics.scriptOutBytes += scriptOut;
       process.stderr.write(`${LOG_PREFIX} code call ${codeToolUseId}: failed (${result.error}) waves=${waves} calls=${calls}\n`);
     } else {
-      collapsed = formatCodeResult(result.value, result.logs || []);
+      collapsed = formatCodeResult(result.value, result.logs || [], {
+        onSpill: (full) => storeCodeArtifact(session, full),
+      });
       const scriptOut = collapsed.content?.[0]?.text?.length ?? 0;
       if (session.turnMetrics) session.turnMetrics.scriptOutBytes += scriptOut;
       process.stderr.write(
@@ -1286,12 +1343,10 @@ function startCodeRun(session, codeToolUseId, input) {
     run.settled = true;
     session.codeErrors = (session.codeErrors || 0) + 1;
     totalCodeErrors++;
+    if (session.turnMetrics) session.turnMetrics.codeErrors += 1;
     session.codeDriving = false;
     clearCodeRun(session, codeToolUseId);
-    internalResolveCode(session, codeToolUseId, {
-      content: [{ type: "text", text: `code script error: ${err?.message || err}` }],
-      isError: true,
-    });
+    internalResolveCode(session, codeToolUseId, formatCodeError(err?.message || String(err), { ledger: run.ledger }));
     process.stderr.write(`${LOG_PREFIX} code call ${codeToolUseId}: worker error (${err?.message || err})\n`);
   });
 
@@ -1314,13 +1369,32 @@ async function dispatchCodeWave(session, codeToolUseId, waveNum, calls) {
   for (let i = 0; i < calls.length; i++) {
     const { name } = calls[i];
     let { args } = calls[i];
+    // codemode.recall: reserved server-side call resolved inline from the
+    // session artifact store — no client turn is fabricated, no transcript
+    // bytes are spent. A real client tool named __recall (theoretical) wins.
+    if (name === "__recall" && !session.clientTools.has("__recall")) {
+      const id = String(args?.id ?? "");
+      const art = session.codeArtifacts?.get(id);
+      validated.push({
+        syntheticId: null,
+        tool: name,
+        args,
+        inlineError: null,
+        inlineResult: art
+          ? { text: art.text, raw: null, isError: false }
+          : { text: `no artifact ${JSON.stringify(id)} in this session (artifacts live for the session only)`, raw: null, isError: true },
+      });
+      continue;
+    }
     const meta = session.clientTools.get(name);
     if (!meta) {
       validated.push({
         syntheticId: null,
         tool: name,
         args,
-        inlineError: `unknown tool: ${name}`,
+        inlineError: session.lateTools?.has(name)
+          ? `tool ${name} was added by the client after this conversation's session started; it is unavailable to code mode in this conversation — proceed without it`
+          : `unknown tool: ${name}`,
       });
       continue;
     }
@@ -1363,11 +1437,11 @@ async function dispatchCodeWave(session, codeToolUseId, waveNum, calls) {
     validated.push({ syntheticId, tool: name, args: syntheticArgs, inlineError: null, anchorPlan });
   }
 
-  // If all calls in this wave are inline errors, return them directly without
-  // fabricating a client turn.
+  // If all calls in this wave are inline (errors or recalls), return them
+  // directly without fabricating a client turn.
   const fabricatable = validated.filter((v) => v.syntheticId !== null);
   if (fabricatable.length === 0) {
-    return validated.map((v) => ({ text: v.inlineError, raw: null, isError: true }));
+    return validated.map((v) => v.inlineResult || { text: v.inlineError, raw: null, isError: true });
   }
 
   if (run.currentWave) {
@@ -1572,6 +1646,24 @@ function projectEvent(session, ev) {
 }
 
 function createSession(key, model, tools, callerSystem, bucket, { resume, cwd = PROXY_CWD_FALLBACK } = {}) {
+  // Recheck the profile dir on every new session, not just at startup: the
+  // bundled CLI mkdirs $CLAUDE_CONFIG_DIR/session-env/<id> per session, and a
+  // profile cleanup can break that (dangling symlink) while the daemon is up.
+  // Repair is a handful of lstats when healthy; log-and-continue on failure —
+  // the SDK surfaces its own error if the dir is truly unusable.
+  if (serverProfileDir) {
+    try {
+      const pre = preflightProfileDir(serverProfileDir, { repair: true });
+      for (const r of pre.repaired) {
+        process.stderr.write(`${LOG_PREFIX} profile preflight: repaired ${r.entry} (${r.reason}) -> ${r.target}\n`);
+      }
+      for (const e of pre.errors) {
+        process.stderr.write(`${LOG_PREFIX} profile preflight: UNREPAIRABLE ${e.entry}: ${e.reason}\n`);
+      }
+    } catch (e) {
+      process.stderr.write(`${LOG_PREFIX} profile preflight failed: ${e?.message || e}\n`);
+    }
+  }
   const input = makeInputQueue();
   const abortController = new AbortController();
   const session = {
@@ -1606,6 +1698,10 @@ function createSession(key, model, tools, callerSystem, bucket, { resume, cwd = 
     codeSubCalls: 0,
     codeErrors: 0,
     codeWaves: 0,
+    codeState: {},               // persistent `state` global across code calls (conversation memory; survives clearAllCodeState)
+    codeArtifacts: new Map(),    // id -> {text, ts}: full text of truncated results, fetched via codemode.recall(id)
+    codeArtifactSeq: 0,
+    lateTools: null,             // Set of tool names that arrived after session creation (drift detection)
     currentTurn: null,            // { resolve } deferred for the active HTTP turn
     res: null,                    // current streaming HTTP response
     nonStream: null,              // { blocks, stopReason } when buffering for non-stream
@@ -1947,11 +2043,20 @@ async function resolveCodeModeToolResults(session, toolResults) {
     const wave = run.currentWave;
     run.currentWave = null;
 
-    // Fill in inline errors for calls that had no syntheticId.
+    // Fill in inline results/errors for calls that had no syntheticId.
     const results = wave.results.map((r, i) => {
       if (r) return r;
-      return { text: wave.calls[i].inlineError || "(no result)", raw: null, isError: true };
+      const v = wave.calls[i];
+      return v.inlineResult || { text: v.inlineError || "(no result)", raw: null, isError: true };
     });
+
+    // Ledger: completed-call evidence for the structured error result, so a
+    // later script failure doesn't force the model to redo this wave's work.
+    for (let i = 0; i < wave.calls.length; i++) {
+      const v = wave.calls[i];
+      if (v.syntheticId === null) continue; // inline errors/recalls are not completed client work
+      (run.ledger ||= []).push(ledgerEntry(v.tool, v.args, !!results[i]?.isError));
+    }
 
     // Update sub-call metrics.
     const subCalls = wave.calls.filter((v) => v.syntheticId !== null).length;
@@ -2107,21 +2212,36 @@ async function handleMessages(req, res) {
   // "cold"    => no matching live session and no resume index hit: narrative priming.
   // "new"     => brand-new conversation (single message): new session.
   let action;
+  let coldReason = null;
   if (session) {
     // Warm session: decide from the classified tail (resolve | push | noop).
     // Never fabricate a user turn from a trailing system/meta message, and never
     // abandon a parked tool round just because a system message trails the
     // tool_result. See decideWarmAction()/actionableTail().
     action = decideWarmAction(tail).action;
+    // Tool-set drift: clientTools is frozen at session creation (the MCP server
+    // and the `code` description cannot be rebuilt mid-query), so tools that
+    // arrive later are stashed only to explain the unknown-tool error.
+    if (tools?.length && session.clientTools?.size) {
+      for (const t of tools) {
+        if (!t?.name || t.name === "code" || session.clientTools.has(t.name)) continue;
+        session.lateTools = session.lateTools || new Set();
+        if (!session.lateTools.has(t.name)) {
+          session.lateTools.add(t.name);
+          process.stderr.write(`${LOG_PREFIX} tool ${t.name} arrived after session start key=${session.key.slice(0, 8)}; unavailable to code mode until a new conversation\n`);
+        }
+      }
+    }
   } else if (messages.length > 1) {
     const b = bucketKey(system, messages, convId, cwd);
     // Cold start: try to recover via SDK session resume (persisted in
-    // resume-index.json). findResumeCandidate only returns a clean user-turn
-    // resume for code-mode sessions (no tool_result tail, no catchup), which is
-    // the safe subset — synthetic toolu_code_* ids from a prior code run cannot
-    // be routed by a freshly-resumed SDK session. Anything else falls through to
-    // mimicry-safe cold priming.
+    // resume-index.json). For code-mode sessions a tool_result tail is a hard
+    // exclusion (synthetic toolu_code_* ids from a prior code run cannot be
+    // routed by a freshly-resumed SDK session); small non-tool_result tails go
+    // through resume-catchup with the mimicry-safe renderer, same as normal
+    // mode. Anything else falls through to mimicry-safe cold priming.
     const index = loadResumeIndex(resumeIndexFile);
+    const resumeTrace = {};
     const candidate = findResumeCandidate({
       entries: index.entries,
       model,
@@ -2131,6 +2251,7 @@ async function handleMessages(req, res) {
       lastIsToolResult,
       codeMode: true,
       hashMessages,
+      trace: resumeTrace,
     });
     if (candidate?.mode === "resume") {
       session = createSession(randomUUID(), model, tools, callerSystem, b, { resume: candidate.sdkSessionId, cwd });
@@ -2141,6 +2262,18 @@ async function handleMessages(req, res) {
       resumeCatchupTail = candidate.tail;
     }
     if (!session) {
+      coldReason = `resume-rejected(${resumeTrace.reason || "unknown"})`;
+      // Unstable x-claude-cwd diagnosis: a live session for this conversation
+      // exists under a different cwd bucket — the client's header moved.
+      if (convId) {
+        for (const s of sessions.values()) {
+          if (!s.closed && s.convId && s.convId === convId && s.cwd !== cwd) {
+            coldReason = `cwd-mismatch(live session at ${s.cwd})`;
+            process.stderr.write(`${LOG_PREFIX} WARNING conversation ${convId.slice(0, 8)} has a live session under cwd=${s.cwd} but this request says cwd=${cwd}; unstable x-claude-cwd header forces a cache-cold session\n`);
+            break;
+          }
+        }
+      }
       session = createSession(randomUUID(), model, tools, callerSystem, b, { cwd });
       action = "cold";
     }
@@ -2148,6 +2281,7 @@ async function handleMessages(req, res) {
     session = createSession(randomUUID(), model, tools, callerSystem, bucketKey(system, messages, convId, cwd), { cwd });
     action = "new";
   }
+  if (convId && !session.convId) session.convId = convId;
 
   process.stderr.write(`${LOG_PREFIX} request model=${model} stream=${isStream} key=${session.key.slice(0, 8)} action=${action} cwd=${session.cwd} tools=${tools?.length || 0} msgs=${messages.length} [${summarizeMessages(messages)}]\n`);
   session.lastActivity = Date.now();
@@ -2159,6 +2293,7 @@ async function handleMessages(req, res) {
     action, startedAt: Date.now(), firstEventAt: null, textDeltas: 0,
     usage: { input: 0, read: 0, create5m: 0, create1h: 0, output: 0 },
     messages: 0, _curMsgOutput: 0, codeSubCalls: 0, codeWaves: 0, scriptOutBytes: 0,
+    scriptInBytes: 0, spills: 0, stateBytes: 0, codeErrors: 0, coldReason,
   };
   const turnPromise = new Promise((resolve, reject) => {
     session.currentTurn = { resolve, reject };

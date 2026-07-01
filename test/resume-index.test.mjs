@@ -321,7 +321,9 @@ test("findResumeCandidate refuses tool_result tail for code mode (synthetic ids)
   assert.equal(cand, null);
 });
 
-test("findResumeCandidate refuses multi-message catchup tail for code mode", () => {
+test("findResumeCandidate allows small non-tool_result catchup tail for code mode", () => {
+  // Widened rule: non-tool_result tails use the mimicry-safe catchup renderer,
+  // same as normal mode. Only tool_result tails (synthetic ids) stay excluded.
   const incoming = [
     { role: "user", content: [{ type: "text", text: "start" }] },
     { role: "assistant", content: [{ type: "text", text: "a" }] },
@@ -339,7 +341,51 @@ test("findResumeCandidate refuses multi-message catchup tail for code mode", () 
     codeMode: true,
     hashMessages,
   });
+  assert.equal(cand?.mode, "resume-catchup");
+  assert.equal(cand?.tail.length, 3);
+});
+
+test("findResumeCandidate still refuses over-long catchup tail for code mode", () => {
+  const incoming = [
+    { role: "user", content: [{ type: "text", text: "start" }] },
+    { role: "assistant", content: [{ type: "text", text: "a" }] },
+    ...Array.from({ length: 8 }, (_, i) => ({ role: "user", content: [{ type: "text", text: `m${i}` }] })),
+  ];
+  const trace = {};
+  const cand = findResumeCandidate({
+    entries: [codeEntry(2, incoming)],
+    model: "claude-opus-4-8",
+    profileKey: PK,
+    bucket: BUCKET,
+    messages: incoming,
+    lastIsToolResult: false,
+    codeMode: true,
+    hashMessages,
+    trace,
+  });
   assert.equal(cand, null);
+  assert.equal(trace.reason, "tail-too-long");
+});
+
+test("findResumeCandidate reports rejection reason via trace", () => {
+  const incoming = [
+    { role: "user", content: [{ type: "text", text: "start" }] },
+    { role: "user", content: [{ type: "text", text: "next" }] },
+  ];
+  const trace = {};
+  const cand = findResumeCandidate({
+    entries: [],
+    model: "claude-opus-4-8",
+    profileKey: PK,
+    bucket: BUCKET,
+    messages: incoming,
+    lastIsToolResult: false,
+    codeMode: true,
+    hashMessages,
+    trace,
+  });
+  assert.equal(cand, null);
+  assert.equal(trace.reason, "empty-index");
 });
 
 test("findResumeCandidate isolates code-mode and non-code entries", () => {

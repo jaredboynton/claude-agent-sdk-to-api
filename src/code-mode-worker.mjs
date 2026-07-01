@@ -23,6 +23,39 @@ let callCount = 0;
 let maxWaves = 0; // 0 = unlimited
 let maxCalls = 0; // 0 = unlimited
 let toolDocs = [];
+let sandboxState = {}; // persistent `state` global; round-trips parent <-> worker per run
+
+// The vm context denies timers so a script can't schedule work the parent
+// can't see — but a host-scope sleep is safe (the parent can still terminate
+// the worker) and unblocks model-written retry/backoff loops, which otherwise
+// throw on setTimeout. Capped per call so one await can't park a run forever.
+const SLEEP_MAX_MS = 30_000;
+function sleep(ms) {
+  const delay = Math.min(Math.max(Number(ms) || 0, 0), SLEEP_MAX_MS);
+  return new Promise((resolve) => setTimeout(resolve, delay));
+}
+
+// Retry an async thunk with linear backoff. A ToolResult with isError counts
+// as a failure (tool errors don't throw), so `codemode.retry(() => tools.X(a))`
+// works without the script unwrapping results.
+async function retry(fn, { attempts = 3, delayMs = 250 } = {}) {
+  if (typeof fn !== "function") throw new Error("codemode.retry expects an async function");
+  const max = Math.max(1, Number(attempts) || 1);
+  let last;
+  for (let i = 0; i < max; i++) {
+    try {
+      const out = await fn(i);
+      const target = toolResultTargets.get(out);
+      if (!target || !target.isError) return out;
+      last = out;
+    } catch (e) {
+      last = e;
+    }
+    if (i < max - 1) await sleep((Number(delayMs) || 0) * (i + 1));
+  }
+  if (last instanceof Error) throw last;
+  return last;
+}
 
 const toolResultTargets = new WeakMap();
 
@@ -301,6 +334,10 @@ function buildCodemodeGlobal() {
     batch,
     search: searchToolDocs,
     describe: describeToolDoc,
+    retry,
+    // Fetch the full text of a previously truncated result. Resolved inline by
+    // the bridge from the session artifact store — no client turn is fabricated.
+    recall: (id) => callTool("__recall", { id: String(id ?? "") }),
   });
 }
 
@@ -339,9 +376,13 @@ async function runScript(script, toolNames) {
     ToolResult,
     batch,
     codemode,
+    state: sandboxState,
+    sleep,
     JSON,
     Math,
     console: sandboxConsole,
+    TextEncoder,
+    TextDecoder,
     require: deny("require"),
     process: { exit: deny("process.exit"), env: Object.freeze({}) },
     globalThis: Object.freeze({}),
@@ -354,13 +395,16 @@ async function runScript(script, toolNames) {
     Promise,
   });
 
-  const wrapped = `(async () => { ${script} })()`;
+  // Newline-wrap + lineOffset so stack line numbers match the script's own
+  // numbering (the old single-line wrapper put everything on line 1).
+  const wrapped = `(async () => {\n${script}\n})()`;
   // Deny dynamic import() — never let a script load modules out of the sandbox.
   // We provide a throwing callback, but node still surfaces its own message
   // unless run with --experimental-vm-modules; normalizeRunError() below
   // rewrites either form into a clear denial the script can catch/recover from.
   const scriptObj = new vm.Script(wrapped, {
     filename: "code-mode-script.vm",
+    lineOffset: -1,
     importModuleDynamically: () => {
       throw new Error("dynamic import() is denied in code mode scripts");
     },
@@ -374,12 +418,16 @@ async function runScript(script, toolNames) {
 const workerLogs = [];
 
 // Rewrite node's dynamic-import internals message into a clear denial.
+// Otherwise keep the first script-owned stack frame so the model sees WHERE
+// in its script the throw happened (line numbers align via lineOffset).
 function normalizeRunError(err) {
   const msg = err?.message || String(err);
   if (/dynamic import callback|experimental-vm-modules/i.test(msg)) {
     return "dynamic import() is denied in code mode scripts";
   }
-  return msg;
+  const stack = typeof err?.stack === "string" ? err.stack : "";
+  const frame = stack.split("\n").find((l) => l.includes("code-mode-script.vm"));
+  return frame ? `${msg} (at ${frame.trim().replace(/^at\s+/, "")})` : msg;
 }
 
 parentPort.on("message", async (msg) => {
@@ -391,6 +439,10 @@ parentPort.on("message", async (msg) => {
     maxWaves = msg.maxWaves ?? 0;
     maxCalls = msg.maxCalls ?? 0;
     toolDocs = normalizeToolDocs(msg.toolDocs || [], msg.toolNames || []);
+    sandboxState = msg.state && typeof msg.state === "object" ? msg.state : {};
+    // `state` returns on success AND error: a script that threw after stashing
+    // progress must not lose it. dehydrateValue unwraps ToolResult proxies so
+    // the object survives the structured-clone postMessage boundary.
     try {
       const value = await runScript(msg.script, msg.toolNames || []);
       postToParent({
@@ -399,6 +451,7 @@ parentPort.on("message", async (msg) => {
         logs: workerLogs.slice(),
         waves: waveSeq,
         calls: callCount,
+        state: dehydrateValue(sandboxState),
       });
     } catch (err) {
       postToParent({
@@ -407,6 +460,7 @@ parentPort.on("message", async (msg) => {
         logs: workerLogs.slice(),
         waves: waveSeq,
         calls: callCount,
+        state: dehydrateValue(sandboxState),
       });
     }
     return;

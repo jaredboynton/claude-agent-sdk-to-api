@@ -11,6 +11,8 @@ import {
   validateCodeInput,
   runCodeScriptDynamic,
   formatCodeResult,
+  formatCodeError,
+  ledgerEntry,
   buildCodeToolDescription,
   buildCodeToolCatalog,
   CodeValidationError,
@@ -123,17 +125,44 @@ test("formatCodeResult pretty-prints objects", () => {
   assert.match(r.content[0].text, /\[console\]/);
 });
 
-test("formatCodeResult rejects oversized script output", () => {
-  const r = formatCodeResult("abcdef", [], { maxBytes: 3 });
-  assert.equal(r.isError, true);
-  assert.match(r.content[0].text, /exceeded 3 bytes/);
+test("formatCodeResult truncates oversized output head+tail (never errors)", () => {
+  const big = `START${"x".repeat(50000)}END`;
+  const r = formatCodeResult(big, [], { maxBytes: 1024 });
+  assert.equal(r.isError, undefined, "truncation preserves the run's work; no error");
+  assert.ok(r.content[0].text.length < 50000);
+  assert.match(r.content[0].text, /^START/);
+  assert.match(r.content[0].text, /END/);
+  assert.match(r.content[0].text, /middle omitted/);
+  assert.match(r.content[0].text, /\[output truncated\]/);
 });
 
-test("formatCodeResult does not cap output by default (no truncation)", () => {
-  const big = "x".repeat(200000); // ~200KB, far over the old 32KB cap
+test("formatCodeResult truncation notice points at the spilled artifact", () => {
+  const big = "x".repeat(50000);
+  let spilled = null;
+  const r = formatCodeResult(big, [], { maxBytes: 1024, onSpill: (full) => { spilled = full; return "a1"; } });
+  assert.equal(spilled, big, "onSpill receives the full untruncated text");
+  assert.match(r.content[0].text, /codemode\.recall\("a1"\)/);
+});
+
+test("formatCodeResult caps output at 16KB by default", () => {
+  const big = "x".repeat(200000);
   const r = formatCodeResult(big);
   assert.equal(r.isError, undefined);
+  assert.ok(r.content[0].text.length < 20000);
+  assert.match(r.content[0].text, /output truncated/);
+});
+
+test("formatCodeResult maxBytes 0 disables the cap", () => {
+  const big = "x".repeat(200000);
+  const r = formatCodeResult(big, [], { maxBytes: 0 });
+  assert.equal(r.isError, undefined);
   assert.equal(r.content[0].text.length, 200000);
+});
+
+test("formatCodeResult caps oversized console lines", () => {
+  const r = formatCodeResult("ok", [`L${"y".repeat(5000)}`], { maxBytes: 0 });
+  assert.match(r.content[0].text, /line truncated/);
+  assert.match(r.content[0].text, /output truncated/);
 });
 
 // ---------------------------------------------------------------------------
@@ -148,10 +177,12 @@ test("buildCodeToolDescription lists client tools", () => {
 
 test("buildCodeToolCatalog exposes focused tool docs", () => {
   const c = buildCodeToolCatalog(CLIENT_TOOLS);
-  assert.deepEqual(c.map((t) => t.path), ["tools.Grep", "tools.Glob", "tools.Execute"]);
-  assert.match(c[0].summary, /grep/);
-  assert.match(c[0].docs, /Grep\(args: \{/);
-  assert.match(c[0].docs, /pattern: string/);
+  // Byte-stable ordering: entries are sorted by name regardless of client order.
+  assert.deepEqual(c.map((t) => t.path), ["tools.Execute", "tools.Glob", "tools.Grep"]);
+  const grep = c.find((t) => t.name === "Grep");
+  assert.match(grep.summary, /grep/);
+  assert.match(grep.docs, /Grep\(args: \{/);
+  assert.match(grep.docs, /pattern: string/);
 });
 
 test("buildCodeToolDescription emits typed signatures with required/optional and enums", () => {
@@ -1120,4 +1151,159 @@ test("findSession works with synthetic tool blocks in client history", () => {
   const found = findSession(extended, sys);
   assert.ok(found);
   sessions.clear();
+});
+
+// ---------------------------------------------------------------------------
+// formatCodeError (structured script-error result: ledger + console)
+// ---------------------------------------------------------------------------
+
+test("formatCodeError includes completed-work evidence", () => {
+  const ledger = [
+    ledgerEntry("Read", { file_path: "/a.txt" }, false),
+    ledgerEntry("Edit", { file_path: "/a.txt", old_string: "x".repeat(200) }, true),
+  ];
+  const r = formatCodeError("boom (at code-mode-script.vm:3)", { ledger, logs: ["step 1 done"], waves: 2, calls: 2 });
+  assert.equal(r.isError, true);
+  const t = r.content[0].text;
+  assert.match(t, /code script error: boom/);
+  assert.match(t, /completed before failure: waves=2 calls=2/);
+  assert.match(t, /do NOT repeat/);
+  assert.match(t, /ok  Read\(\{"file_path":"\/a\.txt"\}\)/);
+  assert.match(t, /ERR Edit\(/);
+  assert.ok(!t.includes("x".repeat(100)), "args previews are capped");
+  assert.match(t, /\[console\]\nstep 1 done/);
+});
+
+test("formatCodeError caps the ledger at 30 entries", () => {
+  const ledger = Array.from({ length: 40 }, (_, i) => ledgerEntry("Read", { i }, false));
+  const t = formatCodeError("boom", { ledger }).content[0].text;
+  assert.match(t, /\(\+10 more\)/);
+});
+
+// ---------------------------------------------------------------------------
+// persistent `state` global (round-trips parent <-> worker, survives errors)
+// ---------------------------------------------------------------------------
+
+test("runCodeScriptDynamic: state round-trips across runs", async () => {
+  const opts = { toolNames: [], dispatchWave: async () => [], timeoutMs: 5000 };
+  const r1 = await runCodeScriptDynamic("state.count = (state.count || 0) + 1; return state.count;", { ...opts, state: {} });
+  assert.equal(r1.value, 1);
+  assert.equal(r1.state.count, 1);
+  const r2 = await runCodeScriptDynamic("state.count += 10; return state.count;", { ...opts, state: r1.state });
+  assert.equal(r2.value, 11);
+  assert.equal(r2.state.count, 11);
+});
+
+test("runCodeScriptDynamic: state survives a script error", async () => {
+  const r = await runCodeScriptDynamic(
+    "state.progress = 'half-done'; throw new Error('midway');",
+    { toolNames: [], dispatchWave: async () => [], timeoutMs: 5000, state: {} },
+  );
+  assert.match(r.error, /midway/);
+  assert.equal(r.state.progress, "half-done");
+});
+
+test("runCodeScriptDynamic: script error reports the failing line", async () => {
+  const r = await runCodeScriptDynamic(
+    "const a = 1;\nconst b = 2;\nthrow new Error('line3');",
+    { toolNames: [], dispatchWave: async () => [], timeoutMs: 5000 },
+  );
+  assert.match(r.error, /line3/);
+  assert.match(r.error, /code-mode-script\.vm:3/);
+});
+
+// ---------------------------------------------------------------------------
+// sleep / codemode.retry / TextEncoder in the sandbox
+// ---------------------------------------------------------------------------
+
+test("runCodeScriptDynamic: sleep is available and awaitable", async () => {
+  const r = await runCodeScriptDynamic("await sleep(10); return 'woke';", {
+    toolNames: [],
+    dispatchWave: async () => [],
+    timeoutMs: 5000,
+  });
+  assert.equal(r.value, "woke");
+});
+
+test("runCodeScriptDynamic: codemode.retry retries an isError tool result", async () => {
+  let attempts = 0;
+  const r = await runCodeScriptDynamic(
+    "const out = await codemode.retry(() => tools.Flaky({}), { attempts: 3, delayMs: 1 }); return out.text;",
+    {
+      toolNames: ["Flaky"],
+      dispatchWave: async (w, calls) => {
+        attempts++;
+        return calls.map(() => (attempts < 3
+          ? { text: "transient", raw: null, isError: true }
+          : { text: "recovered", raw: null, isError: false }));
+      },
+      timeoutMs: 5000,
+    },
+  );
+  assert.equal(r.value, "recovered");
+  assert.equal(attempts, 3);
+});
+
+test("runCodeScriptDynamic: TextEncoder is available", async () => {
+  const r = await runCodeScriptDynamic("return new TextEncoder().encode('abc').length;", {
+    toolNames: [],
+    dispatchWave: async () => [],
+    timeoutMs: 5000,
+  });
+  assert.equal(r.value, 3);
+});
+
+// ---------------------------------------------------------------------------
+// description mentions the new runtime surface (Release A batch)
+// ---------------------------------------------------------------------------
+
+test("buildCodeToolDescription documents state, recall, sleep, retry", () => {
+  const d = buildCodeToolDescription(CLIENT_TOOLS);
+  assert.match(d, /`state` is a persistent object/);
+  assert.match(d, /codemode\.recall\(id\)/);
+  assert.match(d, /sleep\(ms\)/);
+  assert.match(d, /codemode\.retry\(fn/);
+});
+
+test("buildCodeToolDescription is byte-stable across client tool order", () => {
+  const a = new Map([["B", { description: "b", input_schema: { type: "object", properties: {} } }], ["A", { description: "a", input_schema: { type: "object", properties: {} } }]]);
+  const b = new Map([["A", { description: "a", input_schema: { type: "object", properties: {} } }], ["B", { description: "b", input_schema: { type: "object", properties: {} } }]]);
+  assert.equal(buildCodeToolDescription(a), buildCodeToolDescription(b));
+});
+
+// ---------------------------------------------------------------------------
+// codemode.recall — resolved inline from the session artifact store
+// ---------------------------------------------------------------------------
+
+test("dispatchCodeWave resolves __recall inline from session artifacts (no client turn)", async () => {
+  const session = fakeCodeSession({
+    codeArtifacts: new Map([["a1", { text: "the full spilled text", ts: 1 }]]),
+    codeRun: { codeId: "c1", aborted: false, currentWave: null, waveSeq: 0, waveCount: 0, callCount: 0, ledger: [] },
+  });
+  const results = await dispatchCodeWave(session, "c1", 1, [
+    { name: "__recall", args: { id: "a1" } },
+    { name: "__recall", args: { id: "missing" } },
+  ]);
+  assert.equal(results[0].isError, false);
+  assert.equal(results[0].text, "the full spilled text");
+  assert.equal(results[1].isError, true);
+  assert.match(results[1].text, /no artifact "missing"/);
+  assert.equal(session.codeRun.currentWave, null, "no wave was fabricated");
+});
+
+test("codemode.recall round-trips worker -> dispatchCodeWave -> script", async () => {
+  const session = fakeCodeSession({
+    codeArtifacts: new Map([["a7", { text: "spilled payload 12345", ts: 1 }]]),
+    codeRun: { codeId: "c9", aborted: false, currentWave: null, waveSeq: 0, waveCount: 0, callCount: 0, ledger: [] },
+  });
+  const r = await runCodeScriptDynamic(
+    "const full = await codemode.recall('a7'); return `got:${full.text}`;",
+    {
+      toolNames: [...CLIENT_TOOLS.keys()],
+      dispatchWave: (w, calls) => dispatchCodeWave(session, "c9", w, calls),
+      timeoutMs: 5000,
+    },
+  );
+  assert.equal(r.error, undefined);
+  assert.equal(r.value, "got:spilled payload 12345");
 });
