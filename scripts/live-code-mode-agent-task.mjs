@@ -348,7 +348,7 @@ async function main() {
     codeErrors: h0.codeErrors ?? 0,
     codeWaves: h0.codeWaves ?? 0,
   };
-  console.log(`healthz before: codeMode=${h0.codeMode} codeCalls=${startCounts.codeCalls} codeSubCalls=${startCounts.codeSubCalls} codeErrors=${startCounts.codeErrors} codeWaves=${startCounts.codeWaves}`);
+  console.log(`healthz before: codeCalls=${startCounts.codeCalls} codeSubCalls=${startCounts.codeSubCalls} codeErrors=${startCounts.codeErrors} codeWaves=${startCounts.codeWaves}`);
 
   const toolCounts = { WebSearch: 0, WriteFile: 0, ReadFile: 0, ListFiles: 0, RunValidation: 0 };
   const validationResults = [];

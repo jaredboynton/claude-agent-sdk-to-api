@@ -31,8 +31,6 @@ function codeSession(overrides = {}) {
   return {
     key: "k",
     bucket: "b",
-    codeMode: true,
-    anchorEdit: true,
     anchorState: createAnchorState(),
     clientTools: new Map([["Edit", { description: "edit", input_schema: { type: "object", properties: {} } }], ["Read", { description: "read", input_schema: { type: "object", properties: {} } }]]),
     inputParsers: new Map(), // no parser => translated args pass straight through

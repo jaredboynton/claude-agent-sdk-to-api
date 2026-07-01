@@ -61,7 +61,7 @@ The tool signatures below are TypeScript-shaped documentation for argument types
 <working_with_results>
 - Process results in the script: filter, count, join, diff, extract, summarize. Return the conclusion — a verdict, a few fields, a short summary — not raw file or search contents.
 - Editing: prefer the client's anchored search/replace editor (an \`old_string\`/\`new_string\`-style pair — read its signature below, don't assume a name) over rewriting whole files or lines. The #1 cause of failed edits is an \`old_string\` that doesn't byte-match the file, so COPY \`old_string\` VERBATIM from the bytes you just read (exact whitespace, indentation, and quotes) — never retype or reformat it from memory — OR, if the editor exposes \`start_anchor\`/\`end_anchor\` and your read result carries an \`.anchored\` view, point at those anchor tokens instead and skip copying entirely. Use the smallest snippet that is unique; if it isn't unique, extend it (add an adjacent line) rather than rewriting more, and match by content, not line numbers. Read the file and compute the edits in the same script so its body never round-trips through you. To change ONE file in several places, prefer a single MultiEdit; otherwise \`await\` the edits to that file one after another (never fire two edits to the same path in one parallel wave — they would clobber each other). Edits to DIFFERENT files are independent and should run together in one parallel wave. If there's no anchored editor, fall back to a write tool but still compute the content in-script from the read.
-- Use the client's tools directly (outside \`code\`) only for interactive, approval, user-input, or handoff tools whose native flow matters. Use \`code\` for ordinary read/search/write/shell/validation work.
+- All client tool calls must happen inside \`code\`; original tools are available only as script functions.
 </working_with_results>
 
 <examples>
@@ -102,17 +102,6 @@ return { passed: out.exitCode === 0, attempts: i + 1, stderr: out.stderr.slice(0
 \`\`\`
 </examples>
 </tool_use_guidance>`;
-
-// Native-mode guidance: used when code mode is OFF. Steers the model to emit
-// multiple independent tool_use blocks per turn (parallel tool calls) while
-// keeping dependent calls sequential.
-export const NATIVE_PARALLEL_APPEND = `
-
-<use_parallel_tool_calls>
-If you intend to call multiple tools and there are no dependencies between the tool calls, make all of the independent tool calls in parallel. Prioritize calling tools simultaneously whenever the actions can be done in parallel rather than sequentially. For example, when reading 3 files, run 3 tool calls in parallel to read all 3 files into context at the same time. When running multiple read-only commands like \`git status\`, \`git diff\`, \`git log\`, or \`gh release view\`, always run all of the commands in parallel. Err on the side of maximizing parallel tool calls rather than running too many tools sequentially.
-
-Only batch tool calls that are independent of each other. If some tool calls depend on previous calls to inform dependent values (the parameters), or if calls have ordering side-effects (\`git fetch\` then \`git log origin/main..HEAD\`; create a directory then write into it; \`git add\` then \`git commit\`), do NOT call these tools in parallel and instead call them sequentially. Never use placeholders or guess missing parameters in tool calls.
-</use_parallel_tool_calls>`;
 
 export class CodeValidationError extends Error {
   constructor(message) {
@@ -273,7 +262,7 @@ export function buildCodeToolDescription(clientTools) {
   return (
     "Run a full async JavaScript program that calls the client's tools and returns a summary. "
     + "ALWAYS favor intelligent logic, and ALWAYS favor maximum batching and parallelism: push branching/loops/retries/aggregation into the script and run every independent operation together in one parallel wave. There is no time, wave, or call limit — one code call can do an entire task. "
-    + "Prefer this for non-interactive read/search/write/shell/validation work; use original tools directly for interactive, approval, handoff, or native-UI flows. "
+    + "All client tools are available only through this script runtime; do not expect original tools outside `code`. "
     + "Call tools with `await tools.<Name>(args)`, `await tools[\"Any-Name\"]`, or `await callTool(name, args)`; each returns `{ text, raw, isError }` (JSON.parse r.text when the tool returns JSON). "
     + "The signatures below are TypeScript-shaped docs only; write executable JavaScript, not TypeScript syntax (no type annotations, interfaces, or generics). "
     + "args MUST match the TypeScript signature for that tool below: a trailing ? marks an optional field, "

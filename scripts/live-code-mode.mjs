@@ -1,6 +1,6 @@
 // End-to-end verification for dynamic code mode (script-first).
 //
-// Boot bridge with codeMode on (default), POST a prompt whose answer requires
+// Boot bridge, POST a prompt whose answer requires
 // Grep+Glob. Confirm the client SSE shows TWO tool_use (Grep, Glob) and NO
 // `code` block (transparent expand). POST tool_results; confirm the script
 // completes and the model emits a final answer promptly (no park timeout).
@@ -109,9 +109,8 @@ async function consumeResponse(res, label) {
   return { blocks, stopReason, toolUses, elapsed: Date.now() - start };
 }
 
-async function postMessages(messages, { label, codeModeHeader } = {}) {
+async function postMessages(messages, { label } = {}) {
   const headers = { "content-type": "application/json" };
-  if (codeModeHeader != null) headers["X-Code-Mode"] = codeModeHeader;
   const res = await fetch(`${BASE}/v1/messages`, {
     method: "POST",
     headers,
@@ -131,7 +130,7 @@ async function healthz() {
 
 async function main() {
   const h0 = await healthz().catch(() => ({}));
-  console.log(`healthz: codeMode=${h0.codeMode} codeCalls=${h0.codeCalls} codeWaves=${h0.codeWaves}`);
+  console.log(`healthz: codeCalls=${h0.codeCalls} codeWaves=${h0.codeWaves}`);
   const startCodeErrors = h0.codeErrors ?? 0;
 
   const userText =

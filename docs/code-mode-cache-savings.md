@@ -120,7 +120,7 @@ Applying the reduction bands to the cache buckets, with a batchability haircut (
 - **Code mode is write-dominated in practice.** The measured shape (59% create / 31% read) means the biggest remaining lever is the one-time 1h cache *write* of the system + ~32 tool schemas at 2×, not read growth — worth watching if the tool catalog grows.
 - **Batchability is the real uncertainty.** The mechanics give a 56–80% read lever, but realized savings = `batchability × lever`. Data-dependent chains (read → decide → act) can't collapse into one manifest. The §5 spread is mostly this knob.
 - **`ρ` and `c` vary widely.** Tool results are tiny at the median (51 B) but heavy-tailed (p90 4.4 KB); a few large script dumps erode the bloat win. The 0.1.6 typed-signature description and the "return only what you need" nudge push `c` down.
-- **No live A/B yet.** These compare a real normal-mode corpus to a separate code-mode session, not the *same* task both ways. Run `scripts/live-code-mode-agent-task.mjs` with code mode on vs `X-Code-Mode: 0` to diff one task directly.
+- **No live A/B yet.** These compare a historical normal-mode corpus to a separate code-mode session, not the *same* task both ways.
 - **Baseline `B`** affects only short-session reductions; the long-session regime is dominated by the quadratic term and is insensitive to `B`.
 
 ## 7. Reproduce

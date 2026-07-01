@@ -100,15 +100,13 @@ claude
 
 Without the header, the bridge falls back to `CLAUDE_PROXY_CWD` (if set and valid), then the daemon's own `process.cwd()`. When the bridge runs as a launchd/systemd service that's usually `/`, so set the header (or `CLAUDE_PROXY_CWD` for a single-project daemon) to get correct directory awareness.
 
-## Code mode (opt-out by default)
+## Code mode
 
-When enabled (the default), the bridge exposes a single `code({ script })` meta-tool to the model. The model writes an async JavaScript script that calls the client's tools via `await tools.<Name>(args)` (or `await callTool(name, args)`). The bridge runs the script inside a Worker-contained `node:vm` sandbox; each `await`ed tool call becomes a wave of synthetic `tool_use` blocks for the unchanged client, and only the script's return value enters the model's context. This collapses multi-step dependent tool chains (read → decide → grep → read) into **one model round-trip** — tool waves inside `code` cost zero model cache reads.
+The bridge exposes a single `code({ script })` meta-tool to the model. The model writes an async JavaScript script that calls the client's tools via `await tools.<Name>(args)` (or `await callTool(name, args)`). The bridge runs the script inside a Worker-contained `node:vm` sandbox; each `await`ed tool call becomes a wave of synthetic `tool_use` blocks for the unchanged client, and only the script's return value enters the model's context. This collapses multi-step dependent tool chains (read → decide → grep → read) into **one model round-trip** — tool waves inside `code` cost zero model cache reads.
 
-The original client tools are still exposed alongside `code`, so clients keep their native schemas and interactive/approval/user-input flows can run directly instead of being forced through `code`.
+Original client tools are not advertised to the model directly. They remain available only inside the `code` script runtime.
 
 **Script-first contract:** the script is a full async JS program. Call tools with `await tools.X(args)` / `await tools["Any-Name"](args)` / `await callTool(name, args)`, each returning `{ text, raw, isError }`. Bake branching/loops into the script — if the next step depends on a tool's result, call the next tool from inside the script instead of returning to the model. Wrap independent calls in `Promise.all([...])` to run them in one parallel wave; sequential `await`s are sequential waves. Do not put order-dependent or side-effect-chained calls in one wave. Only the script's return value is visible to the model.
-
-**Opt out:** set `"codeMode": false` on a profile in `profiles.json`, pass `--code-mode 0` to `claude-agent-api run`, or send `X-Code-Mode: 0` on a request.
 
 **Security:** scripts run in `node:vm` inside a Worker (which keeps the parent responsive and lets it terminate the run on abort). By default there are no time/wave/call caps — a `code` script may run as long as it needs and make as many tool waves as it needs (set `CODE_SCRIPT_TIMEOUT_MS`/`CODE_MAX_WAVES`/`CODE_MAX_CALLS` only if you want a ceiling). `node:vm` is not a hard security boundary and the script orchestrates real I/O via the client's tools; the daemon is local and the model is already authorized to request tools, but do not expose this to untrusted callers without hardening (e.g. `isolated-vm`).
 
@@ -118,18 +116,14 @@ Live validation (requires a running bridge):
 - `node scripts/live-code-mode-agent-task.mjs <port>` — thorough agent workflow: drives a real research-to-code-to-validate task (web search, multi-file generation in a temp project, allowlisted command validation, iterative fixes) and asserts code mode stayed transparent under a multi-turn, multi-tool workload, including a dependent-chain assertion that one `code` call drove multiple waves. Requires network for `WebSearch`. Env: `MAX_TURNS`, `KEEP_CODE_MODE_FIXTURE=1`, `MODEL`.
 - `node scripts/live-extreme-code-mode.mjs <port>` — stress test: uses Haiku by default to drive a multi-turn code-mode session with one 48-call parallel wave plus a dependent count wave guarded by script `if` logic. Env: `MODEL`, `TARGET_PARALLEL_CALLS`, `KEEP_CODE_MODE_FIXTURE=1`.
 
-## Anchor editing (opt-out by default)
+## Anchor editing
 
 The #1 cause of failed `Edit`/`MultiEdit` calls is an `old_string` that doesn't byte-match the file (the model retypes whitespace or indentation from memory). The bridge already caches the exact bytes the model reads (the client executes `Read` and POSTs the result back through us), so it can free the model from reproducing `old_string` at all.
 
-When enabled (the default), every `Read` result is annotated with a stable per-line anchor token (`⟦a5⟧…`) and the exact gutter-stripped bytes are cached per session. The model points an edit at a line range by anchor instead of pasting source, and the bridge reconstructs a byte-exact `old_string`/`new_string` from the cached snapshot before the `tool_use` reaches the client — so the client still executes a perfectly ordinary native `Edit`.
+Every `Read` result inside code mode also carries an `.anchored` view with stable per-line anchor tokens (`⟦a5⟧...`) and the exact gutter-stripped bytes are cached per session. Scripts may pass `start_anchor`/`end_anchor` to `Edit`/`MultiEdit`, and the bridge reconstructs a byte-exact `old_string`/`new_string` from the cached snapshot before fabricating the client tool call. Scripts can also keep deriving `old_string` from the bytes they just read — both work.
 
-- **Native mode:** `Edit`/`MultiEdit` are advertised with an anchor-shaped schema (`start_anchor`, `end_anchor`, `new_string`). The bridge buffers the streamed `tool_use` input and re-emits a translated native input at `content_block_stop`.
-- **Code mode:** each tool result also carries an `.anchored` view (the same text with anchor tokens) and the `Edit`/`MultiEdit` signatures gain **optional** anchor fields. Scripts may pass `start_anchor`/`end_anchor` (translated to native `old_string` before the wave fabricates a client call) **or** keep deriving `old_string` from the bytes they just read — both work.
 - **Live re-anchoring (Dirac-style):** after the client confirms an edit, the bridge applies it to the cached snapshot and re-anchors only the changed lines (unchanged lines keep their tokens). So an edit near the top of a file does not invalidate the anchors below it, and several sequential edits to the same file work without re-reading. A `MultiEdit` resolves all of its ranges against one snapshot, so its edits may be supplied in **any order** (they are sorted and applied ascending); only genuinely overlapping ranges are rejected.
-- If an anchor is unknown or stale (no cached snapshot), translation fails gracefully: native mode forwards the original input (the client errors and the model re-reads), code mode returns an inline error to the script.
-
-**Opt out:** set `"anchorEdit": false` on a profile in `profiles.json`, pass `--anchor-edit 0` to `claude-agent-api run`, or send `X-Anchor-Edit: 0` on a request.
+- If an anchor is unknown or stale (no cached snapshot), translation returns an inline error to the script.
 
 ## Environment knobs
 
@@ -144,14 +138,13 @@ When enabled (the default), every `Read` result is annotated with a stable per-l
 | `CODE_SCRIPT_MAX_OUTPUT_BYTES` | `0` (no cap) | Optional max bytes for a code script's return value before returning a "summarize smaller" error; `0` = unlimited |
 | `CODE_MAX_WAVES` | `0` (unlimited) | Optional cap on tool-call waves per `code` run; `0` = unlimited |
 | `CODE_MAX_CALLS` | `0` (unlimited) | Optional cap on total tool calls per `code` run; `0` = unlimited |
-| `X-Code-Mode` | (default on) | Per-request header: `0` disables, `1` enables code mode |
 | `x-claude-cwd` | (header) | Per-request working directory baked into the SDK env block; must be an existing absolute dir |
 | `CLAUDE_PROXY_CWD` | `process.cwd()` | Daemon-wide working-directory fallback when no valid `x-claude-cwd` header is sent |
 | `CACHE_LOG` | (off) | `1`/`true` → append a per-turn usage row to `<profileDir>/cache-log.jsonl`; or set a path. Also `--cache-log [path]` on `run`, or `"cacheLog": true` per profile |
 
 ## Cache log (per-turn usage receipts)
 
-With `--cache-log` (or `CACHE_LOG=1`), the bridge appends one JSON line per completed HTTP turn capturing the turn's `read`/`create` (cache-read / cache-creation), `input`, and `output` tokens, plus `conv` (conversation id), `model`, `codeMode`, `codeSubCalls`, `codeWaves`, and `scriptOutBytes`. Cache tokens come from the authoritative `message_start` usage and are summed across all upstream messages in the turn (including code-mode internal continuations). Group by `conv` and price with the Opus card to turn the [code-mode savings model](docs/code-mode-cache-savings.md) into measured receipts. The writer is opt-in, append-only (survives restarts), and never throws into the request path. `/healthz` reports the active `cacheLog` path.
+With `--cache-log` (or `CACHE_LOG=1`), the bridge appends one JSON line per completed HTTP turn capturing the turn's `read`/`create` (cache-read / cache-creation), `input`, and `output` tokens, plus `conv` (conversation id), `model`, `codeSubCalls`, `codeWaves`, and `scriptOutBytes`. Cache tokens come from the authoritative `message_start` usage and are summed across all upstream messages in the turn (including code-mode internal continuations). Group by `conv` and price with the Opus card to turn the [code-mode savings model](docs/code-mode-cache-savings.md) into measured receipts. The writer is opt-in, append-only (survives restarts), and never throws into the request path. `/healthz` reports the active `cacheLog` path.
 
 ## Tests
 

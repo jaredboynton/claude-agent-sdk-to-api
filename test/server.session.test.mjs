@@ -25,8 +25,6 @@ import {
   normalizeToolInput,
   extractIdHint,
   abandonToolRound,
-  buildParkingMcpServer,
-  resolveTool,
   noteStreamTiming,
   toolInputShape,
   resolveCwd,
@@ -609,68 +607,6 @@ test("claimStreamedToolUse FIFO-falls back (with counter + log) when two same-na
   assert.equal(c?.id, "u_3");
   assert.equal(s.fifoFallbacks, 2, "single same-name candidate is not a FIFO fallback");
   assert.equal(s.streamedToolUses.length, 0);
-});
-
-// ---------------------------------------------------------------------------
-// buildParkingMcpServer — parallel defaulted tools park and unblock end-to-end
-// ---------------------------------------------------------------------------
-
-function parkingSession(overrides = {}) {
-  return {
-    codeMode: false,
-    anchorEdit: false,
-    streamedToolUses: [],
-    inputParsers: new Map(),
-    fifoFallbacks: 0,
-    pendingTools: new Map(),
-    resolvedResults: new Map(),
-    orphanResolvers: [],
-    lastActivity: Date.now(),
-    ...overrides,
-  };
-}
-
-test("buildParkingMcpServer: parallel defaulted tools park on correct ids and unblock after both results", async () => {
-  const grep = buildParser(GREP_SCHEMA);
-  const glob = buildParser(GLOB_SCHEMA);
-  const session = parkingSession({
-    streamedToolUses: [
-      { id: "grep_1", name: "Grep", input: { pattern: "rtinferd", path: "/x" } },
-      { id: "glob_1", name: "Glob", input: { pattern: "**/rtinfer*", folder: "/x" } },
-    ],
-  });
-  let captured = null;
-  buildParkingMcpServer(
-    [
-      { name: "Grep", description: "grep", input_schema: GREP_SCHEMA },
-      { name: "Glob", description: "glob", input_schema: GLOB_SCHEMA },
-    ],
-    session,
-    (config) => { captured = config; return { ok: true }; },
-  );
-  const handlers = Object.fromEntries(captured.tools.map((t) => [t.name, t.handler]));
-  const globArgs = glob.parse({ pattern: "**/rtinfer*", folder: "/x" });
-  const grepArgs = grep.parse({ pattern: "rtinferd", path: "/x" });
-
-  // Glob handler fires first (out of stream order), mirroring the live regression.
-  const globP = handlers.Glob(globArgs, {});
-  const grepP = handlers.Grep(grepArgs, {});
-
-  assert.equal(session.pendingTools.size, 2);
-  assert.ok(session.pendingTools.has("glob_1"));
-  assert.ok(session.pendingTools.has("grep_1"));
-  assert.equal(session.orphanResolvers.length, 0);
-  assert.equal(session.fifoFallbacks, 0);
-  assert.equal(session.streamedToolUses.length, 0);
-
-  resolveTool(session, "grep_1", { content: [{ type: "text", text: "grep ok" }] });
-  resolveTool(session, "glob_1", { content: [{ type: "text", text: "glob ok" }] });
-
-  const [globResult, grepResult] = await Promise.all([globP, grepP]);
-  assert.equal(globResult.content[0].text, "glob ok");
-  assert.equal(grepResult.content[0].text, "grep ok");
-  assert.equal(session.pendingTools.size, 0);
-  assert.equal(session.orphanResolvers.length, 0);
 });
 
 // ---------------------------------------------------------------------------

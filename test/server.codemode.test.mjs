@@ -3,6 +3,9 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import {
   validateCodeInput,
@@ -11,7 +14,6 @@ import {
   buildCodeToolDescription,
   CodeValidationError,
   CODE_MODE_APPEND,
-  NATIVE_PARALLEL_APPEND,
 } from "../src/code-mode.mjs";
 import {
   abandonToolRound,
@@ -32,6 +34,7 @@ import {
   dispatchCodeWave,
   resolveCodeModeToolResults,
   notifyTurnAttached,
+  startServer,
 } from "../src/server.mjs";
 
 const GREP_SCHEMA = {
@@ -63,7 +66,6 @@ function fakeCodeSession(overrides = {}) {
   return {
     key: "k-test",
     bucket: "b-test",
-    codeMode: true,
     clientTools: CLIENT_TOOLS,
     codeRun: null,
     syntheticToCode: new Map(),
@@ -302,15 +304,6 @@ test("CODE_MODE_APPEND has decision rule, read-only carve-out, dependency guard,
   assert.match(a, /node --test/);
 });
 
-test("NATIVE_PARALLEL_APPEND has use_parallel_tool_calls block with dependency guard", () => {
-  const n = NATIVE_PARALLEL_APPEND;
-  assert.match(n, /<use_parallel_tool_calls>/);
-  assert.match(n, /make all of the independent tool calls in parallel/);
-  assert.match(n, /read-only commands/i);
-  assert.match(n, /do NOT call these tools in parallel and instead call them sequentially/);
-  assert.match(n, /Never use placeholders or guess missing parameters/);
-});
-
 // ---------------------------------------------------------------------------
 // runCodeScriptDynamic (Worker-contained runner)
 // ---------------------------------------------------------------------------
@@ -492,7 +485,7 @@ test("modelObject preserves the requested id and reports a clean display name", 
 // buildParkingMcpServer
 // ---------------------------------------------------------------------------
 
-test("buildParkingMcpServer exposes code plus original tools in code mode", () => {
+test("buildParkingMcpServer exposes only code while preserving script tool catalog", () => {
   const session = fakeCodeSession({ inputParsers: new Map() });
   let captured = null;
   buildParkingMcpServer(
@@ -504,7 +497,7 @@ test("buildParkingMcpServer exposes code plus original tools in code mode", () =
     (config) => { captured = config; return { ok: true }; },
   );
   const names = captured.tools.map((t) => t.name);
-  assert.deepEqual(names, ["code", "Grep", "AskUser"]);
+  assert.deepEqual(names, ["code"]);
   assert.equal(session.clientTools.has("Grep"), true);
   assert.equal(session.clientTools.has("AskUser"), true);
   assert.equal(session.inputParsers.has("Grep"), true);
@@ -619,6 +612,51 @@ test("dispatchCodeWave waits for HTTP turn attachment then fabricates", async ()
   notifyTurnAttached(session);
 
   assert.equal(resolvedTurn, true, "HTTP turn closed so the client can execute the tool");
+  const tu = events.find((e) => e.type === "content_block_start" && e.content_block?.type === "tool_use");
+  assert.equal(tu?.content_block?.id, syn0);
+
+  await resolveCodeModeToolResults(session, [
+    { tool_use_id: syn0, content: [{ type: "text", text: "done" }] },
+  ]);
+  const results = await p;
+  assert.equal(results[0].text, "done");
+});
+
+test("notifyTurnAttached waits for a response sink before fabricating", async () => {
+  const events = [];
+  let resolvedTurn = false;
+  const session = fakeCodeSession({
+    model: "claude-opus-4-8",
+    currentTurn: null,
+    res: null,
+    nonStream: null,
+  });
+  initMessageProjection(session);
+  const codeId = "toolu_code_main";
+  const syn0 = syntheticIdFor(codeId, 1, 0);
+  session.codeRun = {
+    codeId,
+    aborted: false,
+    currentWave: null,
+    preamble: null,
+    waveSeq: 0,
+    waveCount: 0,
+    callCount: 0,
+  };
+
+  const p = dispatchCodeWave(session, codeId, 1, [
+    { name: "Grep", args: { pattern: "x", path: "/r" } },
+  ]);
+  session.currentTurn = { resolve: () => { resolvedTurn = true; } };
+  notifyTurnAttached(session);
+
+  assert.equal(session.codeRun.currentWave?.dispatched, false);
+  assert.equal(resolvedTurn, false);
+
+  session.res = { writableEnded: false, write: (s) => { const m = s.match(/^data: (.+)\n\n$/m); if (m) events.push(JSON.parse(m[1])); } };
+  notifyTurnAttached(session);
+
+  assert.equal(resolvedTurn, true);
   const tu = events.find((e) => e.type === "content_block_start" && e.content_block?.type === "tool_use");
   assert.equal(tu?.content_block?.id, syn0);
 
@@ -769,14 +807,29 @@ test("hasActiveToolRound includes code run and codeDriving", () => {
 });
 
 // ---------------------------------------------------------------------------
-// persistResumeIndex (no-op for code mode)
+// persistResumeIndex
 // ---------------------------------------------------------------------------
 
-// Code-mode SDK resume is disabled, so persistResumeIndex is a no-op for
-// code-mode sessions (it returns before touching the index).
-test("persistResumeIndex is no-op for code-mode sessions", () => {
-  const session = { codeMode: true, sdkSessionId: "sdk-1", seenCount: 2, seenHash: "abc" };
-  persistResumeIndex(session, "model", "sys", []);
+test("persistResumeIndex writes code-mode resume entries", () => {
+  const dir = mkdtempSync(join(tmpdir(), "claude-agent-api-resume-"));
+  const indexPath = join(dir, "resume-index.json");
+  const server = startServer({ port: 0, profileDir: dir });
+  try {
+    const messages = [{ role: "user", content: [{ type: "text", text: "start" }] }];
+    const session = {
+      sdkSessionId: "sdk-1",
+      bucket: bucketKey("sys", messages),
+      seenCount: 1,
+      seenHash: hashMessages(messages, 1),
+    };
+    persistResumeIndex(session, "model", "sys", messages, indexPath);
+    const parsed = JSON.parse(readFileSync(indexPath, "utf8"));
+    assert.equal(parsed.entries.length, 1);
+    assert.equal(parsed.entries[0].sdkSessionId, "sdk-1");
+    assert.equal(parsed.entries[0].codeMode, true);
+  } finally {
+    server.close();
+  }
 });
 
 // ---------------------------------------------------------------------------
