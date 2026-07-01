@@ -9,6 +9,7 @@ import {
   needsStructuredOutputPassthrough,
   anthropicPassthroughHeaders,
   forwardAnthropicMessages,
+  rateLimitHeadersFromInfo,
 } from "../src/server.mjs";
 
 test("needsStructuredOutputPassthrough detects output_config.format", () => {
@@ -116,6 +117,29 @@ test("anthropicPassthroughHeaders forwards auth and anthropic headers", () => {
   assert.equal(headers.accept, "text/event-stream");
 });
 
+test("rateLimitHeadersFromInfo normalizes SDK utilization values", () => {
+  assert.deepEqual(
+    rateLimitHeadersFromInfo({
+      five_hour: { utilization: 23.5, resetsAt: "2026-01-01T00:00:00Z" },
+      seven_day: { used_percentage: 0.412 },
+    }),
+    {
+      "anthropic-ratelimit-unified-5h-utilization": "0.235",
+      "anthropic-ratelimit-unified-7d-utilization": "0.412",
+    },
+  );
+  assert.deepEqual(
+    rateLimitHeadersFromInfo({
+      five_hour: { utilization: -5 },
+      seven_day: { utilization: 250 },
+    }),
+    {
+      "anthropic-ratelimit-unified-5h-utilization": "0",
+      "anthropic-ratelimit-unified-7d-utilization": "1",
+    },
+  );
+});
+
 test("forwardAnthropicMessages relays body and status from upstream", async () => {
   const prevOrigin = process.env.ANTHROPIC_API_ORIGIN;
   const upstream = http.createServer((req, res) => {
@@ -126,7 +150,12 @@ test("forwardAnthropicMessages relays body and status from upstream", async () =
     req.on("data", (c) => { body += c; });
     req.on("end", () => {
       assert.deepEqual(JSON.parse(body), { model: "claude-haiku-4-5", messages: [{ role: "user", content: "hook" }] });
-      res.writeHead(200, { "content-type": "application/json" });
+      res.writeHead(200, {
+        "content-type": "application/json",
+        "anthropic-ratelimit-requests-limit": "1000",
+        "anthropic-ratelimit-tokens-remaining": "9000",
+        "anthropic-ratelimit-unified-5h-utilization": "0.235",
+      });
       res.end(JSON.stringify({ id: "msg_test", type: "message", role: "assistant", content: [{ type: "text", text: '{"ok":true}' }] }));
     });
   });
@@ -159,6 +188,7 @@ test("forwardAnthropicMessages relays body and status from upstream", async () =
         if (chunk) this.chunks.push(chunk);
         resolve({
           status: this.statusCode,
+          headers: this.outHeaders,
           body: Buffer.concat(this.chunks).toString("utf8"),
         });
       },
@@ -173,4 +203,7 @@ test("forwardAnthropicMessages relays body and status from upstream", async () =
   assert.equal(result.status, 200);
   const parsed = JSON.parse(result.body);
   assert.equal(parsed.content[0].text, '{"ok":true}');
+  assert.equal(result.headers["anthropic-ratelimit-requests-limit"], "1000");
+  assert.equal(result.headers["anthropic-ratelimit-tokens-remaining"], "9000");
+  assert.equal(result.headers["anthropic-ratelimit-unified-5h-utilization"], "0.235");
 });

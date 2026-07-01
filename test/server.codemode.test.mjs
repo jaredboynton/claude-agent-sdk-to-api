@@ -35,6 +35,8 @@ import {
   notifyTurnAttached,
   startServer,
   startCodeRun,
+  rememberRateLimitHeaders,
+  writeEvent,
 } from "../src/server.mjs";
 
 const GREP_SCHEMA = {
@@ -60,6 +62,7 @@ const GLOB_SCHEMA = {
 const CLIENT_TOOLS = new Map([
   ["Grep", { description: "grep", input_schema: GREP_SCHEMA }],
   ["Glob", { description: "glob", input_schema: GLOB_SCHEMA }],
+  ["Execute", { description: "execute", input_schema: { type: "object", properties: { command: { type: "string" } }, required: ["command"] } }],
 ]);
 
 function fakeCodeSession(overrides = {}) {
@@ -533,6 +536,36 @@ test("projectEvent projects normally when not codeDriving (no code block)", () =
   assert.equal(starts[0].content_block.type, "text");
 });
 
+test("writeEvent injects latest rate-limit headers before first SSE chunk", () => {
+  const chunks = [];
+  const session = fakeCodeSession({
+    res: {
+      headersSent: false,
+      writableEnded: false,
+      statusCode: null,
+      headers: null,
+      writeHead(status, headers) {
+        this.headersSent = true;
+        this.statusCode = status;
+        this.headers = headers;
+      },
+      write(chunk) { chunks.push(chunk); return true; },
+    },
+  });
+  rememberRateLimitHeaders(session, {
+    five_hour: { utilization: 23.5 },
+    seven_day: { utilization: 0.412 },
+  });
+
+  writeEvent(session, { type: "message_stop" });
+
+  assert.equal(session.res.statusCode, 200);
+  assert.equal(session.res.headers["content-type"], "text/event-stream");
+  assert.equal(session.res.headers["anthropic-ratelimit-unified-5h-utilization"], "0.235");
+  assert.equal(session.res.headers["anthropic-ratelimit-unified-7d-utilization"], "0.412");
+  assert.match(chunks[0], /^event: message_stop\n/);
+});
+
 test("dispatchCodeWave emits immediately on the attached HTTP turn", async () => {
   const events = [];
   let resolvedTurn = false;
@@ -571,6 +604,83 @@ test("dispatchCodeWave emits immediately on the attached HTTP turn", async () =>
   ]);
   const results = await resultPromise;
   assert.equal(results[0].text, "ok");
+});
+
+test("dispatchCodeWave resolves a final errored tool_result without wedging", async () => {
+  const session = fakeCodeSession({
+    model: "claude-opus-4-8",
+    currentTurn: { resolve: () => {} },
+    res: { writableEnded: false, write: () => {} },
+  });
+  initMessageProjection(session);
+  const codeId = "toolu_code_main";
+  const syn0 = syntheticIdFor(codeId, 1, 0);
+  session.codeRun = {
+    codeId,
+    aborted: false,
+    currentWave: null,
+    preamble: null,
+    waveSeq: 0,
+    waveCount: 0,
+    callCount: 0,
+  };
+
+  const resultPromise = dispatchCodeWave(session, codeId, 1, [
+    { name: "Execute", args: { command: "cd /tmp/missing" } },
+  ]);
+
+  await resolveCodeModeToolResults(session, [
+    { tool_use_id: syn0, content: [{ type: "text", text: "Command failed (exit code: 1)" }], is_error: true },
+  ]);
+  const results = await resultPromise;
+  assert.equal(results[0].text, "Command failed (exit code: 1)");
+  assert.equal(results[0].isError, true);
+  assert.equal(session.codeRun.currentWave, null);
+  assert.equal(session.syntheticToCode.size, 0);
+});
+
+test("dispatchCodeWave stays pending when the final tool_result id is unmatched (wedge repro)", async () => {
+  const session = fakeCodeSession({
+    model: "claude-opus-4-8",
+    currentTurn: { resolve: () => {} },
+    res: { writableEnded: false, write: () => {} },
+  });
+  initMessageProjection(session);
+  const codeId = "toolu_code_main";
+  const syn0 = syntheticIdFor(codeId, 1, 0);
+  session.codeRun = {
+    codeId,
+    aborted: false,
+    currentWave: null,
+    preamble: null,
+    waveSeq: 0,
+    waveCount: 0,
+    callCount: 0,
+  };
+
+  const resultPromise = dispatchCodeWave(session, codeId, 1, [
+    { name: "Execute", args: { command: "cd /tmp/missing" } },
+  ]);
+
+  let settled = false;
+  resultPromise.then(
+    () => { settled = true; },
+    () => { settled = true; },
+  );
+
+  await resolveCodeModeToolResults(session, [
+    { tool_use_id: "toolu_code_wrong_w1_0", content: [{ type: "text", text: "Command failed (exit code: 1)" }], is_error: true },
+  ]);
+  await Promise.resolve();
+
+  assert.equal(settled, false);
+  assert.equal(session.codeRun.currentWave?.pending.has(syn0), true);
+  assert.equal(session.syntheticToCode.get(syn0), codeId);
+
+  clearAllCodeState(session);
+  const results = await resultPromise;
+  assert.equal(results[0].text, "code round abandoned");
+  assert.equal(results[0].isError, true);
 });
 
 test("dispatchCodeWave waits for HTTP turn attachment then fabricates", async () => {

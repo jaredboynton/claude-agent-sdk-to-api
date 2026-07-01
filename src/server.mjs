@@ -594,17 +594,82 @@ function toUserFrame(message) {
   return { type: "user", message: { role: "user", content }, parent_tool_use_id: null };
 }
 
-function jsonResp(res, status, body) {
+function jsonResp(res, status, body, extraHeaders = {}) {
   const payload = JSON.stringify(body);
   res.writeHead(status, {
     "content-type": "application/json",
     "content-length": Buffer.byteLength(payload),
+    ...extraHeaders,
   });
   res.end(payload);
 }
 
 function sseEvent(eventType, data) {
   return `event: ${eventType}\ndata: ${JSON.stringify(data)}\n\n`;
+}
+
+function normalizeRateLimitUtilization(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  const normalized = n > 1 ? n / 100 : n;
+  return Math.min(1, Math.max(0, normalized));
+}
+
+function rateLimitUtilization(info) {
+  if (!info || typeof info !== "object") return null;
+  return normalizeRateLimitUtilization(info.utilization ?? info.used_percentage ?? info.used_percent);
+}
+
+function rateLimitHeadersFromInfo(rateLimitInfo) {
+  if (!rateLimitInfo || typeof rateLimitInfo !== "object") return {};
+  const headers = {};
+  const fiveHour = rateLimitUtilization(rateLimitInfo.five_hour);
+  if (fiveHour != null) headers["anthropic-ratelimit-unified-5h-utilization"] = String(fiveHour);
+  const sevenDay = rateLimitUtilization(rateLimitInfo.seven_day);
+  if (sevenDay != null) headers["anthropic-ratelimit-unified-7d-utilization"] = String(sevenDay);
+  return headers;
+}
+
+let lastRateLimitHeaders = {};
+
+function rememberRateLimitHeaders(session, rateLimitInfo) {
+  const headers = rateLimitHeadersFromInfo(rateLimitInfo);
+  if (!Object.keys(headers).length) return headers;
+  session.rateLimitHeaders = headers;
+  session.rateLimitResetsAt = {
+    five_hour: rateLimitInfo?.five_hour?.resetsAt ?? rateLimitInfo?.five_hour?.resets_at,
+    seven_day: rateLimitInfo?.seven_day?.resetsAt ?? rateLimitInfo?.seven_day?.resets_at,
+  };
+  lastRateLimitHeaders = headers;
+  return headers;
+}
+
+function latestRateLimitHeaders(session) {
+  return { ...(session?.rateLimitHeaders || lastRateLimitHeaders || {}) };
+}
+
+function ensureSseHeaders(session) {
+  const res = session?.res;
+  if (!res || res.headersSent || session.sseHeadersWritten) return;
+  const headers = {
+    "content-type": "text/event-stream",
+    "cache-control": "no-cache",
+    connection: "keep-alive",
+    ...latestRateLimitHeaders(session),
+  };
+  if (typeof res.writeHead === "function") {
+    res.writeHead(200, headers);
+  } else if (typeof res.setHeader === "function") {
+    for (const [k, v] of Object.entries(headers)) res.setHeader(k, v);
+    res.statusCode = 200;
+  }
+  session.sseHeadersWritten = true;
+  res.flushHeaders?.();
+}
+
+function writeSseChunk(session, chunk) {
+  ensureSseHeaders(session);
+  session.res.write(chunk);
 }
 
 // Reconstruct content blocks from Anthropic stream events (non-streaming mode).
@@ -1493,6 +1558,9 @@ function createSession(key, model, tools, callerSystem, bucket, { resume, cwd = 
     nonStream: null,              // { blocks, stopReason } when buffering for non-stream
     lastUsage: { input_tokens: 0, output_tokens: 0 },
     lastRawUsage: null,           // full-shape upstream usage for client replay
+    rateLimitHeaders: {},
+    rateLimitResetsAt: null,
+    sseHeadersWritten: false,
     lastActivity: Date.now(),
     closed: false,
     turnMetrics: null,
@@ -1542,7 +1610,9 @@ async function consumeSession(session) {
     for await (const msg of session.query) {
       session.lastActivity = Date.now();
       if (msg.session_id) session.sdkSessionId = msg.session_id;
-      if (msg.type === "stream_event" && msg.event) {
+      if (msg.type === "rate_limit_event") {
+        rememberRateLimitHeaders(session, msg.rate_limit_info ?? msg.rate_limit_event?.rate_limit_info);
+      } else if (msg.type === "stream_event" && msg.event) {
         const ev = msg.event;
         noteStreamTiming(session, ev);
         // A new assistant message begins a fresh tool round. Clear the per-message
@@ -1668,7 +1738,7 @@ function writeEvent(session, ev) {
     return;
   }
   if (session.res && !session.res.writableEnded) {
-    session.res.write(sseEvent(ev.type, ev));
+    writeSseChunk(session, sseEvent(ev.type, ev));
   }
 }
 
@@ -1879,11 +1949,19 @@ async function forwardAnthropicMessages(req, res, rawBody, rawUrl) {
       signal: AbortSignal.timeout(600000),
     });
     const outHeaders = {};
-    for (const h of ["content-type", "cache-control", "request-id", "anthropic-ratelimit-requests-limit"]) {
+    up.headers.forEach((v, h) => {
+      if (h.startsWith("anthropic-ratelimit-")) outHeaders[h] = v;
+    });
+    for (const h of ["content-type", "cache-control", "request-id"]) {
       const v = up.headers.get(h);
       if (v) outHeaders[h] = v;
     }
-    res.writeHead(up.status, outHeaders);
+    if (typeof res.writeHead === "function") {
+      res.writeHead(up.status, outHeaders);
+    } else if (typeof res.setHeader === "function") {
+      for (const [k, v] of Object.entries(outHeaders)) res.setHeader(k, v);
+      res.statusCode = up.status;
+    }
     if (up.body) {
       for await (const chunk of up.body) {
         if (!res.writableEnded) res.write(chunk);
@@ -2030,14 +2108,10 @@ async function handleMessages(req, res) {
   });
 
   if (isStream) {
-    res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
-    res.flushHeaders?.();
     session.res = res;
+    session.sseHeadersWritten = false;
     session.nonStream = null;
-    if (action === "cold" || action === "resume" || action === "resume-catchup") {
-      res.write(": warming up\n\n");
-    }
-    heartbeat = setInterval(() => { if (!res.writableEnded) res.write(`: keep-alive\n\n`); }, HEARTBEAT_MS);
+    heartbeat = setInterval(() => { if (!res.writableEnded) writeSseChunk(session, `: keep-alive\n\n`); }, HEARTBEAT_MS);
     // A response close before writableEnded means the client did not receive
     // the full streamed turn. If that turn was a fabricated code wave, no
     // reliable tool_result can arrive for it, so abort the parked code run.
@@ -2084,9 +2158,9 @@ async function handleMessages(req, res) {
     if (session.currentTurn) {
       if (isStream) {
         if (!res.writableEnded) {
-          res.write(sseEvent("message_start", { type: "message_start", message: { id: `msg_${Date.now()}`, type: "message", role: "assistant", model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } } }));
-          res.write(sseEvent("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 0 } }));
-          res.write(sseEvent("message_stop", { type: "message_stop" }));
+          writeSseChunk(session, sseEvent("message_start", { type: "message_start", message: { id: `msg_${Date.now()}`, type: "message", role: "assistant", model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } } }));
+          writeSseChunk(session, sseEvent("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 0 } }));
+          writeSseChunk(session, sseEvent("message_stop", { type: "message_stop" }));
         }
       } else {
         session.nonStream = { blocks: [], stopReason: "end_turn" };
@@ -2122,7 +2196,7 @@ async function handleMessages(req, res) {
     if (session.currentTurn) failTurn(session, e);
     if (isStream) {
       if (!res.writableEnded) {
-        res.write(sseEvent("error", { type: "error", error: { type: "api_error", message: String(e?.message || e) } }));
+        writeSseChunk(session, sseEvent("error", { type: "error", error: { type: "api_error", message: String(e?.message || e) } }));
         res.end();
       }
     } else {
@@ -2156,7 +2230,7 @@ async function handleMessages(req, res) {
       stop_reason: stopReason,
       stop_sequence: null,
       usage: session.lastUsage,
-    });
+    }, latestRateLimitHeaders(session));
   }
 }
 
@@ -2172,11 +2246,9 @@ const OAUTH_PASS_THROUGH_PATHS = new Set([
 
 // Forward an OAuth usage request to the real Anthropic endpoint, preserving
 // the client's Authorization header. The proxy does not see or store the
-// token. Used so Claude Code's statusbar rate_limits populate correctly when
-// ANTHROPIC_BASE_URL points at this proxy. Claude Code only issues this GET
-// once it treats the base URL as first-party — the launcher sets
-// _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1 for that; without it the TUI
-// suppresses the fetch entirely (so this handler is never called).
+// token. Claude Code only issues this GET once it treats the base URL as
+// first-party — the launcher sets _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1
+// for that; without it the TUI suppresses the fetch entirely.
 async function forwardOauthUsage(req, res, rawUrl) {
   const headers = { "accept": "application/json" };
   const auth = req.headers["authorization"];
@@ -2369,6 +2441,11 @@ export {
   modelObject,
   resolveCwd,
   isValidCwd,
+  normalizeRateLimitUtilization,
+  rateLimitHeadersFromInfo,
+  rememberRateLimitHeaders,
+  latestRateLimitHeaders,
+  ensureSseHeaders,
   needsStructuredOutputPassthrough,
   anthropicPassthroughHeaders,
   forwardAnthropicMessages,
