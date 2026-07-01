@@ -262,6 +262,15 @@ test("buildCodeToolDescription includes intelligent-logic and anchored-edit guid
   assert.match(d, /avoid full-file or whole-line rewrites/);
 });
 
+test("buildCodeToolDescription includes output mechanics", () => {
+  const d = buildCodeToolDescription(new Map());
+  assert.match(d, /OUTPUT MECHANICS/);
+  assert.match(d, /raw tool results are for the script only/);
+  assert.match(d, /small, decision-ready object/);
+  assert.match(d, /Do not return raw Read\/file contents/);
+  assert.match(d, /Filter\/map\/reduce inside JavaScript/);
+});
+
 test("buildCodeToolDescription includes decision rule, read-only carve-out, dependency guard, JS guard, compact returns, examples", () => {
   const d = buildCodeToolDescription(new Map());
   // pre-wave decision rule: write B's args before A returns

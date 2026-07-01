@@ -1,22 +1,22 @@
 # Code Mode — Cache-Cost Savings Analysis
 
-_How the `code({ script })` meta-tool reduces Anthropic prompt-cache spend. Prices are the Opus 4.8 card ($/MTok): input $5.00, cache read $0.50 (0.1×), **cache write $10.00 (1h TTL, 2×)**, output $25.00. Writes are priced at the 1-hour TTL throughout because the bundled Claude Code (v2.1.196) puts the SDK `querySource` on the `tengu_prompt_cache_1h_config` allowlist, so all SDK traffic uses 1h caching (the cheaper 5m write at $6.25/1.25× only applies if you force it via `FORCE_PROMPT_CACHING_5M`, which we don't), and the measured corpus confirms 99.7% of cache-creation tokens are 1h._
+_How the `code({ script })` meta-tool reduces Anthropic prompt-cache spend. Prices are the Opus 4.8 card ($/MTok): input $5.00, cache read $0.50 (0.1×), **cache write $10.00 (1h TTL, 2×)**, output $25.00. Writes are priced at the 1-hour TTL throughout because the bundled Claude Code (v2.1.196) puts the SDK `querySource` on the `tengu_prompt_cache_1h_config` allowlist, so all SDK traffic uses 1h caching (the cheaper 5m write at $6.25/1.25× only applies if you force it via `FORCE_PROMPT_CACHING_5M`, which we don't), and the measured corpus confirms 98.7% of cache-creation tokens are 1h._
 
-> Status: **measured from receipts.** The code-mode figures below come from **594 code-mode turns across 64 conversations** captured by `--cache-log` (per-turn `read`/`create`/`input`/`output` + `codeWaves`/`codeSubCalls`/`scriptOutBytes`), priced with the Opus card. The normal-mode comparison baseline is **2,411 Claude Code sessions / 101,524 API responses** mined from local transcripts.
+> Status: **measured from receipts.** The code-mode figures below come from **1,645 code-mode turns across 302 conversations** captured by `--cache-log` (per-turn `read`/`create`/`input`/`output` + `codeWaves`/`codeSubCalls`/`scriptOutBytes`), priced with the Opus card for apples-to-apples projections. The normal-mode comparison baseline is **2,889 Claude Code sessions / 101,936 API responses** mined from local transcripts.
 
 ## TL;DR
 
 Code mode cuts prompt-cache cost two ways at once:
 
-1. **Fewer model round-trips** — each round-trip re-reads the *entire* cached prefix. Real Claude Code serializes tools (**1.12 ops/round-trip**, parallelizing only 7.3% of the time); code mode runs **2.85 tool calls per `code` call** (measured), doing the same work in ~2.5× fewer full-prefix reads.
-2. **Less transcript bloat** — raw tool outputs never enter the model context; only the script's return value does (measured compression **0.46×**). This shrinks every subsequent cache read **and** the one-time cache write.
+1. **Fewer model round-trips** — each round-trip re-reads the *entire* cached prefix. Real Claude Code serializes tools (**1.12 ops/round-trip**, parallelizing only 7.4% of the time); code mode runs **5.53 tool calls per synthetic wave** (measured), doing the same work in ~4.9× fewer full-prefix reads.
+2. **Less transcript bloat** — raw tool outputs never enter the model context; only the script's return value does (measured compression **0.38×**). This shrinks every subsequent cache read **and** the one-time cache write.
 
 | Lever | Reduction (short-session → long-session) |
 |---|---|
-| cache **read** | **56% → 80%** (grows with session length; reads are quadratic in length) |
-| cache **write** | **~54%** (all session lengths) |
+| cache **read** | **80% → 92%** (grows with session length; reads are quadratic in length) |
+| cache **write** | **~62%** (long-session limit; lower for short sessions where the fixed baseline dominates) |
 
-**Org extrapolation (hypothetical):** on **$1M/yr** of agentic (Claude-Code-style) spend — ~84% of which is cache operations (read 46% + write 38%) — applying these bands with a batchability haircut yields **~$290K/yr (conservative) → ~$510K/yr (aggressive)** in avoided cache spend, i.e. **~29% → ~51% of the bill**. For scale, a cache-break *preservation* lever (recovering the ~2% of requests that miss cache) tops out at ~$16K/yr on the same $1M; code mode acts on the read/write **volume of the 98% that already hit**, a structurally larger lever.
+**Org extrapolation (hypothetical):** on **$1M/yr** of agentic (Claude-Code-style) spend — ~84% of which is cache operations (read 46% + write 38%) — applying these bands with a batchability haircut yields **~$370K/yr (conservative) → ~$530K/yr (aggressive)** in avoided cache spend, i.e. **~37% → ~53% of the bill**. For scale, a cache-break *preservation* lever (recovering the ~2% of requests that miss cache) tops out at ~$16K/yr on the same $1M; code mode acts on the read/write **volume of the 98% that already hit**, a structurally larger lever.
 
 ---
 
@@ -33,23 +33,23 @@ Code mode attacks both:
 
 ## 2. Measured parameters
 
-Normal-mode baseline mined from `~/.claude-/projects/**/*.jsonl` (2,411 sessions), **keyed by `message.id`** so one API response counts once (Claude Code splits a response across several JSONL lines — naive per-line counting double-counts usage and hides parallel tools). Code-mode figures from the live `cache-log.jsonl`.
+Normal-mode baseline mined from `~/.claude-/projects/**/*.jsonl` (2,889 sessions), **grouped by `message.id`** so one API response counts once while still unioning split `tool_use` chunks (Claude Code splits a response across several JSONL lines — naive per-line counting double-counts usage; naive first-line dedupe hides parallel tools). Code-mode figures come from the live `cache-log.jsonl` files under `.claude`, `.claude-`, and `.claude-work`.
 
 | Symbol | Meaning | Value | Source |
 |---|---|---|---|
-| `ρ` | raw tool output per op (tokens) | **719** | mean of **90,948** real `tool_result` bodies (median 51 B, p90 4.4 KB) |
-| `p_n` | tool ops per round-trip, normal mode | **1.12** | 75,344 tool-bearing responses; median 1, p90 1, max 15; **only 7.3% parallelize** |
-| `p_c` | tool calls per `code` call (across all waves) | **2.85** | measured: 279 sub-calls / 98 waves across 594 code-mode turns — real in-script parallelism (`subcalls/wave`) |
-| `c` | code-return compression = `r / (s·ρ)` | **0.46** | 11,901 returned tok / 25,884 raw-equiv tok |
+| `ρ` | raw tool output per op (tokens) | **719** | mean of **95,037** real `tool_result` bodies (median 80 B, p90 4.6 KB) |
+| `p_n` | tool ops per round-trip, normal mode | **1.12** | 75,839 tool-bearing responses; median 1, p90 1, max 35; **only 7.4% parallelize** |
+| `p_c` | tool calls per synthetic code wave | **5.53** | measured: 1,201 sub-calls / 217 waves across 1,645 code-mode turns — real in-script parallelism (`subcalls/wave`) |
+| `c` | code-return compression = `r / (s·ρ)` | **0.38** | 332,129 returned tok / 863,138 raw-equiv tok |
 | `B` | cached baseline (system + tool schemas + seed) | **~12,000** | estimate; matters only for short sessions |
 
-**Real Claude Code is serial.** Across 101,524 API responses, the model emits ~1 tool per turn and parallelizes only 7.3% of the time — so the round-trip lever (`p_n → p_c`) is ~2.5× (1.12 → 2.85 measured), roughly **double** an earlier per-line estimate (2.27) that was inflated by message splitting.
+**Real Claude Code is serial.** Across 101,936 API responses, the model emits ~1 tool per turn and parallelizes only 7.4% of the time — so the round-trip lever (`p_n → p_c`) is ~4.9× (1.12 → 5.53 measured).
 
-**Cache TTL is 1h** (priced $10/MTok, 2× — see header). In the code-mode corpus, **99.7%** of cache-creation tokens are 1h, matching the normal-mode 92%.
+**Cache TTL is 1h** (priced $10/MTok, 2× — see header). In the code-mode corpus, **98.7%** of cache-creation tokens are 1h, matching the normal-mode tendency toward 1h writes.
 
-**Measured code-mode bill shape (594 turns / 64 conversations, $133 total spend):** cache **create 59%** / cache **read 31%** / output 9% / input 0.4% — cache ops = **90.5%** of the bill. read:create token ratio **10.7 : 1** (vs 23.6:1 normal mode — code mode roughly halves it). Mean cache **hit ratio 0.887**. Per conversation: mean **$2.08**, median **$1.40**, max $12.51.
+**Measured code-mode bill shape (1,645 turns / 302 conversations, $392 total spend under Opus pricing):** cache **create 66%** / cache **read 25%** / output 9% / input 0.2% — cache ops = **91.1%** of the bill. read:create token ratio **7.6 : 1**. Mean cache **hit ratio 0.884**. Per conversation: mean **$1.30**, median **$0.78**, p90 **$2.85**, max **$14.43**.
 
-**The shape inverts under code mode.** Normal mode is read-dominated (46% read / 38% write) because each serial round-trip re-reads a growing raw-output transcript. Code mode is **write-dominated** (59% create / 31% read): slim script-return transcripts mean far less read *growth*, so the one-time-ish 1h cache **writes** (system + ~32 tool schemas at 2×) become the larger bucket. This is the bloat lever working — read volume is suppressed, leaving writes as the dominant cost.
+**The shape inverts under code mode.** Normal mode is read-dominated (46% read / 38% write) because each serial round-trip re-reads a growing raw-output transcript. Code mode is **write-dominated** (66% create / 25% read): slim script-return transcripts mean far less read *growth*, so the one-time-ish 1h cache **writes** (system + tool schemas at 2×) become the larger bucket. This is the bloat lever working — read volume is suppressed, leaving writes as the dominant cost.
 
 ---
 
@@ -69,9 +69,9 @@ where `W` = total tool operations, `T = W/p` round-trips, priced at read $0.50 /
 
 **Asymptotic reduction ratios (code ÷ normal):**
 
-- cache read, short-session limit (baseline-dominated): `p_n/p_c` = **0.44 → 56% reduction**
-- cache read, long-session limit (the W² term dominates): `c · p_n/p_c` = **0.20 → 80% reduction**
-- cache write (all lengths): `c` = **0.46 → 54% reduction**
+- cache read, short-session limit (baseline-dominated): `p_n/p_c` = **0.20 → 80% reduction**
+- cache read, long-session limit (the W² term dominates): `c · p_n/p_c` = **0.08 → 92% reduction**
+- cache write, long-session limit: `c` = **0.38 → 62% reduction**
 
 The read win *grows with session length* because the quadratic term rewards slimmer per-turn growth — long agentic sessions benefit most.
 
@@ -81,11 +81,11 @@ The read win *grows with session length* because the quadratic term rewards slim
 
 | W (tool ops) | round-trips n→c | cache-read reduction | cache-write reduction | $ saved / session |
 |---|---|---|---|---|
-| 20 | 18 → 8 | 65% | 29% | $0.19 |
-| 50 | 45 → 19 | 71% | 40% | $0.67 |
-| 100 | 89 → 39 | 74% | 46% | $1.97 |
-| 300 | 268 → 117 | 78% | 51% | $13.62 |
-| 800 | 714 → 311 | 79% | 53% | $87.65 |
+| 20 | 18 → 4 | 84% | 34% | $0.23 |
+| 50 | 45 → 10 | 87% | 46% | $0.80 |
+| 100 | 90 → 19 | 89% | 53% | $2.34 |
+| 300 | 268 → 55 | 91% | 58% | $15.87 |
+| 800 | 713 → 145 | 92% | 60% | $101.30 |
 
 (Assumes every op is batchable — the ceiling. §5 applies a batchability haircut.)
 
@@ -106,9 +106,9 @@ Applying the reduction bands to the cache buckets, with a batchability haircut (
 
 | Scenario | assumptions | cache-read saved | cache-write saved | **Total /yr (per $1M)** |
 |---|---|---|---|---|
-| Conservative | read −60%, 60% batchable | $165K | $122K | **$287K (~29%)** |
-| Moderate | read −72%, 75% batchable | $248K | $152K | **$400K (~40%)** |
-| Aggressive | read −80%, 90% batchable | $330K | $183K | **$513K (~51%)** |
+| Conservative | read −60%, 60% batchable; write −54% | $165K | $203K | **$368K (~37%)** |
+| Moderate | read −72%, 75% batchable; write −54% | $248K | $203K | **$451K (~45%)** |
+| Aggressive | read −80%, 90% batchable; write −54% | $330K | $203K | **$534K (~53%)** |
 
 **Context vs a cache-preservation lever:** a *preservation* play (recovering the ~2% of requests that miss cache) tops out at **~$16K/yr** on the same $1M because it recovers only the miss tail. Code mode reduces the read/write **volume on the 98% that hit**, so it operates on the whole bill, not the break tail — an order of magnitude larger, at the cost of changing model behavior (and the reliability tax in §2).
 
@@ -116,15 +116,15 @@ Applying the reduction bands to the cache buckets, with a batchability haircut (
 
 ## 6. Caveats
 
-- **`p_c` and `c` now measured at scale.** The batching rate (2.85 calls/code-call) and bill shape come from 594 code-mode turns across 64 conversations; compression `c` (0.46) is still a smaller sample. `p_n`, `ρ`, TTL are robust (2,411 sessions).
-- **Code mode is write-dominated in practice.** The measured shape (59% create / 31% read) means the biggest remaining lever is the one-time 1h cache *write* of the system + ~32 tool schemas at 2×, not read growth — worth watching if the tool catalog grows.
-- **Batchability is the real uncertainty.** The mechanics give a 56–80% read lever, but realized savings = `batchability × lever`. Data-dependent chains (read → decide → act) can't collapse into one manifest. The §5 spread is mostly this knob.
-- **`ρ` and `c` vary widely.** Tool results are tiny at the median (51 B) but heavy-tailed (p90 4.4 KB); a few large script dumps erode the bloat win. The 0.1.6 typed-signature description and the "return only what you need" nudge push `c` down.
+- **`p_c` and `c` are now measured at larger scale.** The batching rate (5.53 subcalls/wave) and bill shape come from 1,645 code-mode turns across 302 conversations. The Opus-only slice is more conservative (2.96 subcalls/wave, `c = 0.84`) because a few large script returns dominate that smaller sample; the all-log corpus better reflects mixed real server usage.
+- **Code mode is write-dominated in practice.** The measured shape (66% create / 25% read) means the biggest remaining lever is the one-time 1h cache *write* of the system + tool schemas at 2×, not read growth — worth watching if the tool catalog grows.
+- **Batchability is the real uncertainty.** The mechanics give an 80–92% read lever, but realized savings = `batchability × lever`. Data-dependent chains (read → decide → act) can't collapse into one manifest. The §5 spread is mostly this knob.
+- **`ρ` and `c` vary widely.** Tool results are tiny at the median (80 B) but heavy-tailed (p90 4.6 KB); a few large script dumps erode the bloat win. The typed-signature description and the "return only what you need" nudge push `c` down.
 - **No live A/B yet.** These compare a historical normal-mode corpus to a separate code-mode session, not the *same* task both ways.
 - **Baseline `B`** affects only short-session reductions; the long-session regime is dominated by the quadratic term and is insensitive to `B`.
 
 ## 7. Reproduce
 
-- Normal-mode baseline: scan `~/.claude-/projects/**/*.jsonl`, **group assistant events by `message.id`** (dedupe usage; count `tool_use` blocks per response), and read `tool_result` body sizes from user events.
-- Code-mode receipts (implemented): run with `--cache-log` (or `CACHE_LOG=1`) to append per-turn `read`/`create`(5m/1h)/`input`/`output` rows plus `codeSubCalls`/`scriptOutBytes` to `<profileDir>/cache-log.jsonl`, keyed by `conv`. `p_c = Σ codeSubCalls / #code-calls`; `c = Σ scriptOutBytes/4 / (Σ codeSubCalls · ρ)`.
+- Normal-mode baseline: scan `~/.claude-/projects/**/*.jsonl`, **group assistant events by `message.id`** (dedupe usage, but union split `tool_use` blocks per response), and read `tool_result` body sizes from user events.
+- Code-mode receipts (implemented): run with `--cache-log` (or `CACHE_LOG=1`) to append per-turn `read`/`create`(5m/1h)/`input`/`output` rows plus `codeSubCalls`/`codeWaves`/`scriptOutBytes` to `<profileDir>/cache-log.jsonl`, keyed by `conv`. `p_c = Σ codeSubCalls / Σ codeWaves`; `c = Σ scriptOutBytes/4 / (Σ codeSubCalls · ρ)`.
 - Org bill: scale the per-$1M table in §5 to your own annual agentic spend.
