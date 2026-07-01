@@ -226,6 +226,7 @@ export function buildCodeToolDescription(clientTools) {
     + "Runtime API: `await tools.<Name>(args)`, `await tools[\"Any-Name\"](args)`, `await callTool(name, args)`, or `await codemode.call(name, args)`. `codemode.batch([['Tool', args], ...])` starts independent calls together. `codemode.search(query)` finds matching tool docs (top 20), `codemode.list()` enumerates the full catalog, and `codemode.describe(nameOrPath)` returns focused TypeScript-shaped docs for one tool. `await sleep(ms)` pauses (30s cap per call); `await codemode.retry(fn, { attempts, delayMs })` retries a failing async thunk with linear backoff. "
     + "`await codemode.verify(path)` syntax-checks the real file on disk (js/mjs/cjs, py, json, sh) with no extra turn — call it after edits instead of `tools.Bash(\"node --check ...\")`, and check `.isError` on the result. Files you edit are also auto-checked after the run; failures are appended to this result. "
     + "Each tool call returns a string-like `ToolResult` with `{ text, raw, isError }`, optional `.anchored`, `.json()` for JSON text, and `.lines({ trim, nonEmpty })` for line processing. Prefer `.text` for clarity, but string methods like `.includes()` and `.split()` work directly on the result. "
+    + "If the client environment truncated or annotated a tool's output, `.truncated` is true and the injected notices are moved out of `.text` into `.notes` (an array of strings) so they never pollute data processing — treat such `.text` as incomplete (inline `[... truncated ...]` gap markers may remain) and check `.notes` for where the client saved the full output. "
     + "`state` is a persistent object that survives across `code` calls in this conversation (it may be empty after long gaps or restarts): stash parsed files, indexes, and intermediate results there instead of returning them or re-reading files in the next call. `state` is size-capped (~2MB serialized); if a save is rejected you get a `[state NOT saved ...]` notice on that result — keep large raw text out of `state`. When the working directory is a git repo, `state.git` holds a session-start snapshot `{ branch, upstream, ahead, behind, dirty, changes, recentCommits, capturedAt }` (a snapshot, not live status — use `tools.Bash` for fresh state). "
     + "Pure helpers available: `structuredClone`, `URL`/`URLSearchParams`, `atob`/`btoa`, `queueMicrotask`, `TextEncoder`/`TextDecoder`, `crypto.randomUUID()`, `crypto.sha256(data)`. "
     + "Only batch independent calls. If B's args depend on A's result, or the calls have ordered side effects, use separate awaits. For edits, read first; use exact bytes from the read result or start_anchor/end_anchor from `.anchored` when available, and never parallelize multiple edits to the same file. "
@@ -234,6 +235,34 @@ export function buildCodeToolDescription(clientTools) {
     + "The signatures below are TypeScript-shaped docs only; write executable JavaScript, not TypeScript syntax. Args must match the signature: ? means optional, literal unions list allowed values, and Array<T> is an array. Schema descriptions, defaults, examples, formats, and patterns are authoritative.\n\n"
     + (toolBlocks.length ? `Available tools:\n\n${toolBlocks.join("\n\n")}` : "Available tools: (none)")
   );
+}
+
+// Client harnesses (Claude Code, Droid/Factory, ...) inject <system-reminder>
+// blocks and truncation banners INTO tool_result text. Outside code mode those
+// address the model; in code mode the script consumes the text as data, so a
+// banner inside a Grep result becomes phantom file paths and a truncated
+// result silently parses as complete. Pull reminder blocks out of the data
+// into `notes` and flag truncation so both the script (`.truncated`/`.notes`)
+// and the model (run-level note) can react. Bracketed single-line gap markers
+// (e.g. "[... truncated 13519 characters from middle section ...]") stay in
+// the text — removing them would silently close a real hole in the data —
+// but they still set the truncated flag.
+const SYSTEM_REMINDER_RE = /[ \t]*<system-reminder>[\s\S]*?(?:<\/system-reminder>[ \t]*\n?|$)/g;
+const TRUNCATION_LINE_RE = /^\[[^\n\]]*truncat[^\n\]]*\]$/im;
+
+export function extractClientNotices(text) {
+  const original = String(text ?? "");
+  const notices = [];
+  const cleaned = original.replace(SYSTEM_REMINDER_RE, (block) => {
+    const inner = block
+      .replace(/^[ \t]*<system-reminder>/, "")
+      .replace(/<\/system-reminder>[ \t]*\n?$/, "")
+      .trim();
+    if (inner) notices.push(inner);
+    return "";
+  });
+  const truncated = notices.some((n) => /truncat/i.test(n)) || TRUNCATION_LINE_RE.test(cleaned);
+  return { text: cleaned, notices, truncated };
 }
 
 /**

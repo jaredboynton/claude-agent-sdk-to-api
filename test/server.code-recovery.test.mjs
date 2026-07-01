@@ -144,7 +144,8 @@ test("oversized Read splits into chunked tool_uses and stitches to one anchored 
   assert.match(results[0].text, /const v1 = 1;/);
   assert.match(results[0].text, /const v2761 = 2761;/);
   assert.equal(results[0].text.split("mid").length, 1, "intermediate trailers dropped");
-  assert.match(results[0].text, /final/);
+  assert.ok(!/final/.test(results[0].text), "client reminders never pollute .text");
+  assert.ok(results[0].notes.includes("final"), "client reminders surface in .notes");
   assert.ok(results[0].anchored, "stitched read is anchor-annotated");
   assert.equal(session.anchorState.files.get(file).partial, false, "stitched whole-file snapshot is complete");
   assert.equal(session.syntheticToCode.size, 0);

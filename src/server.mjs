@@ -66,6 +66,7 @@ import {
   ledgerEntry,
   codeToolInputShape,
   normalizeClientToolMeta,
+  extractClientNotices,
 } from "./code-mode.mjs";
 import { initCacheLog, appendCacheLog, cacheLogEnabled, cacheLogPath, cacheCreationSplit } from "./cache-log.mjs";
 import {
@@ -1481,6 +1482,21 @@ function startCodeRun(session, codeToolUseId, input) {
 
     if (stateNote) appendCodeResultNote(collapsed, stateNote);
 
+    // The client cut a tool's output before the script saw it. The script may
+    // have checked `.truncated`/`.notes`, but the model must hear it either
+    // way: counts and lists derived from a truncated result look complete and
+    // silently are not.
+    if (run.clientTruncations?.length) {
+      const shown = run.clientTruncations.slice(0, 3);
+      for (const t of shown) {
+        const notice = t.notice ? `; client notice: ${t.notice.slice(0, 400)}` : "";
+        appendCodeResultNote(collapsed, `[the client truncated a ${t.tool} result before the script processed it — data derived from it may be incomplete${notice}]`);
+      }
+      if (run.clientTruncations.length > shown.length) {
+        appendCodeResultNote(collapsed, `[+${run.clientTruncations.length - shown.length} more client-truncated tool results this run]`);
+      }
+    }
+
     // Post-edit auto-check backstop (failures only): the daemon syntax-checks
     // files this run successfully edited, at zero client/model cost. A clean
     // check appends NOTHING; paths the script already codemode.verify()-ed are
@@ -2412,7 +2428,13 @@ async function resolveCodeModeToolResults(session, toolResults) {
     session.syntheticToCode.delete(tr.tool_use_id);
     const call = wave.calls[slot.callIdx];
     const result = toCallToolResult(tr);
-    const text = result.content?.[0]?.text || "";
+    // Client harnesses inject <system-reminder> blocks and truncation banners
+    // into tool_result text; the script consumes text as DATA, so those move
+    // to `.notes` (with `.truncated` set) instead of polluting it. `raw` keeps
+    // the original. Root cause: a client-truncated Grep whose banner lines
+    // parsed as file paths sent a whole session chasing phantom results.
+    const flat = result.content?.[0]?.text || "";
+    const { text, notices, truncated } = extractClientNotices(flat);
     const isError = !!result.isError;
 
     // Recovery-read result: consumed and discarded. NEVER fed to the anchor
@@ -2420,6 +2442,17 @@ async function resolveCodeModeToolResults(session, toolResults) {
     // and even an error is ignored: the paired edit-retry (already emitted in
     // the same fabricated message) is authoritative.
     if (slot.kind === "recovery-read") continue;
+
+    const noticeFields = {
+      ...(notices.length ? { notes: notices } : {}),
+      ...(truncated ? { truncated: true } : {}),
+    };
+    if (truncated) {
+      (run.clientTruncations ||= []).push({
+        tool: call.tool,
+        notice: notices.find((n) => /truncat/i.test(n)) || "",
+      });
+    }
 
     // Edit-retry result: on success the original slot resolves as a success
     // with an in-band recovery note; on a repeat freshness failure we
@@ -2432,6 +2465,7 @@ async function resolveCodeModeToolResults(session, toolResults) {
           text: `${text}\n\n${NOTE_RECOVERED}`,
           raw: result,
           isError: false,
+          ...noticeFields,
         });
         continue;
       }
@@ -2447,6 +2481,7 @@ async function resolveCodeModeToolResults(session, toolResults) {
           text: `${text}\n\n[proxy verified on disk: ${verified.reason} — the file content actually changed; Read the region again (a windowed Read with offset/limit is enough for large files) before re-editing]`,
           raw: result,
           isError: true,
+          ...noticeFields,
         });
         continue;
       }
@@ -2454,20 +2489,28 @@ async function resolveCodeModeToolResults(session, toolResults) {
         text: cls ? `${text}\n\n${NOTE_FRESHNESS_HINT}` : text,
         raw: result,
         isError: true,
+        ...noticeFields,
       });
       continue;
     }
 
     // Multi-part chunked Read: park the part, assemble when the set completes.
     if (call.parts) {
-      call.partResults[slot.partIdx] = { text, isError };
+      call.partResults[slot.partIdx] = { text, isError, notices, truncated };
       if (!call.partResults.every((r) => r !== null)) continue;
+      const mergedNotes = [...new Set(call.partResults.flatMap((r) => r.notices || []))];
+      const anyTruncated = call.partResults.some((r) => r.truncated);
+      const mergedFields = {
+        ...(mergedNotes.length ? { notes: mergedNotes } : {}),
+        ...(anyTruncated ? { truncated: true } : {}),
+      };
       const failed = call.partResults.findIndex((r) => r.isError);
       if (failed >= 0) {
         finalizeWaveEntry(session, wave, slot.callIdx, {
           text: `chunked read failed at offset ${call.parts[failed].args.offset}: ${call.partResults[failed].text}`,
           raw: null,
           isError: true,
+          ...mergedFields,
         });
       } else {
         const { text: stitched } = stitchReadResults(call.partResults.map((r) => r.text));
@@ -2475,6 +2518,7 @@ async function resolveCodeModeToolResults(session, toolResults) {
           text: stitched,
           raw: null,
           isError: false,
+          ...mergedFields,
         }, { complete: call.stitch?.coversWholeFile === true ? true : undefined });
       }
       continue;
@@ -2498,6 +2542,7 @@ async function resolveCodeModeToolResults(session, toolResults) {
           text: `${text}\n\n${NOTE_FRESHNESS_HINT}`,
           raw: result,
           isError: true,
+          ...noticeFields,
         });
         continue;
       }
@@ -2517,6 +2562,7 @@ async function resolveCodeModeToolResults(session, toolResults) {
             text: `${text}\n\n[proxy verified on disk: ${verified.reason} — the file content actually changed; Read the region again (a windowed Read with offset/limit is enough for large files) before re-editing]`,
             raw: result,
             isError: true,
+            ...noticeFields,
           });
           continue;
         }
@@ -2524,13 +2570,14 @@ async function resolveCodeModeToolResults(session, toolResults) {
           text: `${text}\n\n${NOTE_FRESHNESS_HINT}`,
           raw: result,
           isError: true,
+          ...noticeFields,
         });
         continue;
       }
     }
 
     // Normal single-part result (the pre-existing path).
-    finalizeWaveEntry(session, wave, slot.callIdx, { text, raw: result, isError });
+    finalizeWaveEntry(session, wave, slot.callIdx, { text, raw: result, isError, ...noticeFields });
   }
 
   // Queued recovery tool_uses ride out on the freshly attached turn as one

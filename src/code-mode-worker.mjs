@@ -82,6 +82,10 @@ function makeToolResult(result = {}) {
   };
   Object.setPrototypeOf(target, ToolResult.prototype);
   if (Object.prototype.hasOwnProperty.call(result, "anchored")) target.anchored = result.anchored;
+  // Client-injected notices (system reminders / truncation banners) extracted
+  // from `.text` by the bridge so they never pollute data processing.
+  if (Array.isArray(result.notes) && result.notes.length) target.notes = result.notes;
+  if (result.truncated) target.truncated = true;
 
   const proxy = new Proxy(target, {
     get(obj, prop, receiver) {
@@ -118,6 +122,8 @@ function plainToolResult(value) {
     isError: target.isError,
   };
   if (Object.prototype.hasOwnProperty.call(target, "anchored")) out.anchored = target.anchored;
+  if (Object.prototype.hasOwnProperty.call(target, "notes")) out.notes = target.notes;
+  if (Object.prototype.hasOwnProperty.call(target, "truncated")) out.truncated = target.truncated;
   return out;
 }
 
