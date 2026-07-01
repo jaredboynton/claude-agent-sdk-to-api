@@ -30,6 +30,9 @@ import {
   bucketKey,
   hashMessages,
   buildParkingMcpServer,
+  registerClientTool,
+  mergeLateTool,
+  appendPendingToolNotice,
   hasActiveToolRound,
   normalizeModel,
   modelObject,
@@ -1307,3 +1310,71 @@ test("codemode.recall round-trips worker -> dispatchCodeWave -> script", async (
   assert.equal(r.error, undefined);
   assert.equal(r.value, "got:spilled payload 12345");
 });
+
+// ---------------------------------------------------------------------------
+// Frozen toolsets + late-tool merge (tool mutability without cache busts)
+// ---------------------------------------------------------------------------
+
+test("buildParkingMcpServer reuses frozen toolset bytes on warm resume", () => {
+  const session = fakeCodeSession({ clientTools: new Map(), inputParsers: new Map() });
+  const frozen = {
+    description: "FROZEN DESCRIPTION BYTES (from an earlier release)",
+    tools: [{ name: "Grep", description: "grep", input_schema: GREP_SCHEMA }],
+  };
+  let captured = null;
+  buildParkingMcpServer(
+    [{ name: "Grep", description: "grep NEWER PROSE", input_schema: GREP_SCHEMA }],
+    session,
+    (config) => { captured = config; return { ok: true }; },
+    frozen,
+  );
+  // The cached-prefix bytes must be the persisted ones, not a re-render.
+  assert.equal(captured.tools[0].description, frozen.description);
+  assert.equal(session.codeDescription, frozen.description);
+  assert.match(session.descHash, /^[0-9a-f]{12}$/);
+  // Runtime seeded from the frozen raw tools, not the incoming ones.
+  assert.equal(session.clientTools.get("Grep").description.includes("NEWER PROSE"), false);
+  assert.equal(session.inputParsers.has("Grep"), true);
+});
+
+test("buildParkingMcpServer renders live when no frozen toolset is supplied", () => {
+  const session = fakeCodeSession({ clientTools: new Map(), inputParsers: new Map() });
+  let captured = null;
+  buildParkingMcpServer(
+    [{ name: "Grep", description: "grep", input_schema: GREP_SCHEMA }],
+    session,
+    (config) => { captured = config; return { ok: true }; },
+  );
+  assert.equal(captured.tools[0].description, session.codeDescription);
+  assert.ok(session.codeDescription.includes("Grep"));
+  assert.deepEqual(session.toolsetRawTools.map((t) => t.name), ["Grep"]);
+});
+
+test("mergeLateTool makes a late tool callable and queues an announcement", () => {
+  const session = fakeCodeSession({ clientTools: new Map(), inputParsers: new Map(), toolsetRawTools: [] });
+  mergeLateTool(session, {
+    name: "WebFetch",
+    description: "fetch a url",
+    input_schema: { type: "object", properties: { url: { type: "string" } }, required: ["url"] },
+  });
+  assert.equal(session.clientTools.has("WebFetch"), true);
+  assert.equal(session.inputParsers.has("WebFetch"), true);
+  assert.deepEqual(session.toolsetRawTools.map((t) => t.name), ["WebFetch"]);
+  assert.equal(session.lateTools.has("WebFetch"), true);
+  assert.equal(session.pendingToolNotice.has("WebFetch"), true);
+});
+
+test("appendPendingToolNotice announces once then clears the queue", () => {
+  const session = fakeCodeSession({ pendingToolNotice: new Set(["Zeta", "Alpha"]) });
+  const collapsed = { content: [{ type: "text", text: "result body" }] };
+  appendPendingToolNotice(session, collapsed);
+  const text = collapsed.content[0].text;
+  assert.ok(text.startsWith("result body"));
+  assert.ok(text.includes("new tools available"));
+  assert.ok(text.indexOf("Alpha") < text.indexOf("Zeta"));
+  assert.equal(session.pendingToolNotice, null);
+  const again = { content: [{ type: "text", text: "next" }] };
+  appendPendingToolNotice(session, again);
+  assert.equal(again.content[0].text, "next");
+});
+

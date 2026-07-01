@@ -144,3 +144,15 @@ The write-dominated shape in §6 drove a batch of changes targeting the remainin
 - **Telemetry for receipts** — per-turn rows now add `scriptInBytes`, `spills`, `stateBytes`, `codeErrors`, and `coldReason` (`resume-rejected(prefix-mismatch)`, `cwd-mismatch(...)`, ...), so the next re-run of §7 can attribute write reductions to each lever and quantify cache-cold causes.
 
 Re-run the §7 analysis after ~2 weeks of cache-log under these changes; expected movement: `scriptOutBytes` p90 down (cap), repeat-Read rate down (`state`), post-error redo rate down (ledger), and `action` distribution shifting cold → resume/resume-catchup.
+
+---
+
+## 9. Frozen toolsets: tool mutability without cache invalidation (2026-07-01)
+
+The §8 "ship all description edits in one release" constraint is now enforced mechanically and extended to tool-set drift. The rule: **the `code` description's bytes may change only when the cache is already dead.**
+
+- **Live sessions** freeze the description at creation (unchanged behavior).
+- **Warm-window resumes** (`CACHE_WARM_WINDOW_MS` = 1h, matching the CLI's 1h write TTL) reuse the exact persisted bytes from the conversation's frozen-toolset blob (`<config>/toolsets/<hash>.json`, content-addressed, referenced by `toolsetHash` in `resume-index.json`) — a daemon restart or self-update release can no longer re-write a warm prefix. Past-TTL resumes re-render freely; the full prefix write was happening anyway.
+- **Late tools merge, they don't invalidate.** Tools the client adds mid-conversation (e.g. ToolSearch deferred tools) merge into the script runtime (the worker catalog and arg parsers rebuild from `session.clientTools` at every run) and are announced in-band on the next code tool_result — an incremental cache append, never a prefix re-write. The old behavior (inline "unavailable until a new conversation" error) is gone.
+- **Enforcement + receipts**: `test/code-description.golden.test.mjs` fails on any description byte change (regenerate deliberately with `UPDATE_GOLDEN=1`). Cache-log rows carry `descHash`; `scripts/cache-bust-report.mjs` proves per-conversation byte stability from receipts and prices any re-write suspects.
+

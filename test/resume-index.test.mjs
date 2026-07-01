@@ -15,6 +15,10 @@ import {
   upsertResumeEntry,
   buildResumeCatchupFrames,
   MAX_CATCHUP_TAIL,
+  CACHE_WARM_WINDOW_MS,
+  saveToolsetBlob,
+  loadToolsetBlob,
+  pruneToolsetBlobs,
 } from "../src/resume-index.mjs";
 import { bucketKey, hashMessages, renderPrimingTranscript, primingFrameText, toUserFrame, pushColdStartFrames } from "../src/server.mjs";
 
@@ -421,3 +425,67 @@ test("upsertResumeEntry persists the codeMode flag", () => {
   });
   assert.equal(updated.entries[0].codeMode, true);
 });
+
+// ---------------------------------------------------------------------------
+// Frozen-toolset blobs
+// ---------------------------------------------------------------------------
+
+test("toolset blob roundtrips content-addressed and validates shape", () => {
+  const dir = mkdtempSync(join(tmpdir(), "toolsets-"));
+  const blob = { description: "DESC BYTES", tools: [{ name: "Grep", description: "g", input_schema: { type: "object", properties: {} } }] };
+  const hash = saveToolsetBlob(blob, dir);
+  assert.match(hash, /^[0-9a-f]{16}$/);
+  assert.equal(saveToolsetBlob(blob, dir), hash);
+  assert.deepEqual(loadToolsetBlob(hash, dir), blob);
+  assert.equal(loadToolsetBlob("not-a-hash", dir), null);
+  assert.equal(loadToolsetBlob("0123456789abcdef", dir), null);
+});
+
+test("pruneToolsetBlobs removes only unreferenced blobs", () => {
+  const dir = mkdtempSync(join(tmpdir(), "toolsets-"));
+  const keep = saveToolsetBlob({ description: "KEEP", tools: [] }, dir);
+  const drop = saveToolsetBlob({ description: "DROP", tools: [] }, dir);
+  pruneToolsetBlobs([{ toolsetHash: keep }], dir);
+  assert.notEqual(loadToolsetBlob(keep, dir), null);
+  assert.equal(loadToolsetBlob(drop, dir), null);
+});
+
+test("findResumeCandidate carries toolsetHash and updatedAt", () => {
+  const base = [
+    { role: "user", content: [{ type: "text", text: "start" }] },
+    { role: "assistant", content: [{ type: "text", text: "ok" }] },
+  ];
+  const incoming = [...base, { role: "user", content: [{ type: "text", text: "next" }] }];
+  const e = { ...entry(2, incoming), toolsetHash: "abcdef0123456789" };
+  const candidate = findResumeCandidate({
+    entries: [e],
+    model: "claude-opus-4-8",
+    profileKey: PK,
+    bucket: BUCKET,
+    messages: incoming,
+    lastIsToolResult: false,
+    hashMessages,
+  });
+  assert.equal(candidate.toolsetHash, "abcdef0123456789");
+  assert.equal(candidate.updatedAt, e.updatedAt);
+});
+
+test("upsertResumeEntry preserves toolsetHash", () => {
+  const messages = [{ role: "user", content: [{ type: "text", text: "start" }] }];
+  const updated = upsertResumeEntry({ entries: [] }, {
+    profileKey: PK,
+    bucket: BUCKET,
+    seenCount: 1,
+    seenHash: hashMessages(messages, 1),
+    sdkSessionId: "sdk-frozen-1",
+    model: "claude-opus-4-8",
+    codeMode: true,
+    toolsetHash: "abcdef0123456789",
+  });
+  assert.equal(updated.entries[0].toolsetHash, "abcdef0123456789");
+});
+
+test("CACHE_WARM_WINDOW_MS matches the 1h cache write TTL", () => {
+  assert.equal(CACHE_WARM_WINDOW_MS, 60 * 60 * 1000);
+});
+

@@ -12,6 +12,10 @@ Agentic coding interfaces legitimately have long tool calls — large searches, 
 
 Turn teardown is event-driven off the SDK `query()` lifecycle: when the async iterator ends, errors, or is aborted, settle the turn immediately. A turn that never settles means the SDK stream genuinely never closed; root-cause that from the event stream rather than papering over it with a timer.
 
+### The `code` description is cache-critical
+
+The rendered `code` tool description sits in every conversation's cached prompt prefix; changing its bytes re-writes that prefix at 2x. Its bytes may change only when the cache is already dead: fresh sessions and past-TTL resumes. Never re-render it for a live or warm-resumed conversation (warm resumes reuse the persisted frozen-toolset blob), and never edit the prose or schema rendering without deliberately regenerating `test/fixtures/code-description.golden.txt` — batch such edits into as few releases as possible. Tools that appear mid-conversation merge into the script runtime and are announced inside a code tool_result (append-only), never via the description.
+
 ## Commands
 
 - Test: `npm test`

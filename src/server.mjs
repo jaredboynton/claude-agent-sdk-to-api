@@ -49,6 +49,11 @@ import {
   findResumeCandidate,
   upsertResumeEntry,
   buildResumeCatchupFrames,
+  CACHE_WARM_WINDOW_MS,
+  toolsetDirFor,
+  saveToolsetBlob,
+  loadToolsetBlob,
+  pruneToolsetBlobs,
 } from "./resume-index.mjs";
 import {
   CodeValidationError,
@@ -480,8 +485,12 @@ function claimStreamedToolUse(session, name, args, idHint = null) {
 // blocks for each await wave (see dispatchCodeWave). The native client tools are
 // never registered with the SDK — they are only known to the script runtime, so
 // the model has no way to call them directly.
-function buildParkingMcpServer(tools, session, createServer = createSdkMcpServer) {
-  if (!tools || !tools.length) return null;
+function buildParkingMcpServer(tools, session, createServer = createSdkMcpServer, frozen = null) {
+  // A frozen toolset (warm-window resume) supplies both the raw tools to seed
+  // the script runtime and the exact description bytes the conversation
+  // already cached.
+  const sourceTools = frozen?.tools?.length ? frozen.tools : (tools || []);
+  if (!sourceTools.length) return null;
 
   const makeHandler = (originalName) => async (args, extra) => {
     session.lastActivity = Date.now();
@@ -536,41 +545,101 @@ function buildParkingMcpServer(tools, session, createServer = createSdkMcpServer
     });
   };
 
-  // Populate session.clientTools (the script runtime's tool catalog, used to
-  // render the `code` tool description and validate wave args in dispatchCodeWave)
-  // and session.inputParsers (canonical z.object parser per tool, mirroring the
-  // MCP layer's validateToolInput so claimStreamedToolUse can normalize both the
-  // streamed raw input and the handler's parsed args to the same form). Anchor
-  // editing is additive in code mode: the native old_string path still works
-  // (scripts derive bytes from the Read result), and anchor fields are merged in
-  // as OPTIONAL so the rendered `code` signature documents both. Translation back
-  // to native happens in dispatchCodeWave.
   session.clientTools = session.clientTools || new Map();
-  for (const t of tools) {
-    const anchorOn = ANCHORED_EDIT_TOOLS.has(t.name);
-    session.clientTools.set(t.name, normalizeClientToolMeta(t.name, {
-      description: anchorOn ? patchCodeEditDescription(t.name, t.description || "") : (t.description || ""),
-      input_schema: anchorOn
-        ? mergeAnchorEditSchema(t.name, t.input_schema || { type: "object", properties: {} })
-        : (t.input_schema || { type: "object", properties: {} }),
+  for (const t of sourceTools) registerClientTool(session, t);
+  // Raw tool snapshot behind the description; persisted as the frozen-toolset
+  // blob and extended by mergeLateTool so a later warm resume seeds the full
+  // runtime set without touching the frozen bytes.
+  session.toolsetRawTools = sourceTools
+    .filter((t) => t && t.name)
+    .map((t) => ({
+      name: t.name,
+      description: t.description || "",
+      input_schema: t.input_schema || { type: "object", properties: {} },
     }));
-    const shape = toolInputShape(t.input_schema || { type: "object", properties: {} });
-    try {
-      const parser = z.object(shape);
-      if (session.inputParsers) session.inputParsers.set(t.name, parser);
-    } catch (e) {
-      process.stderr.write(`${LOG_PREFIX} z.object(shape) failed for ${t.name} (${String(e?.message || e).slice(0, 100)}); correlation will use raw input\n`);
-    }
-  }
 
   const codeShape = codeToolInputShape(z);
+  // The description's bytes are part of the conversation's cached prefix: a
+  // warm-window resume MUST reuse the persisted bytes verbatim (a re-render
+  // with a grown tool list or newer prose re-writes the whole prefix at 2x).
+  // Fresh sessions and past-TTL resumes render live — the only moments the
+  // bytes are allowed to change.
+  const description = typeof frozen?.description === "string" && frozen.description
+    ? frozen.description
+    : buildCodeToolDescription(session.clientTools);
+  session.codeDescription = description;
+  session.descHash = createHash("sha256").update(description).digest("hex").slice(0, 12);
   const codeTool = {
     name: "code",
-    description: buildCodeToolDescription(session.clientTools),
+    description,
     inputSchema: codeShape,
     handler: makeHandler("code"),
   };
   return createServer({ name: "bridge", tools: [codeTool], alwaysLoad: true });
+}
+
+// Register one client tool with the session's script runtime: normalized meta
+// in session.clientTools (drives the per-run worker catalog, the rendered
+// description for NEW sessions, and dispatch lookups) and a canonical z.object
+// parser in session.inputParsers (built from the RAW schema — anchor fields
+// are translated back to native before validation, mirroring the MCP layer's
+// validateToolInput so claimStreamedToolUse can normalize both the streamed
+// raw input and the handler's parsed args to the same form). Anchor editing is
+// additive in code mode: the native old_string path still works (scripts
+// derive bytes from the Read result), and anchor fields are merged in as
+// OPTIONAL so the rendered `code` signature documents both. Safe to call
+// mid-conversation: neither map feeds a frozen `code` description, so late
+// registration never changes cached-prefix bytes.
+function registerClientTool(session, t) {
+  const anchorOn = ANCHORED_EDIT_TOOLS.has(t.name);
+  session.clientTools.set(t.name, normalizeClientToolMeta(t.name, {
+    description: anchorOn ? patchCodeEditDescription(t.name, t.description || "") : (t.description || ""),
+    input_schema: anchorOn
+      ? mergeAnchorEditSchema(t.name, t.input_schema || { type: "object", properties: {} })
+      : (t.input_schema || { type: "object", properties: {} }),
+  }));
+  const shape = toolInputShape(t.input_schema || { type: "object", properties: {} });
+  try {
+    const parser = z.object(shape);
+    if (session.inputParsers) session.inputParsers.set(t.name, parser);
+  } catch (e) {
+    process.stderr.write(`${LOG_PREFIX} z.object(shape) failed for ${t.name} (${String(e?.message || e).slice(0, 100)}); correlation will use raw input\n`);
+  }
+}
+
+// A tool that arrives after the conversation's `code` description froze: make
+// it fully callable through the script runtime (the worker catalog and wave
+// validation read session.clientTools at every run) and queue an in-band
+// announcement for the next code tool_result. Appending to the transcript
+// extends the cache incrementally; the frozen description is never
+// re-rendered, so the cached prefix stays byte-identical.
+function mergeLateTool(session, t) {
+  registerClientTool(session, t);
+  if (Array.isArray(session.toolsetRawTools)) {
+    session.toolsetRawTools.push({
+      name: t.name,
+      description: t.description || "",
+      input_schema: t.input_schema || { type: "object", properties: {} },
+    });
+  }
+  session.lateTools = session.lateTools || new Set();
+  session.lateTools.add(t.name);
+  session.pendingToolNotice = session.pendingToolNotice || new Set();
+  session.pendingToolNotice.add(t.name);
+  process.stderr.write(`${LOG_PREFIX} tool ${t.name} arrived after session start key=${session.key ? session.key.slice(0, 8) : "?"}; merged into the script runtime (frozen code description unchanged)\n`);
+}
+
+// Deliver queued late-tool announcements on a code tool_result. Mutates the
+// result's first text block in place and clears the queue once delivered.
+function appendPendingToolNotice(session, collapsed) {
+  if (!session.pendingToolNotice?.size) return collapsed;
+  const block = collapsed?.content?.[0];
+  if (!block || typeof block.text !== "string") return collapsed;
+  const names = [...session.pendingToolNotice].sort();
+  const note = `[new tools available (not in the docs above): ${names.join(", ")} — call them normally; docs via codemode.describe(${JSON.stringify(names[0])})]`;
+  block.text = block.text ? `${block.text}\n\n${note}` : note;
+  session.pendingToolNotice = null;
+  return collapsed;
 }
 
 // Deep-remove cache_control from a content block (client TTLs conflict with the
@@ -832,6 +901,22 @@ let resumeIndexFile = defaultIndexPath();
 function persistResumeIndex(session, model, system, messages, indexPath = resumeIndexFile) {
   if (!session.sdkSessionId || !serverProfileDir) return;
   try {
+    // Persist the frozen toolset (exact description bytes + raw tools) so a
+    // warm-window resume can reuse them verbatim instead of re-rendering —
+    // a re-render with a grown tool list or newer prose would re-write the
+    // conversation's whole cached prefix. Content-addressed: identical
+    // toolsets across conversations share one blob.
+    let toolsetHash = null;
+    if (session.codeDescription && Array.isArray(session.toolsetRawTools)) {
+      try {
+        toolsetHash = saveToolsetBlob(
+          { description: session.codeDescription, tools: session.toolsetRawTools },
+          toolsetDirFor(indexPath),
+        );
+      } catch (e) {
+        process.stderr.write(`${LOG_PREFIX} toolset blob write failed: ${e?.message || e}\n`);
+      }
+    }
     const index = loadResumeIndex(indexPath);
     const updated = upsertResumeEntry(index, {
       profileKey: profileKey(serverProfileDir),
@@ -841,8 +926,10 @@ function persistResumeIndex(session, model, system, messages, indexPath = resume
       sdkSessionId: session.sdkSessionId,
       model,
       codeMode: true,
+      ...(toolsetHash ? { toolsetHash } : {}),
     });
     saveResumeIndex(updated, indexPath);
+    pruneToolsetBlobs(updated.entries, toolsetDirFor(indexPath));
   } catch (e) {
     process.stderr.write(`${LOG_PREFIX} resume index write failed: ${e?.message || e}\n`);
   }
@@ -939,6 +1026,7 @@ function logTurnDone(session) {
       spills: m.spills,
       stateBytes: m.stateBytes,
       codeErrors: m.codeErrors,
+      ...(session.descHash ? { descHash: session.descHash } : {}),
       ...(m.coldReason ? { coldReason: m.coldReason } : {}),
       ttftMs: ttft,
       durationMs: total,
@@ -1334,6 +1422,7 @@ function startCodeRun(session, codeToolUseId, input) {
       );
     }
 
+    appendPendingToolNotice(session, collapsed);
     session.codeDriving = false;
     clearCodeRun(session, codeToolUseId);
     // Resolve the parked `code` MCP handler so the SDK emits the final answer.
@@ -1392,9 +1481,7 @@ async function dispatchCodeWave(session, codeToolUseId, waveNum, calls) {
         syntheticId: null,
         tool: name,
         args,
-        inlineError: session.lateTools?.has(name)
-          ? `tool ${name} was added by the client after this conversation's session started; it is unavailable to code mode in this conversation — proceed without it`
-          : `unknown tool: ${name}`,
+        inlineError: `unknown tool: ${name}`,
       });
       continue;
     }
@@ -1645,7 +1732,7 @@ function projectEvent(session, ev) {
   }
 }
 
-function createSession(key, model, tools, callerSystem, bucket, { resume, cwd = PROXY_CWD_FALLBACK } = {}) {
+function createSession(key, model, tools, callerSystem, bucket, { resume, cwd = PROXY_CWD_FALLBACK, frozenToolset = null } = {}) {
   // Recheck the profile dir on every new session, not just at startup: the
   // bundled CLI mkdirs $CLAUDE_CONFIG_DIR/session-env/<id> per session, and a
   // profile cleanup can break that (dangling symlink) while the daemon is up.
@@ -1701,7 +1788,8 @@ function createSession(key, model, tools, callerSystem, bucket, { resume, cwd = 
     codeState: {},               // persistent `state` global across code calls (conversation memory; survives clearAllCodeState)
     codeArtifacts: new Map(),    // id -> {text, ts}: full text of truncated results, fetched via codemode.recall(id)
     codeArtifactSeq: 0,
-    lateTools: null,             // Set of tool names that arrived after session creation (drift detection)
+    lateTools: null,             // Set of tool names that arrived after session creation (merged into the runtime; telemetry)
+    pendingToolNotice: null,      // Set of late-tool names awaiting in-band announcement on the next code tool_result
     currentTurn: null,            // { resolve } deferred for the active HTTP turn
     res: null,                    // current streaming HTTP response
     nonStream: null,              // { blocks, stopReason } when buffering for non-stream
@@ -1715,7 +1803,16 @@ function createSession(key, model, tools, callerSystem, bucket, { resume, cwd = 
     turnMetrics: null,
   };
 
-  const mcpServer = buildParkingMcpServer(tools, session);
+  const mcpServer = buildParkingMcpServer(tools, session, createSdkMcpServer, frozenToolset);
+  // Warm-window resume: tools the client added since the frozen toolset was
+  // persisted merge into the script runtime (announced in-band on the next
+  // code result); the frozen description bytes stay untouched.
+  if (frozenToolset && tools?.length && session.clientTools?.size) {
+    for (const t of tools) {
+      if (!t?.name || t.name === "code" || session.clientTools.has(t.name)) continue;
+      mergeLateTool(session, t);
+    }
+  }
   const queryOptions = {
     model,
     systemPrompt: { type: "preset", preset: "claude_code", append: callerSystem },
@@ -2219,17 +2316,15 @@ async function handleMessages(req, res) {
     // abandon a parked tool round just because a system message trails the
     // tool_result. See decideWarmAction()/actionableTail().
     action = decideWarmAction(tail).action;
-    // Tool-set drift: clientTools is frozen at session creation (the MCP server
-    // and the `code` description cannot be rebuilt mid-query), so tools that
-    // arrive later are stashed only to explain the unknown-tool error.
+    // Tool-set drift: the `code` description froze at session creation (its
+    // bytes are part of the cached prefix), but the script runtime is not
+    // frozen — merge late tools into session.clientTools/inputParsers so the
+    // next code run can call them, and announce them on the next code
+    // tool_result (append-only transcript; the prefix is never re-written).
     if (tools?.length && session.clientTools?.size) {
       for (const t of tools) {
         if (!t?.name || t.name === "code" || session.clientTools.has(t.name)) continue;
-        session.lateTools = session.lateTools || new Set();
-        if (!session.lateTools.has(t.name)) {
-          session.lateTools.add(t.name);
-          process.stderr.write(`${LOG_PREFIX} tool ${t.name} arrived after session start key=${session.key.slice(0, 8)}; unavailable to code mode until a new conversation\n`);
-        }
+        mergeLateTool(session, t);
       }
     }
   } else if (messages.length > 1) {
@@ -2253,13 +2348,24 @@ async function handleMessages(req, res) {
       hashMessages,
       trace: resumeTrace,
     });
-    if (candidate?.mode === "resume") {
-      session = createSession(randomUUID(), model, tools, callerSystem, b, { resume: candidate.sdkSessionId, cwd });
-      action = "resume";
-    } else if (candidate?.mode === "resume-catchup") {
-      session = createSession(randomUUID(), model, tools, callerSystem, b, { resume: candidate.sdkSessionId, cwd });
-      action = "resume-catchup";
-      resumeCatchupTail = candidate.tail;
+    if (candidate?.mode === "resume" || candidate?.mode === "resume-catchup") {
+      // Warm-window resume MUST reuse the conversation's frozen toolset bytes;
+      // past the cache TTL the prefix re-writes anyway, so rendering fresh
+      // (current tools, current prose) is free — the only moment description
+      // bytes are allowed to change.
+      let frozenToolset = null;
+      const warm = candidate.updatedAt && Date.now() - candidate.updatedAt < CACHE_WARM_WINDOW_MS;
+      if (warm) {
+        frozenToolset = candidate.toolsetHash
+          ? loadToolsetBlob(candidate.toolsetHash, toolsetDirFor(resumeIndexFile))
+          : null;
+        if (!frozenToolset) {
+          process.stderr.write(`${LOG_PREFIX} warm resume without frozen toolset (${candidate.toolsetHash ? "blob missing" : "legacy entry"}); code description may re-write the cached prefix\n`);
+        }
+      }
+      session = createSession(randomUUID(), model, tools, callerSystem, b, { resume: candidate.sdkSessionId, cwd, frozenToolset });
+      action = candidate.mode;
+      if (candidate.mode === "resume-catchup") resumeCatchupTail = candidate.tail;
     }
     if (!session) {
       coldReason = `resume-rejected(${resumeTrace.reason || "unknown"})`;
@@ -2607,6 +2713,9 @@ export {
   abandonToolRound,
   writeSseChunk,
   buildParkingMcpServer,
+  registerClientTool,
+  mergeLateTool,
+  appendPendingToolNotice,
   hasActiveToolRound,
   pushColdStartFrames,
   noteStreamTiming,
