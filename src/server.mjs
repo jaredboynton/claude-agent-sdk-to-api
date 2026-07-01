@@ -490,21 +490,23 @@ function buildParkingMcpServer(tools, session, createServer = createSdkMcpServer
 
     return new Promise((resolve) => {
       let settled = false;
-      const timer = setTimeout(() => {
+      // The `code` handler parks for an ENTIRE multi-wave run, not a single
+      // tool_result. Capping it with TOOL_TIMEOUT_MS would kill a legitimately
+      // long-running script mid-run (punishing intelligent code-mode logic), so
+      // it parks with no per-run clock: a genuine client disconnect is caught
+      // event-driven by onClose, and a dead session (client received a wave and
+      // never returned) is reclaimed by the idle sweeper (SESSION_TTL_MS,
+      // refreshed on every wave POST). Every teardown path resolves this handler
+      // via abandonToolRound, so dropping the timer never orphans it. Individual
+      // client tools keep the bounded park so the SDK loop survives one missing
+      // tool_result.
+      const timer = originalName === "code" ? null : setTimeout(() => {
         if (!settled) {
           settled = true;
           if (id) session.pendingTools.delete(id);
           else {
             const idx = session.orphanResolvers.indexOf(wrappedResolve);
             if (idx !== -1) session.orphanResolvers.splice(idx, 1);
-          }
-          if (originalName === "code" && id) {
-            clearCodeRun(session, id);
-            // clearCodeRun only nulls session.codeRun; also drop codeDriving
-            // so SDK events are no longer suppressed and the client doesn't
-            // see silence after the 30-min code-handler timeout.
-            session.codeDriving = false;
-            session.suppressEndTurn = false;
           }
           session.lastActivity = Date.now();
           process.stderr.write(`${LOG_PREFIX} tool ${id ?? originalName} park timeout after ${TOOL_TIMEOUT_MS}ms; returning isError\n`);
@@ -515,7 +517,7 @@ function buildParkingMcpServer(tools, session, createServer = createSdkMcpServer
       const wrappedResolve = (result) => {
         if (!settled) {
           settled = true;
-          clearTimeout(timer);
+          if (timer) clearTimeout(timer);
           session.lastActivity = Date.now();
           resolve(result);
         }
@@ -999,6 +1001,8 @@ function notifyTurnAttached(session) {
 function clearCodeRun(session, codeId) {
   const run = session.codeRun;
   if (run && run.codeId === codeId) {
+    run.aborted = true;
+    try { run.abortController?.abort(); } catch {}
     rejectTurnWaitersForRun(session, run, new Error("code round abandoned"));
     session.codeRun = null;
   }
@@ -1008,6 +1012,7 @@ function clearAllCodeState(session) {
   if (session.codeRun) {
     const run = session.codeRun;
     run.aborted = true;
+    try { run.abortController?.abort(); } catch {}
     rejectTurnWaitersForRun(session, run, new Error("code round abandoned"));
     if (run.currentWave?.reject) {
       try { run.currentWave.reject(new Error("code round abandoned")); } catch {}
@@ -1103,6 +1108,7 @@ function startCodeRun(session, codeToolUseId, input) {
   const run = {
     codeId: codeToolUseId,
     script,
+    abortController: new AbortController(),
     currentWave: null,       // single in-flight wave awaiting client tool_results
     waveSeq: 0,
     waveCount: 0,
@@ -1123,6 +1129,7 @@ function startCodeRun(session, codeToolUseId, input) {
     maxWaves: CODE_MAX_WAVES,
     maxCalls: CODE_MAX_CALLS,
     timeoutMs: CODE_SCRIPT_TIMEOUT_MS,
+    signal: run.abortController.signal,
     dispatchWave: (waveNum, calls) => dispatchCodeWave(session, codeToolUseId, waveNum, calls),
   });
 
@@ -1506,17 +1513,19 @@ function createSession(key, model, tools, callerSystem, bucket, { resume, cwd = 
     cwd,
     includePartialMessages: true,
     abortController,
-    // The proxy parks MCP handlers across HTTP turns (minutes), but the
-    // SDK's bundled CLI closes its stdin stream after CLAUDE_CODE_STREAM_CLOSE_TIMEOUT
-    // ms of inactivity (default ~60s). Without raising it to outlast our
-    // TOOL_TIMEOUT_MS, the CLI gives up on parked handlers before our own
-    // watchdog fires — producing the "model hangs after tool calls" symptom
-    // (SDK issue #114). Pass a per-query env that raises stream-close to
-    // TOOL_TIMEOUT_MS + a grace window. env REPLACES process.env, so spread it.
+    // The proxy parks MCP handlers across HTTP turns, but the SDK's bundled CLI
+    // closes its stdin stream after CLAUDE_CODE_STREAM_CLOSE_TIMEOUT ms of
+    // inactivity (default ~60s). A code run parks the `code` handler for its
+    // whole multi-wave lifetime with the SDK's stdin idle throughout, so the
+    // ceiling must outlast the session lifecycle, not just TOOL_TIMEOUT_MS —
+    // otherwise the CLI would cut a legitimately long-running script (SDK issue
+    // #114 symptom, and the "punish long code logic" failure mode). Dead
+    // sessions are still reclaimed event-driven (onClose) or by the idle sweeper
+    // (SESSION_TTL_MS). env REPLACES process.env, so spread it.
     env: {
       ...process.env,
       CLAUDE_CODE_STREAM_CLOSE_TIMEOUT: String(
-        Number(process.env.CLAUDE_CODE_STREAM_CLOSE_TIMEOUT) || (TOOL_TIMEOUT_MS + 60000)
+        Number(process.env.CLAUDE_CODE_STREAM_CLOSE_TIMEOUT) || (SESSION_TTL_MS + 60000)
       ),
     },
   };
@@ -1743,6 +1752,12 @@ const sweeper = setInterval(() => {
   const now = Date.now();
   for (const [key, s] of sessions) {
     if (now - s.lastActivity > SESSION_TTL_MS) {
+      if (s.codeRun && !s.currentTurn) {
+        process.stderr.write(`${LOG_PREFIX} evicting stale code session ${key}\n`);
+        try { abandonToolRound(s); s.input.close(); s.abortController.abort(); } catch {}
+        sessions.delete(key);
+        continue;
+      }
       if (hasActiveToolRound(s)) continue;
       process.stderr.write(`${LOG_PREFIX} evicting idle session ${key}\n`);
       try { s.input.close(); s.abortController.abort(); } catch {}
@@ -1958,10 +1973,19 @@ async function handleMessages(req, res) {
       res.write(": warming up\n\n");
     }
     heartbeat = setInterval(() => { if (!res.writableEnded) res.write(`: keep-alive\n\n`); }, HEARTBEAT_MS);
-    // Client disconnect detaches the response but must NOT kill the session —
-    // the client reconnects with the next POST.
-    onClose = () => { if (session.res === res) session.res = null; };
-    req.on("close", onClose);
+    // A response close before writableEnded means the client did not receive
+    // the full streamed turn. If that turn was a fabricated code wave, no
+    // reliable tool_result can arrive for it, so abort the parked code run.
+    onClose = () => {
+      const aborted = !res.writableEnded;
+      if (session.res === res) session.res = null;
+      if (aborted && session.codeRun?.currentWave?.dispatched) {
+        process.stderr.write(`${LOG_PREFIX} client disconnected during code wave key=${session.key.slice(0, 8)}; aborting code run\n`);
+        if (session.currentTurn) failTurn(session, new Error("client disconnected during code wave"));
+        else abandonToolRound(session);
+      }
+    };
+    res.on("close", onClose);
   } else {
     session.res = null;
     session.nonStream = { blocks: [], stopReason: "end_turn" };
@@ -2040,12 +2064,12 @@ async function handleMessages(req, res) {
       if (!res.headersSent) jsonResp(res, 500, { type: "error", error: { type: "api_error", message: String(e?.message || e) } });
     }
     if (heartbeat) clearInterval(heartbeat);
-    if (onClose) req.off("close", onClose);
+    if (onClose) res.off("close", onClose);
     return;
   }
 
   if (heartbeat) clearInterval(heartbeat);
-  if (onClose) req.off("close", onClose);
+  if (onClose) res.off("close", onClose);
 
   persistResumeIndex(session, model, system, messages);
 

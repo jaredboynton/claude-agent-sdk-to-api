@@ -35,6 +35,7 @@ import {
   resolveCodeModeToolResults,
   notifyTurnAttached,
   startServer,
+  startCodeRun,
 } from "../src/server.mjs";
 
 const GREP_SCHEMA = {
@@ -804,6 +805,23 @@ test("hasActiveToolRound includes code run and codeDriving", () => {
   assert.equal(hasActiveToolRound(session), true);
   clearAllCodeState(session);
   assert.equal(hasActiveToolRound(session), false);
+});
+
+test("clearAllCodeState aborts the active code worker immediately", async () => {
+  const session = fakeCodeSession({ clientTools: new Map() });
+  startCodeRun(session, "toolu_code_abort", { script: "return await new Promise(() => {});" });
+  const run = session.codeRun;
+  assert.ok(run?.abortController?.signal, "code run has an abort signal");
+
+  clearAllCodeState(session);
+
+  assert.equal(run.abortController.signal.aborted, true);
+  const outcome = await Promise.race([
+    run.promise.then(() => "resolved", (e) => String(e?.message || e)),
+    new Promise((resolve) => setTimeout(() => resolve("timeout"), 1000)),
+  ]);
+  assert.match(outcome, /aborted/);
+  assert.equal(session.codeRun, null);
 });
 
 // ---------------------------------------------------------------------------
