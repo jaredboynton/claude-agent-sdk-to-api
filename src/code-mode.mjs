@@ -179,37 +179,38 @@ function describeClientTool(name, meta) {
   return desc ? `${heading}\n${desc}\n${sig}` : `${heading}\n${sig}`;
 }
 
+function toolAccessPath(name) {
+  return JS_IDENT_RE.test(name) ? `tools.${name}` : `tools[${jsonLiteral(name)}]`;
+}
+
+export function buildCodeToolCatalog(clientTools) {
+  const entries = [...(clientTools instanceof Map ? clientTools.entries() : Object.entries(clientTools || {}))];
+  return entries.map(([name, meta]) => {
+    const normalized = normalizeClientToolMeta(name, meta);
+    const docs = describeClientTool(name, normalized);
+    const summary = normalized.description.trim().split("\n").map((l) => l.trim()).filter(Boolean)[0] || `${name} tool`;
+    return {
+      name,
+      path: toolAccessPath(name),
+      summary,
+      docs,
+    };
+  });
+}
+
 /** Build dynamic description for the single `code` MCP tool. */
 export function buildCodeToolDescription(clientTools) {
   const entries = [...(clientTools instanceof Map ? clientTools.entries() : Object.entries(clientTools || {}))];
   const toolBlocks = entries.map(([name, meta]) => describeClientTool(name, meta));
   return (
     "Run a full async JavaScript program that calls the client's tools and returns a summary. "
-    + "ALWAYS favor intelligent logic, and ALWAYS favor maximum batching and parallelism ALL the time: every independent tool call goes in one `Promise.all` wave, every time — no exceptions. Drive every call through the script's tool call functions (`tools.<Name>(args)`, `callTool(name, args)`) and wrap independent calls in `Promise.all`. Push branching/loops/retries/aggregation into the script. There is no time, wave, or call limit — one code call can do an entire task. "
+    + "Favor intelligent logic, batching, and parallelism: every independent tool call should run in one `Promise.all` or `codemode.batch` wave. Push branching, loops, retries, and aggregation into this script instead of returning to the model between dependent steps. There is no time, wave, or call limit by default. "
     + "All client tools are available only through this script runtime; do not expect original tools outside `code`. "
-    + "Call tools with `await tools.<Name>(args)`, `await tools[\"Any-Name\"]`, or `await callTool(name, args)`; each returns `{ text, raw, isError }` (JSON.parse r.text when the tool returns JSON). "
-    + "The signatures below are TypeScript-shaped docs only; write executable JavaScript, not TypeScript syntax (no type annotations, interfaces, or generics). "
-    + "args MUST match the TypeScript signature for that tool below: a trailing ? marks an optional field, "
-    + "\"a\" | \"b\" lists the allowed literal values, and Array<T> is an array. "
-    + "Descriptions, comments, defaults, examples, formats, and patterns come from the client schema; follow them exactly. "
-    + "Bake branching/loops into the script — if the next step DEPENDS on a tool's result, do NOT return to the model: feed one call's output into the next call's args, loop over a result set, branch on a status, retry on failure — all in the same script. A dependent chain is a reason to write more JavaScript, not to split into more code calls or model turns. "
-    + "DECISION RULE: before each wave, list all calls needed; batch every pair where you can write B's args before A returns into one `await Promise.all([...])`. "
-    + "Read-only commands and tools (file reads, grep/glob/search, `git status`, `git diff`, `gh release view`, validation/tests that do not depend on an earlier mutation) with no cross-deps → always one wave. Sequential `await`s for independent reads are the top mistake. "
-    + "Only batch calls that are independent: if one call's args depend on another's result, or calls have ordering side-effects (`git fetch` → `git log origin/main..HEAD`; create dir → write into it; `git add` → `git commit`), sequence them with separate `await`s. "
-    + "Write real logic: loops, bounded retry/validate, fan-out+reduce, guards/early-return — not one await per script. "
-    + "Edit via the client's anchored search/replace tool: read the file, then either copy old_string VERBATIM from the bytes you read (exact whitespace) or, if the tool offers start_anchor/end_anchor and your read result has an .anchored view, point at those anchors instead — the top cause of failed edits is a mismatched old_string — use the smallest unique snippet, edit in the same script, and avoid full-file or whole-line rewrites. One file with many changes: prefer a single MultiEdit, else await edits to that path one at a time (never two edits to the same file in one parallel wave); different files edit in parallel. "
-    + "Do not put order-dependent or side-effect-chained calls (create dir → write into it) in one wave. "
-    + "OUTPUT MECHANICS: raw tool results are for the script only; the assistant sees only your final return. Keep bulky data in variables and return a small, decision-ready object: verdict/status, counts, paths with line numbers, first failing assertion or error tail, and only the exact snippets needed for the answer or next edit. Do not return raw Read/file contents, full diffs, full test logs, or large JSON arrays. Filter/map/reduce inside JavaScript; for large result sets return totals plus the top matches/failures and enough context to act. "
-    + "Return only the conclusion — the verdict/summary/fields; intermediate results stay inside the script and only the script's return value is seen by the assistant. "
-    + "Ex — dependent chain (one call's output drives the next, then fan out over the discovered set): "
-    + "const status = (await tools.Execute({ command: \"git status --porcelain\" })).text; "
-    + "if (!status.trim()) return { clean: true }; "
-    + "const files = status.split(\"\\n\").map(l => l.slice(3)).filter(Boolean); "
-    + "const diffs = await Promise.all(files.map(f => tools.Execute({ command: `git diff -- ${f}` }))); "
-    + "return { changed: files.length, files: diffs.map((d, i) => ({ file: files[i], lines: d.text.split(\"\\n\").length })) }; "
-    + "Ex — bounded retry/validate loop (fix and re-run in-script, no model round-trip per attempt): "
-    + "let out; for (let i = 0; i < 3; i++) { out = JSON.parse((await tools.RunValidation({ argv: [\"node\", \"--test\"] })).text); if (out.exitCode === 0) break; await tools.Edit({ /* derive a fix from out.stderr, then loop */ }); } "
-    + "return { passed: out.exitCode === 0, attempts: i + 1, stderr: out.stderr.slice(0, 400) }.\n\n"
+    + "Runtime API: `await tools.<Name>(args)`, `await tools[\"Any-Name\"](args)`, `await callTool(name, args)`, or `await codemode.call(name, args)`. `codemode.batch([['Tool', args], ...])` starts independent calls together. `codemode.search(query)` finds matching tool docs, and `codemode.describe(nameOrPath)` returns focused TypeScript-shaped docs for one tool. "
+    + "Each tool call returns a string-like `ToolResult` with `{ text, raw, isError }`, optional `.anchored`, `.json()` for JSON text, and `.lines({ trim, nonEmpty })` for line processing. Prefer `.text` for clarity, but string methods like `.includes()` and `.split()` work directly on the result. "
+    + "Only batch independent calls. If B's args depend on A's result, or the calls have ordered side effects, use separate awaits. For edits, read first; use exact bytes from the read result or start_anchor/end_anchor from `.anchored` when available, and never parallelize multiple edits to the same file. "
+    + "Return a compact decision-ready object: status, counts, paths with line numbers, first failing assertion or error tail, and exact snippets needed for the next step. Keep raw reads, full diffs, test logs, and large arrays inside local variables. "
+    + "The signatures below are TypeScript-shaped docs only; write executable JavaScript, not TypeScript syntax. Args must match the signature: ? means optional, literal unions list allowed values, and Array<T> is an array. Schema descriptions, defaults, examples, formats, and patterns are authoritative.\n\n"
     + (toolBlocks.length ? `Available tools:\n\n${toolBlocks.join("\n\n")}` : "Available tools: (none)")
   );
 }
@@ -250,11 +251,12 @@ export function formatCodeResult(value, logs = [], { maxBytes = DEFAULT_SCRIPT_O
  * which rejects the wave's calls).
  *
  * @param {string} script
- * @param {{ toolNames: string[], dispatchWave: Function, timeoutMs?: number, maxWaves?: number, maxCalls?: number, signal?: AbortSignal }} opts
+ * @param {{ toolNames: string[], toolDocs?: Array<{name:string,path?:string,summary?:string,docs?:string}>, dispatchWave: Function, timeoutMs?: number, maxWaves?: number, maxCalls?: number, signal?: AbortSignal }} opts
  * @returns {Promise<{ value: *, logs: string[], waves: number, calls: number }>}
  */
 export function runCodeScriptDynamic(script, {
   toolNames = [],
+  toolDocs = [],
   dispatchWave,
   timeoutMs = DEFAULT_SCRIPT_TIMEOUT_MS,
   maxWaves = DEFAULT_MAX_WAVES,
@@ -387,6 +389,7 @@ export function runCodeScriptDynamic(script, {
         type: "run",
         script,
         toolNames,
+        toolDocs,
         maxWaves,
         maxCalls,
       });

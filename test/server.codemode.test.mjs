@@ -12,6 +12,7 @@ import {
   runCodeScriptDynamic,
   formatCodeResult,
   buildCodeToolDescription,
+  buildCodeToolCatalog,
   CodeValidationError,
 } from "../src/code-mode.mjs";
 import {
@@ -145,6 +146,14 @@ test("buildCodeToolDescription lists client tools", () => {
   assert.match(d, /Glob/);
 });
 
+test("buildCodeToolCatalog exposes focused tool docs", () => {
+  const c = buildCodeToolCatalog(CLIENT_TOOLS);
+  assert.deepEqual(c.map((t) => t.path), ["tools.Grep", "tools.Glob", "tools.Execute"]);
+  assert.match(c[0].summary, /grep/);
+  assert.match(c[0].docs, /Grep\(args: \{/);
+  assert.match(c[0].docs, /pattern: string/);
+});
+
 test("buildCodeToolDescription emits typed signatures with required/optional and enums", () => {
   const d = buildCodeToolDescription(CLIENT_TOOLS);
   assert.match(d, /pattern: string/);
@@ -155,7 +164,7 @@ test("buildCodeToolDescription emits typed signatures with required/optional and
   assert.doesNotMatch(d, /folder\?:/);
   assert.match(d, /### Grep/);
   assert.match(d, /Grep\(args: \{/);
-  assert.match(d, /Return only the conclusion/);
+  assert.match(d, /Return a compact decision-ready object/);
 });
 
 test("buildCodeToolDescription renders the exact arg type that previously misfired (string, not object)", () => {
@@ -239,63 +248,39 @@ test("buildCodeToolDescription script-first guidance mentions tools.X and Promis
   const d = buildCodeToolDescription(new Map());
   assert.match(d, /await tools\.<Name>\(args\)/);
   assert.match(d, /Promise\.all/);
-  assert.match(d, /Bake branching/);
-  assert.match(d, /order-dependent/);
-  assert.match(d, /DECISION RULE/);
+  assert.match(d, /ToolResult/);
+  assert.match(d, /codemode\.batch/);
+  assert.match(d, /codemode\.search/);
+  assert.match(d, /codemode\.describe/);
+  assert.match(d, /Push branching, loops, retries, and aggregation/);
+  assert.match(d, /ordered side effects/);
 });
 
-test("buildCodeToolDescription includes intelligent-logic and anchored-edit guidance", () => {
+test("buildCodeToolDescription includes compact logic and anchored-edit guidance", () => {
   const d = buildCodeToolDescription(new Map());
-  // core principle: always favor logic + batching/parallelism, no caps
-  assert.match(d, /ALWAYS favor intelligent logic/);
-  assert.match(d, /maximum batching and parallelism/);
-  assert.match(d, /no time, wave, or call limit/);
-  // logic: real control flow, not one await per script
-  assert.match(d, /Write real logic/);
-  assert.match(d, /retry/i);
-  assert.match(d, /fan-out\+reduce/);
-  assert.match(d, /not one await per script/);
-  // dependent steps: script them rather than splitting into more code calls
-  assert.match(d, /DEPENDS on a tool's result/);
-  assert.match(d, /feed one call's output into the next/);
-  // editing: anchored search/replace, verbatim old_string, smallest unique snippet
-  assert.match(d, /anchored search\/replace/);
-  assert.match(d, /copy old_string VERBATIM/);
-  assert.match(d, /smallest unique snippet/);
-  assert.match(d, /avoid full-file or whole-line rewrites/);
+  assert.match(d, /Favor intelligent logic, batching, and parallelism/);
+  assert.match(d, /no time, wave, or call limit by default/);
+  assert.match(d, /retr/i);
+  assert.match(d, /dependent steps/);
+  assert.match(d, /exact bytes from the read result/);
+  assert.match(d, /start_anchor\/end_anchor/);
+  assert.match(d, /never parallelize multiple edits to the same file/);
 });
 
 test("buildCodeToolDescription includes output mechanics", () => {
   const d = buildCodeToolDescription(new Map());
-  assert.match(d, /OUTPUT MECHANICS/);
-  assert.match(d, /raw tool results are for the script only/);
-  assert.match(d, /small, decision-ready object/);
-  assert.match(d, /Do not return raw Read\/file contents/);
-  assert.match(d, /Filter\/map\/reduce inside JavaScript/);
+  assert.match(d, /Return a compact decision-ready object/);
+  assert.match(d, /status, counts, paths with line numbers/);
+  assert.match(d, /Keep raw reads, full diffs, test logs, and large arrays inside local variables/);
 });
 
-test("buildCodeToolDescription includes decision rule, read-only carve-out, dependency guard, JS guard, compact returns, examples", () => {
+test("buildCodeToolDescription includes dependency guard, JS guard, and compact returns", () => {
   const d = buildCodeToolDescription(new Map());
-  // pre-wave decision rule: write B's args before A returns
-  assert.match(d, /DECISION RULE/);
-  assert.match(d, /before each wave, list all calls needed/i);
-  assert.match(d, /write B's args before A returns/);
-  // read-only fan-out carve-out
-  assert.match(d, /Read-only commands and tools/);
-  assert.match(d, /gh release view/);
-  assert.match(d, /always one wave/);
-  // dependency guard
-  assert.match(d, /Only batch calls that are independent/);
-  assert.match(d, /git add` → `git commit`/);
-  // JavaScript-not-TypeScript guard
+  assert.match(d, /Only batch independent calls/);
+  assert.match(d, /If B's args depend on A's result/);
   assert.match(d, /write executable JavaScript, not TypeScript syntax/);
-  // compact returns
-  assert.match(d, /verdict\/summary\/fields/);
-  // examples consolidated into the tool description
-  assert.match(d, /dependent chain/);
-  assert.match(d, /bounded retry\/validate loop/);
-  assert.match(d, /\["node", "--test"\]/);
-  // phased-gather example was removed — maximal batching is forced, no serial phase carve-out
+  assert.match(d, /Schema descriptions, defaults, examples, formats, and patterns are authoritative/);
+  assert.match(d, /exact snippets needed for the next step/);
   assert.doesNotMatch(d, /Phased gather/);
   assert.doesNotMatch(d, /git fetch --all --tags --prune/);
 });
@@ -416,6 +401,141 @@ test("runCodeScriptDynamic: callTool generic form works", async () => {
     },
   );
   assert.equal(r.value, "out:x");
+});
+
+test("runCodeScriptDynamic: tool result behaves like a string while preserving metadata", async () => {
+  const r = await runCodeScriptDynamic(
+    `
+      const content = await tools.Read({ path: "x" });
+      return {
+        instance: content instanceof ToolResult,
+        includes: content.includes("beta"),
+        split: content.split("\\n").length,
+        match: content.match(/beta/)[0],
+        replace: content.replace("beta", "BETA"),
+        length: content.length,
+        string: String(content),
+        template: \`\${content}\`,
+        text: content.text,
+        isError: content.isError,
+        anchored: content.anchored
+      };
+    `,
+    {
+      toolNames: ["Read"],
+      dispatchWave: async () => [{ text: "alpha\nbeta", raw: { ok: true }, isError: false, anchored: "a1:a2" }],
+      timeoutMs: 5000,
+    },
+  );
+  assert.deepEqual(r.value, {
+    instance: true,
+    includes: true,
+    split: 2,
+    match: "beta",
+    replace: "alpha\nBETA",
+    length: 10,
+    string: "alpha\nbeta",
+    template: "alpha\nbeta",
+    text: "alpha\nbeta",
+    isError: false,
+    anchored: "a1:a2",
+  });
+});
+
+test("runCodeScriptDynamic: ToolResult constructor is script-visible", async () => {
+  const r = await runCodeScriptDynamic(
+    "const r = new ToolResult({ text: 'x', raw: { a: 1 }, isError: true }); return { instance: r instanceof ToolResult, text: `${r}`, raw: r.raw.a, isError: r.isError };",
+    {
+      toolNames: [],
+      dispatchWave: async () => [],
+      timeoutMs: 5000,
+    },
+  );
+  assert.deepEqual(r.value, { instance: true, text: "x", raw: 1, isError: true });
+});
+
+test("runCodeScriptDynamic: tool result has json and lines helpers", async () => {
+  const r = await runCodeScriptDynamic(
+    `
+      const data = await tools.Json({});
+      const lines = await tools.Lines({});
+      return { ok: data.json().ok, lines: lines.lines({ trim: true, nonEmpty: true }) };
+    `,
+    {
+      toolNames: ["Json", "Lines"],
+      dispatchWave: async (w, calls) => calls.map((c) => (
+        c.name === "Json"
+          ? { text: '{"ok":true}', raw: null, isError: false }
+          : { text: " a\n\n b ", raw: null, isError: false }
+      )),
+      timeoutMs: 5000,
+    },
+  );
+  assert.deepEqual(r.value, { ok: true, lines: ["a", "b"] });
+});
+
+test("runCodeScriptDynamic: codemode.batch batches tuple calls into one wave", async () => {
+  const waves = [];
+  const r = await runCodeScriptDynamic(
+    `
+      const [a, b] = await codemode.batch([["A", { x: 1 }], ["B", { y: 2 }]]);
+      return a + b;
+    `,
+    {
+      toolNames: ["A", "B"],
+      dispatchWave: async (w, calls) => {
+        waves.push(calls);
+        return calls.map((c) => ({ text: c.name, raw: null, isError: false }));
+      },
+      timeoutMs: 5000,
+    },
+  );
+  assert.equal(r.value, "AB");
+  assert.equal(r.waves, 1);
+  assert.equal(waves[0].length, 2);
+});
+
+test("runCodeScriptDynamic: batch handles already-started tool promises", async () => {
+  const waves = [];
+  const r = await runCodeScriptDynamic(
+    `
+      const [a, b] = await batch([tools.A({}), tools.B({})]);
+      return a.text + b.text;
+    `,
+    {
+      toolNames: ["A", "B"],
+      dispatchWave: async (w, calls) => {
+        waves.push(calls);
+        return calls.map((c) => ({ text: c.name, raw: null, isError: false }));
+      },
+      timeoutMs: 5000,
+    },
+  );
+  assert.equal(r.value, "AB");
+  assert.equal(r.waves, 1);
+  assert.equal(waves[0].length, 2);
+});
+
+test("runCodeScriptDynamic: codemode.search and describe expose focused tool docs", async () => {
+  const r = await runCodeScriptDynamic(
+    `
+      const hits = codemode.search("grep pattern");
+      return { first: hits[0].path, docs: codemode.describe(hits[0].path) };
+    `,
+    {
+      toolNames: ["Grep"],
+      toolDocs: [{
+        name: "Grep",
+        path: "tools.Grep",
+        summary: "grep files by pattern",
+        docs: "### Grep\nGrep(args: { pattern: string; path: string; })",
+      }],
+      dispatchWave: async () => [],
+      timeoutMs: 5000,
+    },
+  );
+  assert.equal(r.value.first, "tools.Grep");
+  assert.match(r.value.docs, /pattern: string/);
 });
 
 test("runCodeScriptDynamic: console.log captured", async () => {

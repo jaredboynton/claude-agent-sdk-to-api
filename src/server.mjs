@@ -54,6 +54,7 @@ import {
   validateCodeInput,
   runCodeScriptDynamic,
   buildCodeToolDescription,
+  buildCodeToolCatalog,
   formatCodeResult,
   codeToolInputShape,
   normalizeClientToolMeta,
@@ -1231,10 +1232,12 @@ function startCodeRun(session, codeToolUseId, input) {
   session.suppressEndTurn = true; // swallow T0's message_stop while the run is active
 
   const toolNames = [...session.clientTools.keys()];
+  const toolDocs = buildCodeToolCatalog(session.clientTools);
   const t0 = Date.now();
 
   run.promise = runCodeScriptDynamic(script, {
     toolNames,
+    toolDocs,
     maxWaves: CODE_MAX_WAVES,
     maxCalls: CODE_MAX_CALLS,
     timeoutMs: CODE_SCRIPT_TIMEOUT_MS,

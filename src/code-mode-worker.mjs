@@ -22,9 +22,115 @@ let waveSeq = 0;
 let callCount = 0;
 let maxWaves = 0; // 0 = unlimited
 let maxCalls = 0; // 0 = unlimited
+let toolDocs = [];
+
+const toolResultTargets = new WeakMap();
 
 function postToParent(msg) {
   parentPort.postMessage(msg);
+}
+
+function ToolResult(result = {}) {
+  return makeToolResult(result);
+}
+
+function textOf(result) {
+  if (typeof result?.text === "string") return result.text;
+  if (result?.text == null) return "";
+  return String(result.text);
+}
+
+function makeToolResult(result = {}) {
+  const target = {
+    text: textOf(result),
+    raw: result.raw ?? null,
+    isError: !!result.isError,
+  };
+  Object.setPrototypeOf(target, ToolResult.prototype);
+  if (Object.prototype.hasOwnProperty.call(result, "anchored")) target.anchored = result.anchored;
+
+  const proxy = new Proxy(target, {
+    get(obj, prop, receiver) {
+      if (prop === Symbol.toPrimitive) return () => obj.text;
+      if (prop === "toString" || prop === "valueOf") return () => obj.text;
+      if (prop === "json") return () => JSON.parse(obj.text);
+      if (prop === "lines") {
+        return (opts = {}) => {
+          let lines = obj.text.split(/\r?\n/);
+          if (opts.trim) lines = lines.map((line) => line.trim());
+          if (opts.nonEmpty) lines = lines.filter(Boolean);
+          return lines;
+        };
+      }
+      if (Reflect.has(obj, prop)) return Reflect.get(obj, prop, receiver);
+      const textValue = obj.text;
+      const textProp = textValue[prop];
+      return typeof textProp === "function" ? textProp.bind(textValue) : textProp;
+    },
+    has(obj, prop) {
+      return prop in obj || prop in obj.text;
+    },
+  });
+  toolResultTargets.set(proxy, target);
+  return proxy;
+}
+
+function plainToolResult(value) {
+  const target = toolResultTargets.get(value);
+  if (!target) return null;
+  const out = {
+    text: target.text,
+    raw: target.raw,
+    isError: target.isError,
+  };
+  if (Object.prototype.hasOwnProperty.call(target, "anchored")) out.anchored = target.anchored;
+  return out;
+}
+
+function dehydrateValue(value, seen = new WeakMap()) {
+  if (value == null || typeof value !== "object") {
+    if (typeof value === "function") return undefined;
+    return value;
+  }
+  const plain = plainToolResult(value);
+  if (plain) return dehydrateValue(plain, seen);
+  if (seen.has(value)) return seen.get(value);
+  const tag = Object.prototype.toString.call(value);
+  if (
+    tag === "[object Date]"
+    || tag === "[object RegExp]"
+    || tag === "[object ArrayBuffer]"
+    || ArrayBuffer.isView(value)
+  ) {
+    return value;
+  }
+  if (tag === "[object Map]") {
+    const out = new Map();
+    seen.set(value, out);
+    for (const [key, item] of value.entries()) {
+      out.set(dehydrateValue(key, seen), dehydrateValue(item, seen));
+    }
+    return out;
+  }
+  if (tag === "[object Set]") {
+    const out = new Set();
+    seen.set(value, out);
+    for (const item of value.values()) out.add(dehydrateValue(item, seen));
+    return out;
+  }
+  if (Array.isArray(value)) {
+    const out = [];
+    seen.set(value, out);
+    for (const item of value) out.push(dehydrateValue(item, seen));
+    return out;
+  }
+  const out = {};
+  seen.set(value, out);
+  for (const [key, item] of Object.entries(value)) {
+    const dehydrated = dehydrateValue(item, seen);
+    if (dehydrated !== undefined) out[key] = dehydrated;
+  }
+  return out;
 }
 
 function makeCallTool(name) {
@@ -33,11 +139,11 @@ function makeCallTool(name) {
 
 function callTool(name, args) {
   if (maxCalls > 0 && callCount >= maxCalls) {
-    return Promise.resolve({
+    return Promise.resolve(makeToolResult({
       text: `code call limit reached (${maxCalls} calls)`,
       raw: null,
       isError: true,
-    });
+    }));
   }
   callCount++;
   const call = { name, args: args && typeof args === "object" ? args : {} };
@@ -59,7 +165,7 @@ async function flush() {
   pending = [];
   waveSeq++;
   if (maxWaves > 0 && waveSeq > maxWaves) {
-    for (const c of batch) c.__resolve({ text: `code wave limit reached (${maxWaves} waves)`, raw: null, isError: true });
+    for (const c of batch) c.__resolve(makeToolResult({ text: `code wave limit reached (${maxWaves} waves)`, raw: null, isError: true }));
     flushing = false;
     return;
   }
@@ -103,10 +209,99 @@ function handleWaveResult(msg) {
     const results = msg.results || [];
     for (let i = 0; i < batch.length; i++) {
       const r = results[i] || { text: "(no result)", raw: null, isError: true };
-      batch[i].__resolve(r);
+      batch[i].__resolve(makeToolResult(r));
     }
   }
   resolveWave();
+}
+
+function normalizeToolDocs(docs = [], toolNames = []) {
+  const byName = new Map();
+  for (const doc of Array.isArray(docs) ? docs : []) {
+    if (!doc || typeof doc.name !== "string") continue;
+    byName.set(doc.name, {
+      name: doc.name,
+      path: typeof doc.path === "string" && doc.path ? doc.path : toolPath(doc.name),
+      summary: typeof doc.summary === "string" ? doc.summary : "",
+      docs: typeof doc.docs === "string" ? doc.docs : "",
+    });
+  }
+  for (const name of Array.isArray(toolNames) ? toolNames : []) {
+    if (typeof name !== "string" || byName.has(name)) continue;
+    byName.set(name, {
+      name,
+      path: toolPath(name),
+      summary: "",
+      docs: `${name}(args: {})`,
+    });
+  }
+  return [...byName.values()];
+}
+
+function toolPath(name) {
+  return /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name)
+    ? `tools.${name}`
+    : `tools[${JSON.stringify(name)}]`;
+}
+
+function findToolDoc(nameOrPath) {
+  const needle = String(nameOrPath || "").trim();
+  if (!needle) return null;
+  return toolDocs.find((doc) => (
+    doc.name === needle
+    || doc.path === needle
+    || doc.path.endsWith(`.${needle}`)
+    || doc.path.endsWith(`["${needle}"]`)
+  )) || null;
+}
+
+function searchToolDocs(query = "") {
+  const terms = String(query || "").toLowerCase().split(/[^a-z0-9_$.-]+/).filter(Boolean);
+  const scored = toolDocs.map((doc) => {
+    const haystack = `${doc.name} ${doc.path} ${doc.summary} ${doc.docs}`.toLowerCase();
+    const score = terms.length ? terms.reduce((n, term) => n + (haystack.includes(term) ? 1 : 0), 0) : 1;
+    return {
+      path: doc.path,
+      name: doc.name,
+      score,
+      summary: doc.summary,
+    };
+  });
+  return scored
+    .filter((item) => item.score > 0)
+    .sort((a, b) => b.score - a.score || a.name.localeCompare(b.name))
+    .slice(0, 8)
+    .map(({ score: _score, ...item }) => item);
+}
+
+function describeToolDoc(nameOrPath) {
+  const doc = findToolDoc(nameOrPath);
+  if (doc) return doc.docs || `${doc.name}(args: {})`;
+  const matches = searchToolDocs(nameOrPath).map((item) => item.path);
+  if (matches.length) return `No exact tool match for ${String(nameOrPath)}. Closest: ${matches.join(", ")}`;
+  return `No tool match for ${String(nameOrPath)}`;
+}
+
+function batch(items = []) {
+  if (!Array.isArray(items)) return Promise.reject(new Error("codemode.batch expects an array"));
+  const calls = items.map((item) => {
+    if (item && typeof item.then === "function") return item;
+    if (Array.isArray(item)) return callTool(item[0], item[1] || {});
+    if (item && typeof item === "object" && (typeof item.name === "string" || typeof item.tool === "string")) {
+      return callTool(item.name || item.tool, item.args || {});
+    }
+    return Promise.resolve(makeToolResult({ text: "invalid batch item", raw: null, isError: true }));
+  });
+  return Promise.all(calls);
+}
+
+function buildCodemodeGlobal() {
+  return Object.freeze({
+    call: callTool,
+    batch,
+    search: searchToolDocs,
+    describe: describeToolDoc,
+  });
 }
 
 function buildToolsProxy(toolNames = []) {
@@ -129,6 +324,7 @@ function buildToolsProxy(toolNames = []) {
 
 async function runScript(script, toolNames) {
   const tools = buildToolsProxy(toolNames);
+  const codemode = buildCodemodeGlobal();
 
   const sandboxConsole = {
     log: (...a) => workerLogs.push(a.map(String).join(" ")),
@@ -140,6 +336,9 @@ async function runScript(script, toolNames) {
   const context = vm.createContext({
     tools,
     callTool,
+    ToolResult,
+    batch,
+    codemode,
     JSON,
     Math,
     console: sandboxConsole,
@@ -191,11 +390,12 @@ parentPort.on("message", async (msg) => {
   if (msg?.type === "run") {
     maxWaves = msg.maxWaves ?? 0;
     maxCalls = msg.maxCalls ?? 0;
+    toolDocs = normalizeToolDocs(msg.toolDocs || [], msg.toolNames || []);
     try {
       const value = await runScript(msg.script, msg.toolNames || []);
       postToParent({
         type: "done",
-        value: value === undefined ? null : value,
+        value: value === undefined ? null : dehydrateValue(value),
         logs: workerLogs.slice(),
         waves: waveSeq,
         calls: callCount,
