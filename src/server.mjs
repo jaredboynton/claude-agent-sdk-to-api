@@ -714,6 +714,11 @@ function ensureSseHeaders(session) {
 }
 
 function writeSseChunk(session, chunk) {
+  // session.res can be nulled by onClose between heartbeat ticks; the heartbeat
+  // guards on the captured res.writableEnded, but a client disconnect sets
+  // session.res=null while writableEnded is still false. Without this guard the
+  // next keep-alive tick throws null.write and kills the whole daemon.
+  if (!session.res || session.res.destroyed || session.res.writableEnded) return;
   ensureSseHeaders(session);
   session.res.write(chunk);
 }
@@ -2170,6 +2175,9 @@ async function handleMessages(req, res) {
     onClose = () => {
       const aborted = !res.writableEnded;
       if (session.res === res) session.res = null;
+      // Stop keep-alive ticks once the response closes; otherwise a disconnect
+      // arms a post-close tick that races session.res=null and crashes.
+      if (heartbeat) { clearInterval(heartbeat); heartbeat = null; }
       if (aborted && session.codeRun?.currentWave?.dispatched) {
         process.stderr.write(`${LOG_PREFIX} client disconnected during code wave key=${session.key.slice(0, 8)}; aborting code run\n`);
         if (session.currentTurn) failTurn(session, new Error("client disconnected during code wave"));
@@ -2462,6 +2470,7 @@ export {
   normalizeToolInput,
   extractIdHint,
   abandonToolRound,
+  writeSseChunk,
   buildParkingMcpServer,
   hasActiveToolRound,
   pushColdStartFrames,

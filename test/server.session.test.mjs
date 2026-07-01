@@ -29,6 +29,7 @@ import {
   toolInputShape,
   resolveCwd,
   isValidCwd,
+  writeSseChunk,
 } from "../src/server.mjs";
 import { z } from "../src/sdk.mjs";
 
@@ -772,4 +773,53 @@ test("decideWarmAction: system-only tail -> noop (no fabricated user turn)", () 
 test("decideWarmAction: empty tail -> noop", () => {
   const d = decideWarmAction([]);
   assert.equal(d.action, "noop");
+});
+
+// Regression: the SSE keep-alive heartbeat used to crash the daemon when a
+// client disconnected mid-stream. onClose nulls session.res while
+// res.writableEnded is still false, so the next heartbeat tick called
+// session.res.write on null. writeSseChunk must be null/destroyed/ended-safe.
+function mockRes({ writableEnded = false, destroyed = false } = {}) {
+  return {
+    writableEnded,
+    destroyed,
+    statusCode: 0,
+    writableEndedHit: false,
+    headers: {},
+    written: [],
+    setHeader(k, v) { this.headers[k] = v; },
+    flushHeaders() {},
+    write(chunk) { this.written.push(chunk); return true; },
+    end() { this.writableEndedHit = true; },
+  };
+}
+
+test("writeSseChunk is a no-op when session.res is null (heartbeat-after-disconnect crash guard)", () => {
+  const session = { res: null, sseHeadersWritten: false };
+  // Must not throw.
+  writeSseChunk(session, ": keep-alive\n\n");
+  assert.equal(session.sseHeadersWritten, false);
+});
+
+test("writeSseChunk is a no-op when res is destroyed", () => {
+  const res = mockRes({ destroyed: true });
+  const session = { res, sseHeadersWritten: false };
+  writeSseChunk(session, ": keep-alive\n\n");
+  assert.equal(res.written.length, 0, "destroyed res must not be written to");
+});
+
+test("writeSseChunk is a no-op when res.writableEnded is true", () => {
+  const res = mockRes({ writableEnded: true });
+  const session = { res, sseHeadersWritten: false };
+  writeSseChunk(session, ": keep-alive\n\n");
+  assert.equal(res.written.length, 0, "ended res must not be written to");
+});
+
+test("writeSseChunk writes to a live res", () => {
+  const res = mockRes();
+  const session = { res, sseHeadersWritten: false };
+  writeSseChunk(session, ": keep-alive\n\n");
+  assert.equal(res.written.length, 1);
+  assert.equal(res.written[0], ": keep-alive\n\n");
+  assert.equal(session.sseHeadersWritten, true);
 });
