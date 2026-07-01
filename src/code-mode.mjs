@@ -27,82 +27,6 @@ const DEFAULT_SCRIPT_OUTPUT_MAX_BYTES = Number(process.env.CODE_SCRIPT_MAX_OUTPU
 
 const WORKER_PATH = join(dirname(fileURLToPath(import.meta.url)), "code-mode-worker.mjs");
 
-export const CODE_MODE_APPEND = `
-
-<tool_use_guidance>
-You have one tool, \`code\`, that runs an async JavaScript program. Inside it, call the client's tools and return a small result:
-
-\`\`\`
-const r = await tools.<Name>(args);            // any client tool listed below
-const r = await tools["Some-Tool-Name"](args); // names that aren't JS identifiers
-const r = await callTool(name, args);          // generic form
-\`\`\`
-
-Each call returns \`{ text, raw, isError }\`; use \`r.text\`, or \`JSON.parse(r.text)\` for JSON tools. Only the script's return value reaches you — raw tool output never enters your context.
-
-<principle>
-Maximize parallelism and intelligent logic. Whenever you perform multiple independent operations, issue all of them in one \`await Promise.all([...])\` wave — not sequential \`await\`s. Err on the side of maximizing parallel calls. Do as much as possible in one \`code\` call: gather everything you can in parallel, then branch, loop, and aggregate in JavaScript. One \`code\` call is a single model round-trip no matter how many tools it touches, and the tool waves inside it cost nothing against your context. There is no time, wave, or call limit. Return for another \`code\` call only when you must show the user intermediate output or get their input.
-</principle>
-
-<decision_rule>
-Before each wave, list every tool call needed for this phase. For each pair, ask: "Can I write call B's arguments before call A returns?" If yes for all pairs, batch them in one \`Promise.all\`. If B's args depend on A's result, keep B in a later wave.
-</decision_rule>
-
-<calling_tools>
-- Read-only operations — file reads, greps, globs, web searches, \`git status\`, \`git diff\`, \`gh release view\`, and tests/validation that only read the current tree — are safe to parallelize unless one call's args depend on another's result. Batch all reads for a phase in one wave. Sequential \`await\`s for independent reads are the top mistake.
-- Only batch calls that are independent. If one call's args depend on another's result, or if calls have ordering side-effects (\`git fetch\` → \`git log origin/main..HEAD\`; create dir → write into it; write file → test that file; \`git add\` → \`git commit\`), sequence them with separate \`await\`s.
-- Dependent calls stay in the script: feed one call's output into the next call's args, loop over a discovered set, branch on a status, retry on failure. A dependency is a reason to write a few more lines here, not to split into another \`code\` call or model turn.
-</calling_tools>
-
-<language>
-The tool signatures below are TypeScript-shaped documentation for argument types only. The script you write is JavaScript: do not use type annotations, interfaces, or generics.
-</language>
-
-<working_with_results>
-- Process results in the script: filter, count, join, diff, extract, summarize. Return the conclusion — a verdict, a few fields, a short summary — not raw file or search contents.
-- Editing: prefer the client's anchored search/replace editor (an \`old_string\`/\`new_string\`-style pair — read its signature below, don't assume a name) over rewriting whole files or lines. The #1 cause of failed edits is an \`old_string\` that doesn't byte-match the file, so COPY \`old_string\` VERBATIM from the bytes you just read (exact whitespace, indentation, and quotes) — never retype or reformat it from memory — OR, if the editor exposes \`start_anchor\`/\`end_anchor\` and your read result carries an \`.anchored\` view, point at those anchor tokens instead and skip copying entirely. Use the smallest snippet that is unique; if it isn't unique, extend it (add an adjacent line) rather than rewriting more, and match by content, not line numbers. Read the file and compute the edits in the same script so its body never round-trips through you. To change ONE file in several places, prefer a single MultiEdit; otherwise \`await\` the edits to that file one after another (never fire two edits to the same path in one parallel wave — they would clobber each other). Edits to DIFFERENT files are independent and should run together in one parallel wave. If there's no anchored editor, fall back to a write tool but still compute the content in-script from the read.
-- All client tool calls must happen inside \`code\`; original tools are available only as script functions.
-</working_with_results>
-
-<examples>
-Phased gather — one required serial step, then a wide read-only wave:
-\`\`\`
-// Phase 1: only if remote refs must be fresh for later origin/main comparisons.
-await tools.Execute({ command: "git fetch --all --tags --prune" });
-
-// Phase 2: independent read-only/status work — all in one wave.
-const [status, log, diff, release, tests] = await Promise.all([
-  tools.Execute({ command: "git status --short" }),
-  tools.Execute({ command: "git log --oneline -10" }),
-  tools.Execute({ command: "git diff --stat" }),
-  tools.Execute({ command: "gh release view v1.22.6 --json tagName,createdAt" }),
-  tools.Execute({ command: "node --test test/rt-map-seed.test.mjs" }),
-]);
-return { status: status.text, log: log.text, diffstat: diff.text, release: release.text, tests: tests.text };
-\`\`\`
-
-Dependent chain — one call's output drives the next, then fan out over the discovered set:
-\`\`\`
-const status = (await tools.Execute({ command: "git status --porcelain" })).text;
-if (!status.trim()) return { clean: true };
-const files = status.split("\\n").map(l => l.slice(3)).filter(Boolean);
-const diffs = await Promise.all(files.map(f => tools.Execute({ command: \\\`git diff -- \\\${f}\\\` })));
-return { changed: files.length, files: diffs.map((d, i) => ({ file: files[i], lines: d.text.split("\\n").length })) };
-\`\`\`
-
-Bounded retry/validate loop — fix and re-run in-script, no model round-trip per attempt:
-\`\`\`
-let out;
-for (let i = 0; i < 3; i++) {
-  out = JSON.parse((await tools.RunValidation({ argv: ["node", "--test"] })).text);
-  if (out.exitCode === 0) break;
-  await tools.Edit({ /* derive a fix from out.stderr, then loop */ });
-}
-return { passed: out.exitCode === 0, attempts: i + 1, stderr: out.stderr.slice(0, 400) };
-\`\`\`
-</examples>
-</tool_use_guidance>`;
-
 export class CodeValidationError extends Error {
   constructor(message) {
     super(message);
@@ -261,7 +185,7 @@ export function buildCodeToolDescription(clientTools) {
   const toolBlocks = entries.map(([name, meta]) => describeClientTool(name, meta));
   return (
     "Run a full async JavaScript program that calls the client's tools and returns a summary. "
-    + "ALWAYS favor intelligent logic, and ALWAYS favor maximum batching and parallelism: push branching/loops/retries/aggregation into the script and run every independent operation together in one parallel wave. There is no time, wave, or call limit — one code call can do an entire task. "
+    + "ALWAYS favor intelligent logic, and ALWAYS favor maximum batching and parallelism ALL the time: every independent tool call goes in one `Promise.all` wave, every time — no exceptions. Drive every call through the script's tool call functions (`tools.<Name>(args)`, `callTool(name, args)`) and wrap independent calls in `Promise.all`. Push branching/loops/retries/aggregation into the script. There is no time, wave, or call limit — one code call can do an entire task. "
     + "All client tools are available only through this script runtime; do not expect original tools outside `code`. "
     + "Call tools with `await tools.<Name>(args)`, `await tools[\"Any-Name\"]`, or `await callTool(name, args)`; each returns `{ text, raw, isError }` (JSON.parse r.text when the tool returns JSON). "
     + "The signatures below are TypeScript-shaped docs only; write executable JavaScript, not TypeScript syntax (no type annotations, interfaces, or generics). "
@@ -275,7 +199,16 @@ export function buildCodeToolDescription(clientTools) {
     + "Write real logic: loops, bounded retry/validate, fan-out+reduce, guards/early-return — not one await per script. "
     + "Edit via the client's anchored search/replace tool: read the file, then either copy old_string VERBATIM from the bytes you read (exact whitespace) or, if the tool offers start_anchor/end_anchor and your read result has an .anchored view, point at those anchors instead — the top cause of failed edits is a mismatched old_string — use the smallest unique snippet, edit in the same script, and avoid full-file or whole-line rewrites. One file with many changes: prefer a single MultiEdit, else await edits to that path one at a time (never two edits to the same file in one parallel wave); different files edit in parallel. "
     + "Do not put order-dependent or side-effect-chained calls (create dir → write into it) in one wave. "
-    + "Return only the conclusion — the verdict/summary/fields; intermediate results stay inside the script and only the script's return value is seen by the assistant.\n\n"
+    + "Return only the conclusion — the verdict/summary/fields; intermediate results stay inside the script and only the script's return value is seen by the assistant. "
+    + "Ex — dependent chain (one call's output drives the next, then fan out over the discovered set): "
+    + "const status = (await tools.Execute({ command: \"git status --porcelain\" })).text; "
+    + "if (!status.trim()) return { clean: true }; "
+    + "const files = status.split(\"\\n\").map(l => l.slice(3)).filter(Boolean); "
+    + "const diffs = await Promise.all(files.map(f => tools.Execute({ command: `git diff -- ${f}` }))); "
+    + "return { changed: files.length, files: diffs.map((d, i) => ({ file: files[i], lines: d.text.split(\"\\n\").length })) }; "
+    + "Ex — bounded retry/validate loop (fix and re-run in-script, no model round-trip per attempt): "
+    + "let out; for (let i = 0; i < 3; i++) { out = JSON.parse((await tools.RunValidation({ argv: [\"node\", \"--test\"] })).text); if (out.exitCode === 0) break; await tools.Edit({ /* derive a fix from out.stderr, then loop */ }); } "
+    + "return { passed: out.exitCode === 0, attempts: i + 1, stderr: out.stderr.slice(0, 400) }.\n\n"
     + (toolBlocks.length ? `Available tools:\n\n${toolBlocks.join("\n\n")}` : "Available tools: (none)")
   );
 }

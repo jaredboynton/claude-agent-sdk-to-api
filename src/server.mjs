@@ -50,7 +50,6 @@ import {
   buildResumeCatchupFrames,
 } from "./resume-index.mjs";
 import {
-  CODE_MODE_APPEND,
   CodeValidationError,
   validateCodeInput,
   runCodeScriptDynamic,
@@ -1499,11 +1498,10 @@ function createSession(key, model, tools, callerSystem, bucket, { resume, cwd = 
     turnMetrics: null,
   };
 
-  const systemAppend = callerSystem + CODE_MODE_APPEND;
   const mcpServer = buildParkingMcpServer(tools, session);
   const queryOptions = {
     model,
-    systemPrompt: { type: "preset", preset: "claude_code", append: systemAppend },
+    systemPrompt: { type: "preset", preset: "claude_code", append: callerSystem },
     settingSources: [],
     tools: [],
     mcpServers: mcpServer ? [mcpServer] : [],
@@ -1840,14 +1838,21 @@ async function resolveCodeModeToolResults(session, toolResults) {
 
 // Claude Code prompt/agent hooks (Stop, SubagentStop, PreToolUse, etc.) call the
 // Messages API with output_config.format (structured JSON). The SDK bridge cannot
-// honor that — it injects the claude_code preset, CODE_MODE_APPEND, and MCP tools,
-// so hook eval gets narrative text instead of {"ok": true/false} and Claude Code
-// reports "JSON validation failed". Passthrough those requests to api.anthropic.com.
+// honor that — it injects the claude_code preset and MCP tools, so hook eval gets
+// narrative text instead of {"ok": true/false} and Claude Code reports "JSON validation failed".
+// Similarly, statusline and hook requests send effort/model/context_window/rate_limits/cost
+// metadata that the bridge's intervention would corrupt. Passthrough those requests to api.anthropic.com.
 function needsStructuredOutputPassthrough(reqBody) {
   if (!reqBody || typeof reqBody !== "object") return false;
   if (reqBody.output_config?.format) return true;
   // Legacy field Claude Code still accepts during the structured-outputs transition.
   if (reqBody.output_format) return true;
+  // Claude Code hooks and statusline send effort level and other metadata.
+  if (reqBody.effort) return true;
+  // Usage and rate limit fields from statusline hooks.
+  if (reqBody.rate_limits) return true;
+  if (reqBody.cost) return true;
+  if (reqBody.context_window) return true;
   return false;
 }
 

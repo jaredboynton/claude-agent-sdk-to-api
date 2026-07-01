@@ -13,7 +13,6 @@ import {
   formatCodeResult,
   buildCodeToolDescription,
   CodeValidationError,
-  CODE_MODE_APPEND,
 } from "../src/code-mode.mjs";
 import {
   abandonToolRound,
@@ -263,7 +262,7 @@ test("buildCodeToolDescription includes intelligent-logic and anchored-edit guid
   assert.match(d, /avoid full-file or whole-line rewrites/);
 });
 
-test("buildCodeToolDescription includes decision rule, read-only carve-out, dependency guard, JS guard, compact returns", () => {
+test("buildCodeToolDescription includes decision rule, read-only carve-out, dependency guard, JS guard, compact returns, examples", () => {
   const d = buildCodeToolDescription(new Map());
   // pre-wave decision rule: write B's args before A returns
   assert.match(d, /DECISION RULE/);
@@ -280,29 +279,13 @@ test("buildCodeToolDescription includes decision rule, read-only carve-out, depe
   assert.match(d, /write executable JavaScript, not TypeScript syntax/);
   // compact returns
   assert.match(d, /verdict\/summary\/fields/);
-});
-
-test("CODE_MODE_APPEND has decision rule, read-only carve-out, dependency guard, JS guard, expanded example", () => {
-  const a = CODE_MODE_APPEND;
-  // stronger parallel phrasing
-  assert.match(a, /Maximize parallelism/);
-  assert.match(a, /Err on the side of maximizing parallel calls/);
-  // pre-wave decision rule
-  assert.match(a, /<decision_rule>/);
-  assert.match(a, /Can I write call B's arguments before call A returns\?/);
-  // read-only carve-out
-  assert.match(a, /Read-only operations/);
-  assert.match(a, /Batch all reads for a phase in one wave/);
-  // dependency guard
-  assert.match(a, /Only batch calls that are independent/);
-  assert.match(a, /git add` → `git commit`/);
-  // JavaScript guard
-  assert.match(a, /<language>/);
-  assert.match(a, /do not use type annotations, interfaces, or generics/);
-  // expanded example: git fetch phase boundary + gh release view + node --test
-  assert.match(a, /git fetch --all --tags --prune/);
-  assert.match(a, /gh release view/);
-  assert.match(a, /node --test/);
+  // examples consolidated into the tool description
+  assert.match(d, /dependent chain/);
+  assert.match(d, /bounded retry\/validate loop/);
+  assert.match(d, /\["node", "--test"\]/);
+  // phased-gather example was removed — maximal batching is forced, no serial phase carve-out
+  assert.doesNotMatch(d, /Phased gather/);
+  assert.doesNotMatch(d, /git fetch --all --tags --prune/);
 });
 
 // ---------------------------------------------------------------------------

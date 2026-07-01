@@ -33,6 +33,50 @@ test("needsStructuredOutputPassthrough detects legacy output_format", () => {
   );
 });
 
+test("needsStructuredOutputPassthrough detects top-level effort (hook/statusline requests)", () => {
+  assert.equal(
+    needsStructuredOutputPassthrough({
+      model: "claude-opus-4-8",
+      messages: [{ role: "user", content: "hook eval" }],
+      effort: { level: "high" },
+    }),
+    true,
+  );
+});
+
+test("needsStructuredOutputPassthrough detects rate_limits (statusline 5h/weekly limits)", () => {
+  assert.equal(
+    needsStructuredOutputPassthrough({
+      model: "claude-opus-4-8",
+      messages: [{ role: "user", content: "statusline" }],
+      rate_limits: { five_hour: { used_percentage: 23.5 }, seven_day: { used_percentage: 41.2 } },
+    }),
+    true,
+  );
+});
+
+test("needsStructuredOutputPassthrough detects cost (statusline cost tracking)", () => {
+  assert.equal(
+    needsStructuredOutputPassthrough({
+      model: "claude-opus-4-8",
+      messages: [{ role: "user", content: "statusline" }],
+      cost: { total_cost_usd: 0.01234, total_duration_ms: 45000 },
+    }),
+    true,
+  );
+});
+
+test("needsStructuredOutputPassthrough detects context_window (statusline usage)", () => {
+  assert.equal(
+    needsStructuredOutputPassthrough({
+      model: "claude-opus-4-8",
+      messages: [{ role: "user", content: "statusline" }],
+      context_window: { total_input_tokens: 15500, total_output_tokens: 1200 },
+    }),
+    true,
+  );
+});
+
 test("needsStructuredOutputPassthrough ignores effort-only output_config", () => {
   assert.equal(
     needsStructuredOutputPassthrough({
