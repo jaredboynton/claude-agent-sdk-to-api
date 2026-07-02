@@ -24,6 +24,11 @@ import { cavemanLevels, compressProse } from "./caveman.mjs";
 const DEFAULT_SCRIPT_TIMEOUT_MS = Number(process.env.CODE_SCRIPT_TIMEOUT_MS || 0);
 const DEFAULT_MAX_WAVES = Number(process.env.CODE_MAX_WAVES || 0);
 const DEFAULT_MAX_CALLS = Number(process.env.CODE_MAX_CALLS || 0);
+// Auto-monitor: when a client backgrounds a shell command mid-run, the worker
+// keeps watching it through the client's monitor tool (blocking TaskOutput /
+// BashOutput / Read on the output file) in zero-round-trip waves and resolves
+// the original await with the finished output. CODE_AUTO_MONITOR=0 disables.
+const DEFAULT_AUTO_MONITOR = process.env.CODE_AUTO_MONITOR !== "0";
 // Output IS transcript: every byte returned is cache-written at 2x once and
 // re-read on every later turn, so oversized returns get truncated head+tail
 // (never errored — the run's work is preserved) with the full text spilled to a
@@ -261,6 +266,7 @@ export function buildCodeToolDescription(clientTools, { caveman = cavemanLevels(
     + "## Runtime API\n"
     + "`await tools.<Name>(args)` calls a client tool (`tools[\"Any-Name\"]`, `callTool(name, args)`, and `codemode.call(name, args)` are equivalent forms). `codemode.batch([['Tool', args], ...])` starts independent calls together. `codemode.search(query)` finds matching tool docs (top 20), `codemode.list()` enumerates the full catalog, and `codemode.describe(nameOrPath)` returns the FULL docs for one tool. `await sleep(ms)` pauses (30s cap per call); `await codemode.retry(fn, { attempts, delayMs })` retries a failing async thunk with linear backoff. "
     + "`await codemode.exec(source, { interpreter?, interpreterArgs?, cwd?, args?, tool? })` runs an inline script through the client's shell tool with zero quoting hazards: the source is base64-armored into a mktemp file and executed in one atomic command (interpreter defaults to `node`; `.mjs`/`.cjs` inferred from the source; `interpreterArgs` are CLI flags placed BEFORE the script path, e.g. `[\"--expose-internals\"]`, while `args` become the script's argv). The temp file lives in a random mktemp dir and is deleted when the command finishes — to re-run, call `exec` again; never reference the temp path from a later shell call. Always use it instead of `node -e`/`python -c` one-liners — the shell mangles `$[`, `$(`, and nested quotes inside those — and instead of separate write-temp-file-then-run steps. The client shell on macOS is BSD userland: GNU-only extensions (`sed -n 'N,+Kp'`, `grep -P`, `date -d`) fail there, so put anything beyond a trivial one-liner in `codemode.exec` instead of stacking sed/awk flags. "
+    + "`await codemode.monitor(handleOrId, { until?, intervalMs?, maxMs?, tool? })` attaches to a command the client backgrounded (\"Command running in background with ID: ...\") and waits for it via the client's own monitor tool (blocking TaskOutput, BashOutput polling, or Read on the reported output file), returning the finished output. When a client backgrounds a shell call on its own, the runtime does this automatically - the original `await` simply resolves with the completed output, so never hand-roll poll loops over an output file. Set `run_in_background: true` only when you deliberately want the handle back immediately; `codemode.monitor` it later. "
     + "Pure helpers available: `structuredClone`, `URL`/`URLSearchParams`, `atob`/`btoa`, `queueMicrotask`, `TextEncoder`/`TextDecoder`, `crypto.randomUUID()`, `crypto.sha256(data)`.\n"
     + "\n"
     + "## Tool results\n"
@@ -448,7 +454,7 @@ export function formatCodeError(error, { ledger = [], logs = [], waves = 0, call
  * which rejects the wave's calls).
  *
  * @param {string} script
- * @param {{ toolNames: string[], toolDocs?: Array<{name:string,path?:string,summary?:string,docs?:string}>, dispatchWave: Function, timeoutMs?: number, maxWaves?: number, maxCalls?: number, signal?: AbortSignal, state?: object }} opts
+ * @param {{ toolNames: string[], toolDocs?: Array<{name:string,path?:string,summary?:string,docs?:string}>, dispatchWave: Function, timeoutMs?: number, maxWaves?: number, maxCalls?: number, signal?: AbortSignal, state?: object, autoMonitor?: boolean }} opts
  * @returns {Promise<{ value: *, logs: string[], waves: number, calls: number, state?: object }>}
  */
 export function runCodeScriptDynamic(script, {
@@ -460,6 +466,7 @@ export function runCodeScriptDynamic(script, {
   maxCalls = DEFAULT_MAX_CALLS,
   signal,
   state,
+  autoMonitor = DEFAULT_AUTO_MONITOR,
 } = {}) {
   return new Promise((resolve, reject) => {
     let worker;
@@ -591,6 +598,7 @@ export function runCodeScriptDynamic(script, {
         type: "run",
         script,
         toolNames,
+        autoMonitor,
         toolDocs,
         maxWaves,
         maxCalls,

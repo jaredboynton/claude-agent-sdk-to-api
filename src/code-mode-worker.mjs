@@ -3,7 +3,7 @@
 // script may run as long as it needs — no time/wave/call caps by default.
 //
 // Protocol with the parent:
-//   parent -> worker: { type: "run", script, toolNames, maxWaves, maxCalls }
+//   parent -> worker: { type: "run", script, toolNames, maxWaves, maxCalls, autoMonitor }
 //   worker -> parent: { type: "wave", wave: N, calls: [{name, args}] }
 //   parent -> worker: { type: "wave_result", wave: N, results: [{text, raw, isError}] | {error} }
 //   worker -> parent: { type: "done", value, logs, waves, calls }
@@ -17,6 +17,16 @@ import vm from "node:vm";
 import { parentPort } from "node:worker_threads";
 import { createHash, randomUUID } from "node:crypto";
 import { pickShellTool, buildExecCommand } from "./exec-command.mjs";
+import {
+  DEFAULT_MONITOR_MAX_MS,
+  DEFAULT_POLL_START_MS,
+  looksRunning,
+  nextPollDelay,
+  parseBackgroundBanner,
+  parseCompletion,
+  pickMonitorStrategy,
+  stripReadGutter,
+} from "./background-monitor.mjs";
 
 let pending = [];
 let flushing = false;
@@ -26,6 +36,7 @@ let maxWaves = 0; // 0 = unlimited
 let maxCalls = 0; // 0 = unlimited
 let toolDocs = [];
 let sandboxState = {}; // persistent `state` global; round-trips parent <-> worker per run
+let autoMonitor = true; // auto-attach to client-backgrounded commands (run msg can disable)
 
 // The vm context denies timers so a script can't schedule work the parent
 // can't see — but a host-scope sleep is safe (the parent can still terminate
@@ -175,7 +186,116 @@ function dehydrateValue(value, seen = new WeakMap()) {
 }
 
 function makeCallTool(name) {
-  return (args) => callTool(name, args);
+  return (args) => monitoredCall(name, args);
+}
+
+// Auto-monitor seam: every script-visible tool call routes through here. If
+// the client answers by backgrounding the command ("Command running in
+// background with ID: ..."), keep watching it in client-side waves and resolve
+// the original await with the finished output. A script that set
+// run_in_background: true asked for the handle - leave it alone.
+async function monitoredCall(name, args) {
+  const r = await callTool(name, args);
+  if (!autoMonitor) return r;
+  if (args && typeof args === "object" && args.run_in_background === true) return r;
+  const target = toolResultTargets.get(r);
+  const banner = target ? parseBackgroundBanner(target.text) : null;
+  if (!banner || !pickMonitorStrategy(toolDocs, banner)) return r;
+  workerLogs.push(`[monitor] ${name} was backgrounded by the client (id ${banner.id}); watching it`);
+  return monitorLoop(banner, {});
+}
+
+// Watch one backgrounded command to completion. Poll waves are client-side
+// only - the model is never woken. Every return path carries a notes entry
+// saying what the monitor observed.
+async function monitorLoop(banner, opts = {}) {
+  const o = opts && typeof opts === "object" ? opts : {};
+  const startedAt = Date.now();
+  const maxMs = Math.max(1_000, Number(o.maxMs) || DEFAULT_MONITOR_MAX_MS);
+  const intervalMs = Math.max(10, Number(o.intervalMs) || DEFAULT_POLL_START_MS);
+  const until = o.until == null ? null
+    : (typeof o.until.test === "function" ? o.until : new RegExp(String(o.until), "m"));
+  const strategy = pickMonitorStrategy(toolDocs, banner, o.tool);
+  if (!strategy) {
+    return makeToolResult({
+      text: `codemode.monitor: no monitor-capable client tool (TaskOutput/BashOutput, or Read + an output path) for id ${banner.id}`,
+      raw: null,
+      isError: true,
+    });
+  }
+  let acc = "";
+  let lastSnapshot = null;
+  let stable = 0;
+  let polls = 0;
+  const finish = ({ text, exitCode = null, done, isError, note }) => {
+    workerLogs.push(`[monitor] ${note}`);
+    return makeToolResult({
+      text,
+      raw: { monitored: true, id: banner.id, tool: strategy.tool, polls, exitCode, done },
+      isError: isError ?? (exitCode != null && exitCode !== 0),
+      notes: [note],
+    });
+  };
+  while (Date.now() - startedAt < maxMs) {
+    if (polls > 0 || strategy.kind !== "task") {
+      // Blocking TaskOutput does the waiting itself; others back off 1.5x.
+      await sleep(strategy.kind === "task" ? Math.min(intervalMs, 1_000) : nextPollDelay(polls, intervalMs));
+    }
+    polls++;
+    const r = await callTool(strategy.tool, strategy.buildArgs(maxMs - (Date.now() - startedAt)));
+    const target = toolResultTargets.get(r);
+    const text = target ? target.text : String(r ?? "");
+    if (target?.isError) {
+      // An unknown/reaped id usually means the process already finished;
+      // return what we captured instead of failing the script.
+      return finish({
+        text: acc || text,
+        done: false,
+        isError: !acc,
+        note: `monitor: ${strategy.tool} errored after ${polls} poll(s): ${text.slice(0, 160)}`,
+      });
+    }
+    if (strategy.incremental) acc += (acc && text ? "\n" : "") + text;
+    else acc = strategy.kind === "read" ? stripReadGutter(text) : text;
+    const completion = parseCompletion(text);
+    const elapsed = Math.round((Date.now() - startedAt) / 1000);
+    if (completion.done || (until && until.test(acc))) {
+      return finish({
+        text: acc,
+        exitCode: completion.exitCode,
+        done: true,
+        note: `monitor: ${banner.id} finished after ${elapsed}s (${polls} ${strategy.tool} poll(s)${completion.exitCode != null ? `, exit ${completion.exitCode}` : ""})`,
+      });
+    }
+    if (strategy.kind === "task" && text.trim() && !looksRunning(text)) {
+      // A blocking TaskOutput that returns without a running marker returned
+      // because the task ended, even when the client omits exit markers.
+      return finish({
+        text: acc,
+        done: true,
+        note: `monitor: ${banner.id} returned via blocking ${strategy.tool} after ${elapsed}s (${polls} call(s))`,
+      });
+    }
+    if (strategy.kind === "read") {
+      // No exit marker in the file: only assume completion once non-empty
+      // output has stopped changing across several backed-off reads.
+      stable = text === lastSnapshot && acc.trim() ? stable + 1 : 0;
+      lastSnapshot = text;
+      if (stable >= 3) {
+        return finish({
+          text: acc,
+          done: null,
+          note: `monitor: ${banner.id} output stable across ${stable + 1} reads (${elapsed}s); assuming complete - no exit marker seen, the process may still be running`,
+        });
+      }
+    }
+  }
+  return finish({
+    text: acc,
+    done: false,
+    isError: !acc,
+    note: `monitor: gave up on ${banner.id} after ${Math.round(maxMs / 1000)}s (${polls} poll(s)); pass { maxMs } to codemode.monitor to wait longer`,
+  });
 }
 
 function callTool(name, args) {
@@ -339,9 +459,9 @@ function batch(items = []) {
   if (!Array.isArray(items)) return Promise.reject(new Error("codemode.batch expects an array"));
   const calls = items.map((item) => {
     if (item && typeof item.then === "function") return item;
-    if (Array.isArray(item)) return callTool(item[0], item[1] || {});
+    if (Array.isArray(item)) return monitoredCall(item[0], item[1] || {});
     if (item && typeof item === "object" && (typeof item.name === "string" || typeof item.tool === "string")) {
-      return callTool(item.name || item.tool, item.args || {});
+      return monitoredCall(item.name || item.tool, item.args || {});
     }
     return Promise.resolve(makeToolResult({ text: "invalid batch item", raw: null, isError: true }));
   });
@@ -350,11 +470,38 @@ function batch(items = []) {
 
 function buildCodemodeGlobal() {
   return Object.freeze({
-    call: callTool,
+    call: monitoredCall,
     batch,
     search: searchToolDocs,
     describe: describeToolDoc,
     retry,
+    // Attach to a backgrounded command (a ToolResult carrying the client's
+    // banner, an id string, or { id, outputPath }) and wait for completion via
+    // the client's monitor tool. The worker already does this automatically
+    // when a client backgrounds a call on its own; this is for deliberate
+    // run_in_background: true handles and re-attaching after a monitor timeout.
+    monitor: (handle, opts = {}) => {
+      const o = opts && typeof opts === "object" ? opts : {};
+      let banner = null;
+      if (typeof handle === "string" && handle.trim()) {
+        banner = { id: handle.trim(), outputPath: null };
+      } else if (handle && typeof handle === "object") {
+        const target = toolResultTargets.get(handle);
+        if (target) banner = parseBackgroundBanner(target.text);
+        else if (typeof handle.id === "string" || typeof handle.task_id === "string") {
+          banner = { id: String(handle.id || handle.task_id), outputPath: handle.outputPath || null };
+        }
+      }
+      if (!banner) {
+        return Promise.resolve(makeToolResult({
+          text: "codemode.monitor: pass a backgrounded ToolResult, an id string, or { id, outputPath }",
+          raw: null,
+          isError: true,
+        }));
+      }
+      if (!banner.outputPath && typeof o.outputPath === "string") banner.outputPath = o.outputPath;
+      return monitorLoop(banner, o);
+    },
     // Fetch the full text of a previously truncated result. Resolved inline by
     // the bridge from the session artifact store — no client turn is fabricated.
     recall: (id) => callTool("__recall", { id: String(id ?? "") }),
@@ -382,7 +529,7 @@ function buildCodemodeGlobal() {
       }
       const extra = o.toolArgs && typeof o.toolArgs === "object" ? o.toolArgs : {};
       const key = typeof o.commandKey === "string" && o.commandKey ? o.commandKey : "command";
-      return callTool(toolName, { ...extra, [key]: command });
+      return monitoredCall(toolName, { ...extra, [key]: command });
     },
     // Full catalog enumeration (worker-local, zero waves). search() caps at 20;
     // this is the complete list.
@@ -575,6 +722,7 @@ parentPort.on("message", async (msg) => {
   if (msg?.type === "run") {
     maxWaves = msg.maxWaves ?? 0;
     maxCalls = msg.maxCalls ?? 0;
+    autoMonitor = msg.autoMonitor !== false;
     toolDocs = normalizeToolDocs(msg.toolDocs || [], msg.toolNames || []);
     sandboxState = msg.state && typeof msg.state === "object" ? msg.state : {};
     // `state` returns on success AND error: a script that threw after stashing
