@@ -3,6 +3,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -1506,3 +1507,67 @@ test("runCodeScriptDynamic: SyntaxError carries a line number", async () => {
   assert.ok(r.error, "script should error");
   assert.match(r.error, /line 2/);
 });
+
+// ---------------------------------------------------------------------------
+// codemode.exec (worker helper -> shell tool wave)
+// ---------------------------------------------------------------------------
+
+test("runCodeScriptDynamic: codemode.exec runs inline source through the shell tool unmangled", async () => {
+  const seen = [];
+  const src = `console.log(["h['x-access']", "$[ok]", process.argv[2]].join("|"));`;
+  const script = `const r = await codemode.exec(${JSON.stringify(src)}, { args: ["A B"] }); return { text: r.text, err: r.isError };`;
+  const r = await runCodeScriptDynamic(script, {
+    toolNames: ["Execute"],
+    toolDocs: [{ name: "Execute", path: "tools.Execute", summary: "run", docs: "Execute(args: { command: string })" }],
+    dispatchWave: async (w, calls) => calls.map((c) => {
+      seen.push(c);
+      const out = execFileSync("/bin/bash", ["-c", c.args.command], { encoding: "utf8" });
+      return { text: out, raw: null, isError: false };
+    }),
+    timeoutMs: 15000,
+  });
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].name, "Execute");
+  assert.match(seen[0].args.command, /base64 --decode/);
+  assert.equal(r.value.text.trim(), "h['x-access']|$[ok]|A B");
+  assert.equal(r.value.err, false);
+  assert.equal(r.waves, 1);
+});
+
+test("runCodeScriptDynamic: codemode.exec with no shell tool errors clearly (no wave)", async () => {
+  const r = await runCodeScriptDynamic(
+    "const r = await codemode.exec('console.log(1)'); return { text: r.text, err: r.isError };",
+    {
+      toolNames: ["Grep"],
+      toolDocs: [{ name: "Grep", path: "tools.Grep", summary: "grep", docs: "Grep(args: { pattern: string })" }],
+      dispatchWave: async () => { throw new Error("should not dispatch"); },
+      timeoutMs: 5000,
+    },
+  );
+  assert.equal(r.value.err, true);
+  assert.match(r.value.text, /no shell-capable client tool/);
+  assert.equal(r.waves, 0);
+});
+
+test("runCodeScriptDynamic: codemode.exec explicit tool override and empty-source error", async () => {
+  const seen = [];
+  const r = await runCodeScriptDynamic(
+    `const bad = await codemode.exec("   ");
+     const ok = await codemode.exec("console.log('via override')", { tool: "MyShell" });
+     return { badErr: bad.isError, badText: bad.text, okText: ok.text };`,
+    {
+      toolNames: ["MyShell"],
+      toolDocs: [{ name: "MyShell", path: "tools.MyShell", summary: "", docs: "MyShell(args: { command: string })" }],
+      dispatchWave: async (w, calls) => calls.map((c) => {
+        seen.push(c.name);
+        return { text: execFileSync("/bin/bash", ["-c", c.args.command], { encoding: "utf8" }), raw: null, isError: false };
+      }),
+      timeoutMs: 15000,
+    },
+  );
+  assert.equal(r.value.badErr, true);
+  assert.match(r.value.badText, /source is empty/);
+  assert.deepEqual(seen, ["MyShell"]);
+  assert.equal(r.value.okText.trim(), "via override");
+});
+

@@ -16,6 +16,7 @@
 import vm from "node:vm";
 import { parentPort } from "node:worker_threads";
 import { createHash, randomUUID } from "node:crypto";
+import { pickShellTool, buildExecCommand } from "./exec-command.mjs";
 
 let pending = [];
 let flushing = false;
@@ -360,6 +361,29 @@ function buildCodemodeGlobal() {
     // Daemon-side syntax check of the real file (js/mjs/cjs, py, json, sh) —
     // resolved inline by the bridge, no client turn. Check `.isError`.
     verify: (path) => callTool("__verify", { path: String(path ?? "") }),
+    // Run an inline script through the client's shell tool with zero quoting
+    // hazards: the source travels as base64 into a mktemp file and executes in
+    // one atomic command (no separate write-then-run steps to race or mangle).
+    exec: (source, opts = {}) => {
+      const o = opts && typeof opts === "object" ? opts : {};
+      const toolName = typeof o.tool === "string" && o.tool ? o.tool : pickShellTool(toolDocs);
+      if (!toolName) {
+        return Promise.resolve(makeToolResult({
+          text: 'codemode.exec: no shell-capable client tool found; pass { tool: "Name" }',
+          raw: null,
+          isError: true,
+        }));
+      }
+      let command;
+      try {
+        command = buildExecCommand({ source, interpreter: o.interpreter, args: o.args, cwd: o.cwd, ext: o.ext });
+      } catch (e) {
+        return Promise.resolve(makeToolResult({ text: `codemode.exec: ${e?.message || e}`, raw: null, isError: true }));
+      }
+      const extra = o.toolArgs && typeof o.toolArgs === "object" ? o.toolArgs : {};
+      const key = typeof o.commandKey === "string" && o.commandKey ? o.commandKey : "command";
+      return callTool(toolName, { ...extra, [key]: command });
+    },
     // Full catalog enumeration (worker-local, zero waves). search() caps at 20;
     // this is the complete list.
     list: () => toolDocs.map((d) => ({ name: d.name, path: d.path, summary: d.summary })),
