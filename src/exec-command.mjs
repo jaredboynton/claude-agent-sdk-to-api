@@ -85,3 +85,25 @@ export function pickShellTool(toolDocs = []) {
   }
   return null;
 }
+
+// GNU-BRE alternation is a portability trap: `grep 'foo\|bar'` alternates only
+// under GNU grep's BRE engine. rg, ugrep, and BSD grep all read \| as a
+// LITERAL pipe character, so the search silently matches nothing and the model
+// burns a round-trip re-deriving its own quoting. Word-ish characters flanking
+// the escape are essentially never an intended literal pipe; a rare false
+// positive only ever attaches a note, never an error.
+const GREP_FAMILY_RE = /(^|[\s;|&(!])(?:command\s+)?(?:rg|u?grep|egrep|fgrep|ug)\b/;
+const BRE_ALTERNATION_RE = /[A-Za-z0-9_$)\]]\\{1,2}\|[A-Za-z0-9_$([]/;
+
+export const NOTE_GREP_ALTERNATION = "[note: the pattern uses \\| — GNU-BRE-only alternation. rg/ugrep/BSD grep match a literal pipe there, so this empty result is unreliable. Use an unescaped | with -E (grep -E 'a|b', rg 'a|b'), or repeated -F -e 'literal' flags for an OR over literals]";
+
+/**
+ * Note string when a shell command greps with GNU-BRE alternation and the
+ * result looks like the trap fired (error exit or empty output); else null.
+ */
+export function grepAlternationHazard(command, { text = "", isError = false } = {}) {
+  if (typeof command !== "string") return null;
+  if (!GREP_FAMILY_RE.test(command) || !BRE_ALTERNATION_RE.test(command)) return null;
+  if (!isError && text.trim() !== "") return null;
+  return NOTE_GREP_ALTERNATION;
+}

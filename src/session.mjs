@@ -9,7 +9,7 @@ import { preflightProfileDir } from "./auth.mjs";
 import { collectGitSnapshot } from "./local-checks.mjs";
 import { defaultIndexPath, loadResumeIndex, profileKey, pruneToolsetBlobs, saveResumeIndex, saveToolsetBlob, toolsetDirFor, upsertResumeEntry } from "./resume-index.mjs";
 import { createSdkMcpServer, query } from "./sdk.mjs";
-import { LOG_PREFIX } from "./metrics.mjs";
+import { metrics, LOG_PREFIX } from "./metrics.mjs";
 import { cloneUsageForClient, normalizeUsage, refreshRateLimitsFromControl, rememberRateLimitHeaders } from "./wire.mjs";
 import { bucketKey, hashMessages } from "./session-identity.mjs";
 import { buildParkingMcpServer, mergeLateTool, stripBridgeToolName } from "./client-tools.mjs";
@@ -267,6 +267,13 @@ function createSession(key, model, tools, callerSystem, bucket, { resume, cwd = 
     ? compressProse(callerSystem, { level: cavemanLevels().system })
     : { text: callerSystem, savedBytes: 0 };
   session.cavemanSystemSaved = sdkSystem.savedBytes;
+  // Receipt mirrors the description-render stderr line so system-append
+  // savings are observable without a cache log; /healthz aggregates both.
+  if (session.cavemanSystemSaved > 0) {
+    metrics.totalCavemanSystemSaved += session.cavemanSystemSaved;
+    const rawSys = Buffer.byteLength(callerSystem, "utf8");
+    process.stderr.write(`${LOG_PREFIX} caveman ${cavemanLevels().system}: system append ${rawSys}B -> ${rawSys - session.cavemanSystemSaved}B (saved ${session.cavemanSystemSaved}B, ${Math.round((session.cavemanSystemSaved / rawSys) * 100)}%)\n`);
+  }
   const queryOptions = {
     model,
     systemPrompt: { type: "preset", preset: "claude_code", append: sdkSystem.text },

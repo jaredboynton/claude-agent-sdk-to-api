@@ -536,7 +536,7 @@ export function startServer({ port = 32809, host = "127.0.0.1", account = null, 
         cacheReadTokens: metrics.totalCacheReadTokens,
         cacheCreationTokens: metrics.totalCacheCreationTokens,
         cacheLog: cacheLogPath() || null,
-        caveman: { ...cavemanLevels(), rulesVersion: CAVEMAN_RULES_VERSION },
+        caveman: { ...cavemanLevels(), rulesVersion: CAVEMAN_RULES_VERSION, descSavedBytes: metrics.totalCavemanDescSaved, systemSavedBytes: metrics.totalCavemanSystemSaved },
         update: getUpdateStatus(),
       });
     }

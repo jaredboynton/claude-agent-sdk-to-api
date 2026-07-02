@@ -340,6 +340,12 @@ function startCodeRun(session, codeToolUseId, input) {
       }
     }
 
+    // Same contract as truncation notices: empty grep results caused by GNU-BRE
+    // alternation look like true no-matches to the script and the model alike.
+    if (run.grepHazards) {
+      appendCodeResultNote(collapsed, `[${run.grepHazards} grep/rg call(s) used \\| — GNU-BRE-only alternation; rg/ugrep/BSD grep treat it as a literal pipe, so those empty results are unreliable. Re-run with grep -E 'a|b' / rg 'a|b', or repeated -F -e 'literal' flags]`);
+    }
+
     // Post-edit auto-check backstop (failures only): the daemon syntax-checks
     // files this run successfully edited, at zero client/model cost. A clean
     // check appends NOTHING; paths the script already codemode.verify()-ed are

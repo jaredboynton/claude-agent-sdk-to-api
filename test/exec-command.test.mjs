@@ -9,7 +9,7 @@ import { existsSync, realpathSync } from "node:fs";
 import { dirname } from "node:path";
 import { tmpdir } from "node:os";
 
-import { shQuote, inferExt, buildExecCommand, pickShellTool } from "../src/exec-command.mjs";
+import { shQuote, inferExt, buildExecCommand, pickShellTool, grepAlternationHazard, NOTE_GREP_ALTERNATION } from "../src/exec-command.mjs";
 
 function runBash(command) {
   return execFileSync("/bin/bash", ["-c", command], { encoding: "utf8" });
@@ -104,4 +104,25 @@ test("pickShellTool: preferred names, docs fallback, none", () => {
   );
   assert.equal(pickShellTool([{ name: "Grep", docs: "Grep(args: { pattern: string })" }]), null);
   assert.equal(pickShellTool([]), null);
+});
+
+test("grepAlternationHazard flags GNU-BRE alternation on empty or errored grep-family results", () => {
+  assert.equal(grepAlternationHazard("grep -rn 'foo\\|bar' src/", { text: "", isError: true }), NOTE_GREP_ALTERNATION);
+  assert.equal(grepAlternationHazard("rg 'serverProfileDir\\|resumeIndexFile' src/server.mjs", { text: "", isError: false }), NOTE_GREP_ALTERNATION);
+  // double-quoted shell form arrives with two backslashes before the pipe
+  assert.equal(grepAlternationHazard('grep "foo\\\\|bar" src/', { text: "", isError: true }), NOTE_GREP_ALTERNATION);
+  assert.equal(grepAlternationHazard("cat f | ugrep 'x1\\|x2'", { text: "", isError: true }), NOTE_GREP_ALTERNATION);
+});
+
+test("grepAlternationHazard stays silent when the trap cannot have fired", () => {
+  // matches came back: the pattern worked (or the miss is invisible either way)
+  assert.equal(grepAlternationHazard("grep -rn 'foo\\|bar' src/", { text: "src/a.mjs:1:foo", isError: false }), null);
+  // unescaped | with -E is correct cross-userland usage
+  assert.equal(grepAlternationHazard("grep -E 'foo|bar' src/", { text: "", isError: true }), null);
+  // no grep-family binary in the command
+  assert.equal(grepAlternationHazard("sed -n 's/a\\|b/x/p' f", { text: "", isError: true }), null);
+  // no word character after the escaped pipe: could be an intended literal
+  assert.equal(grepAlternationHazard("grep 'foo\\|' src/", { text: "", isError: true }), null);
+  assert.equal(grepAlternationHazard(undefined, { text: "", isError: true }), null);
+  assert.equal(grepAlternationHazard("ls -la", { text: "", isError: false }), null);
 });

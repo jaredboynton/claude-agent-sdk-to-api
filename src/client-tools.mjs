@@ -282,6 +282,7 @@ function buildParkingMcpServer(tools, session, createServer = createSdkMcpServer
       + Buffer.byteLength(SCRIPT_FIELD_DESCRIPTION, "utf8");
     const outBytes = Buffer.byteLength(description, "utf8") + Buffer.byteLength(scriptDesc, "utf8");
     session.cavemanDescSaved = Math.max(0, rawBytes - outBytes);
+    metrics.totalCavemanDescSaved += session.cavemanDescSaved;
     const pct = rawBytes ? Math.round((session.cavemanDescSaved / rawBytes) * 100) : 0;
     process.stderr.write(`${LOG_PREFIX} caveman ${cavemanLevels().tools}: code description ${rawBytes}B -> ${outBytes}B (saved ${session.cavemanDescSaved}B, ${pct}%)\n`);
   }

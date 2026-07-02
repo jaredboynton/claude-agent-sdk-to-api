@@ -4,6 +4,7 @@
 
 import { ANCHORED_READ_TOOLS, annotateReadResult, reconcileEdit } from "./anchor-edit.mjs";
 import { extractClientNotices, ledgerEntry } from "./code-mode.mjs";
+import { grepAlternationHazard } from "./exec-command.mjs";
 import { recordDebug } from "./debug-ring.mjs";
 import { checkerFor } from "./local-checks.mjs";
 import { EDIT_RECOVERY_MAX_ROUNDS, NOTE_FRESHNESS_HINT, NOTE_RECOVERED, classifyToolFailure, editRecoveryDisabled, planChunkedRead, planFreshnessWindow, stitchReadResults, verifyEditsOnDisk } from "./read-recovery.mjs";
@@ -177,6 +178,17 @@ async function resolveCodeModeToolResults(session, toolResults) {
         tool: call.tool,
         notice: notices.find((n) => /truncat/i.test(n)) || "",
       });
+    }
+
+    // A grep-family shell call used GNU-BRE alternation (\|): rg/ugrep/BSD grep
+    // read it as a literal pipe, so an empty result is a quoting artifact, not a
+    // true no-match. Attach the correction to the result the script sees and
+    // queue it for the final tool_result — the model, not the script, wrote the
+    // pattern, and it must hear this even if the script never checks .notes.
+    const altNote = grepAlternationHazard(call.args?.command, { text, isError });
+    if (altNote) {
+      noticeFields.notes = [...(noticeFields.notes || []), altNote];
+      if (run) run.grepHazards = (run.grepHazards || 0) + 1;
     }
 
     // Edit-retry result: on success the original slot resolves as a success

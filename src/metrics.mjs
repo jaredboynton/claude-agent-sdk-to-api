@@ -17,6 +17,8 @@ const metrics = {
   totalCacheReadTokens: 0,
   totalCacheCreationTokens: 0,
   totalMimicryDetections: 0,
+  totalCavemanDescSaved: 0,
+  totalCavemanSystemSaved: 0,
 };
 
 export { LOG_PREFIX, metrics };
