@@ -130,27 +130,58 @@ const CANONICAL_TOOLS = [
   },
 ];
 
-function render(toolsArr) {
+// Second fixture: the authored (uncompressed) render — what pre-caveman frozen
+// sessions replay and what CAVEMAN=0 users cache. Levels are also passed
+// explicitly per render so neither fixture depends on module state.
+const OFF_GOLDEN_PATH = join(dirname(fileURLToPath(import.meta.url)), "fixtures", "code-description.off.golden.txt");
+
+function render(toolsArr, caveman = "full") {
   const session = { clientTools: new Map(), inputParsers: new Map() };
   for (const t of toolsArr) registerClientTool(session, t);
-  return buildCodeToolDescription(session.clientTools);
+  return buildCodeToolDescription(session.clientTools, { caveman });
 }
 
-test("code description matches the golden fixture byte-for-byte", () => {
-  const rendered = render(CANONICAL_TOOLS);
+function checkGolden(rendered, path) {
   if (process.env.UPDATE_GOLDEN) {
-    mkdirSync(dirname(GOLDEN_PATH), { recursive: true });
-    writeFileSync(GOLDEN_PATH, rendered);
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, rendered);
     return;
   }
-  const golden = readFileSync(GOLDEN_PATH, "utf8");
+  const golden = readFileSync(path, "utf8");
   assert.equal(
     rendered,
     golden,
-    "code tool description bytes changed. This re-writes the cached prefix (2x write) of every conversation resumed inside the warm window. If deliberate, batch ALL prose/rendering changes into this release and regenerate: UPDATE_GOLDEN=1 node --test test/code-description.golden.test.mjs",
+    "code tool description bytes changed. This re-writes the cached prefix (2x write) of every conversation resumed inside the warm window. If deliberate, batch ALL prose/rendering/caveman-rule changes into this release and regenerate: UPDATE_GOLDEN=1 node --test test/code-description.golden.test.mjs",
   );
+}
+
+test("code description (caveman full, the default) matches the golden fixture byte-for-byte", () => {
+  checkGolden(render(CANONICAL_TOOLS, "full"), GOLDEN_PATH);
+});
+
+test("code description (caveman off) matches the off golden fixture byte-for-byte", () => {
+  checkGolden(render(CANONICAL_TOOLS, "off"), OFF_GOLDEN_PATH);
+});
+
+test("compression invariants: shorter, headings/signatures byte-identical, truncation pointer survives", () => {
+  const off = render(CANONICAL_TOOLS, "off");
+  const full = render(CANONICAL_TOOLS, "full");
+  assert.ok(full.length < off.length, "compressed render must be shorter than authored render");
+  // Tool headings and signature lines are protected spans / never compressed:
+  // every one in the authored render must appear byte-identical in the
+  // compressed render, so the model's callable surface is untouched.
+  for (const line of off.split("\n")) {
+    if (/^### /.test(line) || /^[A-Za-z_$][\w$-]*\(args: /.test(line)) {
+      assert.ok(full.includes(line), `protected line missing from compressed render: ${line}`);
+    }
+  }
+  for (const rendered of [off, full]) {
+    assert.match(rendered, /\[truncated — full docs: codemode\.describe\("Task"\)\]/);
+  }
 });
 
 test("code description is byte-stable across tool insertion order", () => {
-  assert.equal(render(CANONICAL_TOOLS), render([...CANONICAL_TOOLS].reverse()));
+  for (const level of ["off", "full"]) {
+    assert.equal(render(CANONICAL_TOOLS, level), render([...CANONICAL_TOOLS].reverse(), level));
+  }
 });
