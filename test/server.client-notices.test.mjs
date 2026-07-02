@@ -9,7 +9,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, realpathSync } from "node:fs";
+import { mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -85,6 +85,45 @@ test("extractClientNotices: bare bracketed truncation line flags without notices
   );
   assert.deepEqual(notices, []);
   assert.equal(truncated, true);
+});
+
+// False-positive regressions: tool_result text that merely CONTAINS
+// notice-shaped strings (source code, docs, logs -- including this repo's own
+// files) is data and must pass through untouched. See the anchoring
+// invariants above extractClientNotices in src/code-mode.mjs.
+
+test("extractClientNotices: mid-line tag mention in data passes through", () => {
+  const src = "// harnesses inject <system-reminder> blocks into tool_result text\nconst RE = /<system-reminder>/;\nmore data\n";
+  const { text, notices, truncated } = extractClientNotices(src);
+  assert.equal(text, src);
+  assert.deepEqual(notices, []);
+  assert.equal(truncated, false);
+});
+
+test("extractClientNotices: well-formed block mid-data stays in the text", () => {
+  const src = "./a.js\n<system-reminder>\nfile content, not an injected notice\n</system-reminder>\n./b.js\n";
+  const { text, notices, truncated } = extractClientNotices(src);
+  assert.equal(text, src);
+  assert.deepEqual(notices, []);
+  assert.equal(truncated, false);
+});
+
+test("extractClientNotices: bracketed truncation lookalike mid-data does not flag", () => {
+  const src = "line one\n[note: truncated output would go here]\nline three\n";
+  const { text, notices, truncated } = extractClientNotices(src);
+  assert.equal(text, src);
+  assert.deepEqual(notices, []);
+  assert.equal(truncated, false);
+});
+
+test("extractClientNotices: this repo's extractor sources pass through as identity", () => {
+  for (const rel of ["../src/code-mode.mjs", "../src/code-recovery.mjs"]) {
+    const src = readFileSync(new URL(rel, import.meta.url), "utf8");
+    const { text, notices, truncated } = extractClientNotices(src);
+    assert.equal(text, src, rel + " text must be untouched");
+    assert.deepEqual(notices, [], rel);
+    assert.equal(truncated, false, rel);
+  }
 });
 
 // ---------------------------------------------------------------------------

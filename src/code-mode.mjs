@@ -319,26 +319,94 @@ export function buildCodeToolDescription(clientTools, { caveman = cavemanLevels(
 // address the model; in code mode the script consumes the text as data, so a
 // banner inside a Grep result becomes phantom file paths and a truncated
 // result silently parses as complete. Pull reminder blocks out of the data
-// into `notes` and flag truncation so both the script (`.truncated`/`.notes`)
-// and the model (run-level note) can react. Bracketed single-line gap markers
-// (e.g. "[... truncated 13519 characters from middle section ...]") stay in
-// the text — removing them would silently close a real hole in the data —
-// but they still set the truncated flag.
-const SYSTEM_REMINDER_RE = /[ \t]*<system-reminder>[\s\S]*?(?:<\/system-reminder>[ \t]*\n?|$)/g;
-const TRUNCATION_LINE_RE = /^\[[^\n\]]*truncat[^\n\]]*\]$/im;
+// into notes and flag truncation so both the script (.truncated/.notes) and
+// the model (run-level note) can react.
+//
+// Matching is line- and edge-anchored because harnesses PREPEND or APPEND
+// standalone notices; they never interleave them mid-data. Data that merely
+// mentions the tag or contains a bracketed truncation line (source code,
+// docs, logs -- including this repo's own files) must pass through untouched:
+// a tag with text before it on its line never matches, a well-formed block in
+// the middle of the data stays in the text, an unclosed open tag swallows to
+// EOF only when no close tag follows anywhere (the client cut the text off
+// mid-reminder), and a generic bracketed truncation banner counts only on the
+// first or last non-empty line. Single-line gap markers (e.g. "[... truncated
+// 13519 characters from middle section ...]") stay in the text wherever they
+// appear -- removing them would silently close a real hole in the data -- but
+// they still set the truncated flag.
+const REMINDER_OPEN_RE = /^[ \t]*<system-reminder>/;
+const REMINDER_CLOSE_RE = /<\/system-reminder>[ \t]*$/;
+const TRUNCATION_LINE_RE = /^\[[^\]]*truncat[^\]]*\]$/i;
+const GAP_MARKER_RE = /^\[\.\.\.[^\]]*\btruncated \d+ (?:characters|chars|lines|bytes)\b[^\]]*\]$/im;
 
 export function extractClientNotices(text) {
   const original = String(text ?? "");
+  const lines = original.split("\n");
+  const blocks = [];
+
+  const isBlank = (i) => lines[i].trim() === "";
+  const closeAt = (from, to) => {
+    for (let i = from; i <= to; i++) if (REMINDER_CLOSE_RE.test(lines[i])) return i;
+    return -1;
+  };
+
+  // Leading region: whole closed blocks (and blank lines) from the top.
+  let top = 0;
+  while (top < lines.length) {
+    if (isBlank(top)) { top += 1; continue; }
+    if (!REMINDER_OPEN_RE.test(lines[top])) break;
+    const close = closeAt(top, lines.length - 1);
+    if (close === -1) break;
+    blocks.push({ start: top, end: close });
+    top = close + 1;
+  }
+
+  // Trailing region: whole closed blocks (and blank lines) from the bottom.
+  let bottom = lines.length - 1;
+  while (bottom >= top) {
+    if (isBlank(bottom)) { bottom -= 1; continue; }
+    if (!REMINDER_CLOSE_RE.test(lines[bottom])) break;
+    let start = bottom;
+    while (start >= top && !REMINDER_OPEN_RE.test(lines[start])) start -= 1;
+    if (start < top) break;
+    blocks.push({ start, end: bottom });
+    bottom = start - 1;
+  }
+
+  // A client that truncates the tail can cut a trailing reminder before its
+  // close tag: an open tag at line start with NO close tag after it owns
+  // everything to EOF. A mere mention mid-line never qualifies.
+  for (let i = top; i <= bottom; i++) {
+    if (REMINDER_OPEN_RE.test(lines[i]) && closeAt(i, lines.length - 1) === -1) {
+      blocks.push({ start: i, end: lines.length - 1 });
+      break;
+    }
+  }
+
+  blocks.sort((a, b) => a.start - b.start);
   const notices = [];
-  const cleaned = original.replace(SYSTEM_REMINDER_RE, (block) => {
-    const inner = block
-      .replace(/^[ \t]*<system-reminder>/, "")
-      .replace(/<\/system-reminder>[ \t]*\n?$/, "")
+  const strip = new Set();
+  for (const block of blocks) {
+    const inner = lines.slice(block.start, block.end + 1).join("\n")
+      .replace(REMINDER_OPEN_RE, "")
+      .replace(REMINDER_CLOSE_RE, "")
       .trim();
     if (inner) notices.push(inner);
-    return "";
-  });
-  const truncated = notices.some((n) => /truncat/i.test(n)) || TRUNCATION_LINE_RE.test(cleaned);
+    for (let i = block.start; i <= block.end; i++) strip.add(i);
+  }
+  const kept = strip.size ? lines.filter((_, i) => !strip.has(i)) : lines;
+  const cleaned = kept.join("\n");
+
+  let first = -1;
+  let last = -1;
+  for (let i = 0; i < kept.length; i++) {
+    if (kept[i].trim() === "") continue;
+    if (first === -1) first = i;
+    last = i;
+  }
+  const edgeBanner = first !== -1
+    && (TRUNCATION_LINE_RE.test(kept[first].trim()) || TRUNCATION_LINE_RE.test(kept[last].trim()));
+  const truncated = notices.some((n) => /truncat/i.test(n)) || edgeBanner || GAP_MARKER_RE.test(cleaned);
   return { text: cleaned, notices, truncated };
 }
 
