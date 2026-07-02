@@ -156,3 +156,17 @@ The §8 "ship all description edits in one release" constraint is now enforced m
 - **Late tools merge, they don't invalidate.** Tools the client adds mid-conversation (e.g. ToolSearch deferred tools) merge into the script runtime (the worker catalog and arg parsers rebuild from `session.clientTools` at every run) and are announced in-band on the next code tool_result — an incremental cache append, never a prefix re-write. The old behavior (inline "unavailable until a new conversation" error) is gone.
 - **Enforcement + receipts**: `test/code-description.golden.test.mjs` fails on any description byte change (regenerate deliberately with `UPDATE_GOLDEN=1`). Cache-log rows carry `descHash`; `scripts/cache-bust-report.mjs` proves per-conversation byte stability from receipts and prices any re-write suspects.
 
+---
+
+## 10. Shipped levers (2026-07-02): one-call doctrine + prefix compression
+
+One batched description release targeting the two remaining shapes in §6: the write-dominated prefix and the round-trip "dribble" (models issuing small single-call scripts instead of one conditional program).
+
+- **Sectioned description rewrite with explicit cost framing** — the `code` prose is now markdown sections led by "## Why one call": each `code` call is named as a full-prefix re-read/re-extend, the only valid reasons to return are enumerated (done / needs model-user judgment / unrecoverable), and a 14-line worked example demonstrates batch recon → in-script `if/else` → edit → `codemode.verify` → `state` stash → compact return. New doctrine: verify-failures are repaired in the same run, scripts start by checking `state`, error ledgers are continued from rather than redone, and returns target ~1-2 KB.
+- **Per-tool prose budget** (`CODE_TOOL_DESC_MAX_CHARS`, default 700) — the rendered description embeds client tool prose truncated at a word boundary with a `codemode.describe("Name")` pointer; TS signatures always survive. The worker catalog keeps full docs, so `describe()`/`search()` are lossless in-script. Attacks the dominant cache-create bucket directly (real Claude Code toolsets carry tens of KB of tool prose, written at 2x per conversation).
+- **Anchor-note dedupe** — the ~1.6KB anchored-editing note previously prepended to BOTH `Edit` and `MultiEdit` is now a one-line pointer; the full doctrine lives once in the description's "Editing files" section.
+- **Frozen `script` schema description** — the `code` input schema's `script` field now carries a one-line doctrine reminder at the point of generation. Like the description, it is frozen per conversation via the toolset blob (`scriptDesc`); legacy blobs resume with the bare schema their prefix cached, so no warm resume re-writes.
+- **Consolidation nudge + `singleCallRuns` receipts** — a successful run that fabricated exactly one client tool call gets an in-band note (append-only transcript, max `CODE_NUDGE_MAX_PER_SESSION`=2 per session) telling the model to fold surrounding steps into one script; every such run increments `singleCallRuns` in the cache-log row so the dribble rate is measurable.
+
+Expected movement on the next §7 re-run: cache-create tokens per conversation down (prefix compression), `p_c` up and turns per task down (doctrine + example + nudge), `c` down (return-size target), `singleCallRuns/codeCalls` trending toward zero.
+
