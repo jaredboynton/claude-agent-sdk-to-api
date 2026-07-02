@@ -1,6 +1,6 @@
 {
   "name": "@jaredboynton/claude-agent-api",
-  "version": "0.1.44",
+  "version": "0.1.45",
   "description": "Anthropic-compatible HTTP bridge that exposes the Claude Agent SDK as a /v1/messages API, authenticating natively off your already-logged-in Claude OAuth profiles. Run one instance per profile, each on its own port.",
   "type": "module",
   "bin": {
@@ -19,8 +19,11 @@
   ],
   "scripts": {
     "start": "node bin/cli.mjs",
-    "test": "node --test test/*.test.mjs",
-    "prepublishOnly": "node --test test/*.test.mjs"
+    "test": "node scripts/test-suite.mjs",
+    "test:profile": "node scripts/test-suite.mjs --profile",
+    "test:changed": "node scripts/test-suite.mjs --changed",
+    "test:hotspots": "node scripts/test-suite.mjs --hotspots",
+    "prepublishOnly": "node scripts/test-suite.mjs"
   },
   "engines": {
     "node": ">=20"

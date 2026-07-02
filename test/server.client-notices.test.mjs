@@ -20,6 +20,7 @@ import {
   startCodeRun,
   notifyTurnAttached,
 } from "../src/server.mjs";
+import { drainSession } from "./helpers.mjs";
 
 // ---------------------------------------------------------------------------
 // extractClientNotices unit tests
@@ -157,20 +158,24 @@ async function driveRun(session, codeId, script, resultForCall) {
   startCodeRun(session, codeId, { script });
   const fed = new Set();
   const t0 = Date.now();
-  while (!session.resolvedResults.has(codeId)) {
-    if (Date.now() - t0 > 8000) throw new Error("code run did not settle");
-    const uses = toolUses().filter((u) => !fed.has(u.id) && session.syntheticToCode.has(u.id));
-    if (uses.length) {
-      for (const u of uses) fed.add(u.id);
-      attach();
-      await resolveCodeModeToolResults(session, uses.map((u) => ({
-        tool_use_id: u.id,
-        content: [{ type: "text", text: resultForCall(u) }],
-      })));
+  try {
+    while (!session.resolvedResults.has(codeId)) {
+      if (Date.now() - t0 > 8000) throw new Error("code run did not settle");
+      const uses = toolUses().filter((u) => !fed.has(u.id) && session.syntheticToCode.has(u.id));
+      if (uses.length) {
+        for (const u of uses) fed.add(u.id);
+        attach();
+        await resolveCodeModeToolResults(session, uses.map((u) => ({
+          tool_use_id: u.id,
+          content: [{ type: "text", text: resultForCall(u) }],
+        })));
+      }
+      await new Promise((r) => setTimeout(r, 10));
     }
-    await new Promise((r) => setTimeout(r, 10));
+    return session.resolvedResults.get(codeId);
+  } finally {
+    drainSession(session);
   }
-  return session.resolvedResults.get(codeId);
 }
 
 const DROID_TRUNCATED_GREP = [

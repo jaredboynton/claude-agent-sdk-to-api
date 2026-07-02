@@ -193,19 +193,19 @@ export function findResumeCandidate({
       if (trace) trace.reason = "tail-too-long";
       return null;
     }
-    return { mode: "resume-catchup", sdkSessionId: best.sdkSessionId, seenCount: best.seenCount, tail, toolsetHash: best.toolsetHash || null, updatedAt: best.updatedAt || null };
+    return { mode: "resume-catchup", sdkSessionId: best.sdkSessionId, seenCount: best.seenCount, tail, toolsetHash: best.toolsetHash || null, updatedAt: best.updatedAt || null, caveman: best.caveman || null };
   }
 
   // Normal continuation: one new user turn, or assistant+user pair from client history.
   if (tail.length === 1 && tail[0]?.role === "user") {
-    return { mode: "resume", sdkSessionId: best.sdkSessionId, seenCount: best.seenCount, tail, toolsetHash: best.toolsetHash || null, updatedAt: best.updatedAt || null };
+    return { mode: "resume", sdkSessionId: best.sdkSessionId, seenCount: best.seenCount, tail, toolsetHash: best.toolsetHash || null, updatedAt: best.updatedAt || null, caveman: best.caveman || null };
   }
   if (tail.length === 2 && tail[0]?.role === "assistant" && tail[1]?.role === "user") {
-    return { mode: "resume", sdkSessionId: best.sdkSessionId, seenCount: best.seenCount, tail, toolsetHash: best.toolsetHash || null, updatedAt: best.updatedAt || null };
+    return { mode: "resume", sdkSessionId: best.sdkSessionId, seenCount: best.seenCount, tail, toolsetHash: best.toolsetHash || null, updatedAt: best.updatedAt || null, caveman: best.caveman || null };
   }
 
   if (tail.length <= MAX_CATCHUP_TAIL) {
-    return { mode: "resume-catchup", sdkSessionId: best.sdkSessionId, seenCount: best.seenCount, tail, toolsetHash: best.toolsetHash || null, updatedAt: best.updatedAt || null };
+    return { mode: "resume-catchup", sdkSessionId: best.sdkSessionId, seenCount: best.seenCount, tail, toolsetHash: best.toolsetHash || null, updatedAt: best.updatedAt || null, caveman: best.caveman || null };
   }
 
   if (trace) trace.reason = "tail-too-long";
@@ -226,6 +226,7 @@ export function upsertResumeEntry(index, entry, now = Date.now()) {
     model: entry.model,
     codeMode: !!entry.codeMode,
     ...(entry.toolsetHash ? { toolsetHash: entry.toolsetHash } : {}),
+    ...(entry.caveman ? { caveman: entry.caveman } : {}),
     updatedAt: now,
   };
   const idx = entries.findIndex(

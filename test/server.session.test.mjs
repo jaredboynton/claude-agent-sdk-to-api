@@ -393,16 +393,21 @@ test("makeInputQueue yields pushed items in order and ends on close", async () =
       if (got.length === 3) return;
     }
   })();
-  setTimeout(() => q.push({ n: 3 }), 10);
+  await Promise.resolve();
+  q.push({ n: 3 });
   await consumer;
   assert.deepEqual(got, [1, 2, 3]);
 });
 
 test("makeInputQueue iterable terminates when closed with no items", async () => {
   const q = makeInputQueue();
-  setTimeout(() => q.close(), 10);
   const got = [];
-  for await (const item of q.iterable) got.push(item);
+  const consumer = (async () => {
+    for await (const item of q.iterable) got.push(item);
+  })();
+  await Promise.resolve();
+  q.close();
+  await consumer;
   assert.deepEqual(got, []);
 });
 

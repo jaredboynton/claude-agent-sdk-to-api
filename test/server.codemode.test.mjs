@@ -49,6 +49,7 @@ import {
   rememberRateLimitHeaders,
   writeEvent,
 } from "../src/server.mjs";
+import { drainSession } from "./helpers.mjs";
 
 const GREP_SCHEMA = {
   type: "object",
@@ -1718,16 +1719,20 @@ async function runCodeTurn(session, codeId, script) {
   initMessageProjection(session);
   const done = new Promise((resolve) => session.pendingTools.set(codeId, resolve));
   startCodeRun(session, codeId, { script });
-  await waitFor(() => events.some((e) => e.content_block?.type === "tool_use"));
-  const uses = events
-    .filter((e) => e.type === "content_block_start" && e.content_block?.type === "tool_use")
-    .map((e) => e.content_block);
-  await resolveCodeModeToolResults(session, uses.map((u) => ({
-    tool_use_id: u.id,
-    content: [{ type: "text", text: "hit" }],
-  })));
-  const collapsed = await done;
-  return collapsed.content[0].text;
+  try {
+    await waitFor(() => events.some((e) => e.content_block?.type === "tool_use"));
+    const uses = events
+      .filter((e) => e.type === "content_block_start" && e.content_block?.type === "tool_use")
+      .map((e) => e.content_block);
+    await resolveCodeModeToolResults(session, uses.map((u) => ({
+      tool_use_id: u.id,
+      content: [{ type: "text", text: "hit" }],
+    })));
+    const collapsed = await done;
+    return collapsed.content[0].text;
+  } finally {
+    drainSession(session);
+  }
 }
 
 test("single-call code runs get the consolidation nudge, capped at 2 per session", async () => {

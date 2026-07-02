@@ -15,6 +15,7 @@
 import { Worker } from "node:worker_threads";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { cavemanLevels, compressProse } from "./caveman.mjs";
 
 // No execution caps by default: a code script may run as long as it needs and
 // make as many tool waves/calls as it needs. The parked `code` MCP handler and
@@ -199,10 +200,15 @@ export function truncateToolProse(desc, name, maxChars) {
 }
 
 /** Build a typed declaration block for one client tool (codex-style). */
-function describeClientTool(name, meta, maxDescChars = 0) {
+// Caveman compression runs BEFORE truncation so more of the tool's substance
+// survives the per-tool prose cap; the truncation pointer is appended after and
+// is never compressed. Default "off" keeps the catalog path (codemode.describe/
+// list/search full docs) byte-exact and uncompressed.
+function describeClientTool(name, meta, maxDescChars = 0, caveman = "off") {
   const normalized = normalizeClientToolMeta(name, meta);
   const argsType = jsonSchemaToTs(normalized.input_schema);
-  const desc = truncateToolProse(normalized.description.trim(), name, maxDescChars);
+  const prose = compressProse(normalized.description.trim(), { level: caveman }).text;
+  const desc = truncateToolProse(prose, name, maxDescChars);
   const heading = `### ${name}`;
   const sig = `${name}(args: ${argsType})`;
   return desc ? `${heading}\n${desc}\n${sig}` : `${heading}\n${sig}`;
@@ -220,6 +226,9 @@ function sortedToolEntries(clientTools) {
   return entries.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
 }
 
+// Invariant: catalog docs are NEVER caveman-compressed or truncated. They are
+// worker-local (zero transcript bytes) and serve as the lossless fallback for
+// whatever compression did to the rendered `code` description.
 export function buildCodeToolCatalog(clientTools) {
   const entries = sortedToolEntries(clientTools);
   return entries.map(([name, meta]) => {
@@ -236,10 +245,14 @@ export function buildCodeToolCatalog(clientTools) {
 }
 
 /** Build dynamic description for the single `code` MCP tool. */
-export function buildCodeToolDescription(clientTools) {
+// `caveman` picks the compression level for this transcript-bound render only
+// (static head + per-tool prose blocks); it defaults to the process-wide knob
+// so production and the golden fixture render the same bytes. With "off" the
+// output is byte-identical to the uncompressed authored prose.
+export function buildCodeToolDescription(clientTools, { caveman = cavemanLevels().tools } = {}) {
   const entries = sortedToolEntries(clientTools);
-  const toolBlocks = entries.map(([name, meta]) => describeClientTool(name, meta, DEFAULT_TOOL_DESC_MAX_CHARS));
-  return (
+  const toolBlocks = entries.map(([name, meta]) => describeClientTool(name, meta, DEFAULT_TOOL_DESC_MAX_CHARS, caveman));
+  const head = (
     "Run one complete async JavaScript program that performs as much of the task as possible in a single call and returns a compact summary.\n"
     + "\n"
     + "## Why one call\n"
@@ -247,7 +260,7 @@ export function buildCodeToolDescription(clientTools) {
     + "\n"
     + "## Runtime API\n"
     + "`await tools.<Name>(args)` calls a client tool (`tools[\"Any-Name\"]`, `callTool(name, args)`, and `codemode.call(name, args)` are equivalent forms). `codemode.batch([['Tool', args], ...])` starts independent calls together. `codemode.search(query)` finds matching tool docs (top 20), `codemode.list()` enumerates the full catalog, and `codemode.describe(nameOrPath)` returns the FULL docs for one tool. `await sleep(ms)` pauses (30s cap per call); `await codemode.retry(fn, { attempts, delayMs })` retries a failing async thunk with linear backoff. "
-    + "`await codemode.exec(source, { interpreter?, cwd?, args?, tool? })` runs an inline script through the client's shell tool with zero quoting hazards: the source is base64-armored into a mktemp file and executed in one atomic command (interpreter defaults to `node`; `.mjs`/`.cjs` inferred from the source). Always use it instead of `node -e`/`python -c` one-liners — the shell mangles `$[`, `$(`, and nested quotes inside those — and instead of separate write-temp-file-then-run steps. The client shell on macOS is BSD userland: GNU-only extensions (`sed -n 'N,+Kp'`, `grep -P`, `date -d`) fail there, so put anything beyond a trivial one-liner in `codemode.exec` instead of stacking sed/awk flags. "
+    + "`await codemode.exec(source, { interpreter?, interpreterArgs?, cwd?, args?, tool? })` runs an inline script through the client's shell tool with zero quoting hazards: the source is base64-armored into a mktemp file and executed in one atomic command (interpreter defaults to `node`; `.mjs`/`.cjs` inferred from the source; `interpreterArgs` are CLI flags placed BEFORE the script path, e.g. `[\"--expose-internals\"]`, while `args` become the script's argv). The temp file lives in a random mktemp dir and is deleted when the command finishes — to re-run, call `exec` again; never reference the temp path from a later shell call. Always use it instead of `node -e`/`python -c` one-liners — the shell mangles `$[`, `$(`, and nested quotes inside those — and instead of separate write-temp-file-then-run steps. The client shell on macOS is BSD userland: GNU-only extensions (`sed -n 'N,+Kp'`, `grep -P`, `date -d`) fail there, so put anything beyond a trivial one-liner in `codemode.exec` instead of stacking sed/awk flags. "
     + "Pure helpers available: `structuredClone`, `URL`/`URLSearchParams`, `atob`/`btoa`, `queueMicrotask`, `TextEncoder`/`TextDecoder`, `crypto.randomUUID()`, `crypto.sha256(data)`.\n"
     + "\n"
     + "## Tool results\n"
@@ -289,9 +302,10 @@ export function buildCodeToolDescription(clientTools) {
     + "\n"
     + "## Tool signatures\n"
     + "The signatures below are TypeScript-shaped docs only; write executable JavaScript, not TypeScript syntax. Args must match the signature: ? means optional, literal unions list allowed values, and Array<T> is an array. Schema descriptions, defaults, examples, formats, and patterns are authoritative. Long tool descriptions are truncated below — `codemode.describe(\"Name\")` returns the full docs in-script.\n"
-    + "\n"
-    + (toolBlocks.length ? `Available tools:\n\n${toolBlocks.join("\n\n")}` : "Available tools: (none)")
   );
+  return compressProse(head, { level: caveman }).text
+    + "\n"
+    + (toolBlocks.length ? `Available tools:\n\n${toolBlocks.join("\n\n")}` : "Available tools: (none)");
 }
 
 // Client harnesses (Claude Code, Droid/Factory, ...) inject <system-reminder>

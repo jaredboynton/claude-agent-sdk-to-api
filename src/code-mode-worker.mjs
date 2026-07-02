@@ -376,7 +376,7 @@ function buildCodemodeGlobal() {
       }
       let command;
       try {
-        command = buildExecCommand({ source, interpreter: o.interpreter, args: o.args, cwd: o.cwd, ext: o.ext });
+        command = buildExecCommand({ source, interpreter: o.interpreter, interpreterArgs: o.interpreterArgs, args: o.args, cwd: o.cwd, ext: o.ext });
       } catch (e) {
         return Promise.resolve(makeToolResult({ text: `codemode.exec: ${e?.message || e}`, raw: null, isError: true }));
       }

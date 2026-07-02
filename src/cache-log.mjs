@@ -78,6 +78,17 @@ export function appendCacheLog(row) {
   }
 }
 
+export function flushCacheLogForTest() {
+  if (!cacheLogEnabled()) return Promise.resolve();
+  return new Promise((resolve) => {
+    try {
+      state.stream.write("", resolve);
+    } catch {
+      resolve();
+    }
+  });
+}
+
 /** Extract the 5m / 1h cache-creation split from a raw Anthropic usage object. */
 export function cacheCreationSplit(rawUsage) {
   const cc = rawUsage?.cache_creation;

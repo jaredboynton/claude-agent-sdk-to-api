@@ -41,6 +41,23 @@ test("node source with $[ and quotes survives bash exactly, args included", () =
   assert.equal(runBash(cmd), "h['x-access']|$[ok]|A B|$[nope]|back\\slash\n");
 });
 
+test("interpreterArgs land between the interpreter and the script path", () => {
+  const cmd = buildExecCommand({ source: "console.log(1);", interpreterArgs: ["--no-warnings", "--stack-size=900"] });
+  assert.match(cmd, /'node' '--no-warnings' '--stack-size=900' "\$__cma_d\/exec\.cjs"/);
+  // A single scalar is accepted like `args` is.
+  const one = buildExecCommand({ source: "console.log(1);", interpreterArgs: "--no-warnings" });
+  assert.match(one, /'node' '--no-warnings' "\$__cma_d\/exec\.cjs"/);
+});
+
+test("interpreterArgs reach node as CLI flags, not script argv", () => {
+  // internal/util resolves only under --expose-internals; without the flag the
+  // same source must fail. Also proves argv indexing is unshifted by the flag.
+  const src = `require("internal/util"); console.log("ok", process.argv[2] ?? "-");`;
+  const flagged = buildExecCommand({ source: src, interpreterArgs: ["--expose-internals"], args: ["A"] });
+  assert.equal(runBash(flagged), "ok A\n");
+  assert.throws(() => runBash(buildExecCommand({ source: src })), /Cannot find module/);
+});
+
 test("interpreter exit status is preserved", () => {
   const cmd = buildExecCommand({ source: "process.exit(7);" });
   try {

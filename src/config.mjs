@@ -23,6 +23,19 @@ export function defaultConfigPath({ env = process.env, home = homedir() } = {}) 
   return join(home, ".config", "claude-agent-api", "profiles.json");
 }
 
+// Per-profile caveman compression level. Absent -> null (bridge default,
+// full). Boolean shorthands map to the extremes; anything else must name a
+// level explicitly so a typo cannot silently change cached-prefix bytes.
+function normalizeProfileCaveman(v, name) {
+  if (v === undefined || v === null) return null;
+  if (v === true) return "full";
+  if (v === false) return "off";
+  const s = String(v).trim().toLowerCase();
+  if (s === "full" || s === "lite") return s;
+  if (s === "off" || s === "0") return "off";
+  throw new Error(`profile "${name}" has invalid "caveman" value ${JSON.stringify(v)} (use "full", "lite", or "off")`);
+}
+
 // Pure validation + normalization. Throws on the first structural problem.
 export function validateProfilesConfig(obj, { home = homedir() } = {}) {
   if (!obj || typeof obj !== "object") throw new Error("config must be a JSON object");
@@ -60,6 +73,7 @@ export function validateProfilesConfig(obj, { home = homedir() } = {}) {
       port,
       host: typeof p.host === "string" ? p.host : "127.0.0.1",
       cacheLog: p.cacheLog === true,
+      caveman: normalizeProfileCaveman(p.caveman, name),
     };
   });
 

@@ -8,6 +8,7 @@ import {
   resolveCacheLogPath,
   initCacheLog,
   appendCacheLog,
+  flushCacheLogForTest,
   cacheLogEnabled,
   cacheLogPath,
   cacheCreationSplit,
@@ -51,7 +52,7 @@ test("enabled: appends one JSON line per call, append mode preserves prior", asy
 
   appendCacheLog({ conv: "a", read: 100, create: 10 });
   appendCacheLog({ conv: "b", read: 200, create: 0 });
-  await new Promise((r) => setTimeout(r, 30));
+  await flushCacheLogForTest();
 
   const lines = fs.readFileSync(p, "utf8").trim().split("\n");
   assert.equal(lines.length, 2);
@@ -62,7 +63,7 @@ test("enabled: appends one JSON line per call, append mode preserves prior", asy
   _resetCacheLogForTest();
   initCacheLog(true, dir);
   appendCacheLog({ conv: "c" });
-  await new Promise((r) => setTimeout(r, 30));
+  await flushCacheLogForTest();
   const after = fs.readFileSync(p, "utf8").trim().split("\n");
   assert.equal(after.length, 3);
   _resetCacheLogForTest();

@@ -21,6 +21,7 @@ import {
 } from "../src/server.mjs";
 import { createAnchorState } from "../src/anchor-edit.mjs";
 import { NOTE_RECOVERED, NOTE_FRESHNESS_HINT } from "../src/read-recovery.mjs";
+import { drainSession } from "./helpers.mjs";
 
 const STALE_READ_ERR = "<tool_use_error>File has been modified since read, either by the user or by a linter. Read it again before attempting to write it.</tool_use_error>";
 const TOO_LARGE_ERR = "File content (29916 tokens) exceeds maximum allowed tokens (25000). Use offset and limit parameters to read specific portions of the file, or search for specific content instead of reading the whole file.";
@@ -476,22 +477,31 @@ async function driveRun(session, codeId, script, resultForCall) {
   startCodeRun(session, codeId, { script });
   const fed = new Set();
   const t0 = Date.now();
-  while (!session.resolvedResults.has(codeId)) {
-    if (Date.now() - t0 > 8000) throw new Error("code run did not settle");
-    const uses = toolUses(events).filter((u) => !fed.has(u.id) && session.syntheticToCode.has(u.id));
-    if (uses.length) {
-      for (const u of uses) fed.add(u.id);
-      attach();
-      await resolveCodeModeToolResults(session, uses.map((u) => {
-        const r = resultForCall(u);
-        const text = typeof r === "string" ? r : r.text;
-        const isErr = typeof r === "object" && !!r.is_error;
-        return { tool_use_id: u.id, content: [{ type: "text", text }], ...(isErr ? { is_error: true } : {}) };
-      }));
+  try {
+    while (!session.resolvedResults.has(codeId)) {
+      if (Date.now() - t0 > 8000) throw new Error("code run did not settle");
+      const uses = toolUses(events).filter((u) => !fed.has(u.id) && session.syntheticToCode.has(u.id));
+      if (uses.length) {
+        for (const u of uses) fed.add(u.id);
+        attach();
+        await resolveCodeModeToolResults(session, uses.map((u) => {
+          const r = resultForCall(u);
+          const text = typeof r === "string" ? r : r.text;
+          const isErr = typeof r === "object" && !!r.is_error;
+          return { tool_use_id: u.id, content: [{ type: "text", text }], ...(isErr ? { is_error: true } : {}) };
+        }));
+      }
+      await new Promise((r) => setTimeout(r, 10));
     }
-    await new Promise((r) => setTimeout(r, 10));
+    const collapsed = session.resolvedResults.get(codeId);
+    Object.defineProperty(collapsed, "resolvedResultCountBeforeDrain", {
+      value: session.resolvedResults.size,
+      enumerable: false,
+    });
+    return collapsed;
+  } finally {
+    drainSession(session);
   }
-  return session.resolvedResults.get(codeId);
 }
 
 test("post-edit auto-check appends a failures-only note", async () => {
@@ -635,6 +645,6 @@ test("end-to-end: oversized file + stale read heal invisibly within one code cal
   assert.match(text, /auto-refreshed stale read state/);
   assert.ok(readFileSync(file, "utf8").includes("const line1500 = 9999;"), "edit landed on disk");
   assert.ok(editAttempts >= 2, "first edit was refused by the freshness guard");
-  assert.equal(session.resolvedResults.size, 1, "exactly one code tool_result reached the SDK");
+  assert.equal(collapsed.resolvedResultCountBeforeDrain, 1, "exactly one code tool_result reached the SDK");
   rmSync(dir, { recursive: true, force: true });
 });

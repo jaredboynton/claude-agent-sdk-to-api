@@ -52,7 +52,7 @@ export function inferExt(interpreter, source, ext) {
  * `cwd` never leaks into persistent client shells; the temp dir is removed
  * afterward with the interpreter's exit status preserved.
  */
-export function buildExecCommand({ source, interpreter = "node", args = [], cwd = "", ext = "" } = {}) {
+export function buildExecCommand({ source, interpreter = "node", interpreterArgs = [], args = [], cwd = "", ext = "" } = {}) {
   const src = String(source ?? "");
   if (!src.trim()) throw new Error("source is empty");
   const bytes = Buffer.byteLength(src, "utf8");
@@ -61,8 +61,13 @@ export function buildExecCommand({ source, interpreter = "node", args = [], cwd 
   const runner = String(interpreter || "node");
   const fileExt = inferExt(runner, src, String(ext || ""));
   const file = `"$__cma_d/exec${fileExt}"`;
+  // Interpreter CLI flags must precede the script path (node --expose-internals,
+  // python -u); anything in `args` lands after it and becomes the script's argv.
+  // `interpreter` stays a single quoted token, so flags can't ride in there.
+  const iargv = (Array.isArray(interpreterArgs) ? interpreterArgs : [interpreterArgs])
+    .map((a) => `${shQuote(String(a))} `).join("");
   const argv = (Array.isArray(args) ? args : [args]).map((a) => ` ${shQuote(String(a))}`).join("");
-  const run = `${shQuote(runner)} ${file}${argv}`;
+  const run = `${shQuote(runner)} ${iargv}${file}${argv}`;
   const inner = cwd ? `cd ${shQuote(String(cwd))} && ${run}` : run;
   return `__cma_d="$(mktemp -d)" && printf '%s' '${b64}' | base64 --decode > ${file} && (${inner}); __cma_s=$?; [ -n "\${__cma_d:-}" ] && rm -rf "$__cma_d"; (exit $__cma_s)`;
 }

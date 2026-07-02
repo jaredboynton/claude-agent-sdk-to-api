@@ -161,8 +161,15 @@ With `--cache-log` (or `CACHE_LOG=1`), the bridge appends one JSON line per comp
 ## Tests
 
 ```bash
-npm test   # node --test test/*.test.mjs
+npm test                 # optimized node:test runner over test/*.test.mjs
+npm run test:changed     # conservative changed-file/dependency selection
+npm run test:profile     # serial per-file timing report with hotspot summary
+npm run test:hotspots    # scanned slow-risk summary without executing tests
+TEST_SHARD=1/4 npm test  # run one deterministic shard
+TEST_SHARD=1/4 node scripts/test-suite.mjs --list  # inspect shard composition
 ```
+
+Runner knobs: `TEST_CONCURRENCY`, `TEST_SHARD=index/total`, `TEST_CHANGED_BASE`, and `TEST_TIMINGS_JSON`.
 
 ## License
 

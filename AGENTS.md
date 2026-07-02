@@ -13,7 +13,18 @@ Anthropic-compatible HTTP bridge over the Claude Agent SDK. It exposes `/v1/mess
 ## Architecture and Navigation
 
 - `bin/cli.mjs`: CLI subcommands (`run`, `start-all`, `install`, `uninstall`, `list`, `status`, `doctor`), auth setup, service orchestration, self-update startup.
-- `src/server.mjs`: HTTP server, Anthropic SSE passthrough, session identity, live SDK `query()` lifecycle, parked client-tool handlers, cwd resolution, health/model endpoints.
+- `src/server.mjs`: HTTP routes (/v1/messages, health, models, update, debug), Anthropic structured-output/OAuth passthroughs, and barrel re-exports of every module below (tests and bin/cli.mjs import through it).
+- `src/session.mjs`: session store and lifecycle — `createSession`, the live SDK `query()` consumer, TTL sweeper, cwd resolution, resume-index persistence.
+- `src/session-identity.mjs`: content-derived session identity (bucket/hash), transcript rendering, mimicry-safe cold-start priming, warm-action classification.
+- `src/wire.mjs`: SSE plumbing, usage shaping, rate-limit header synthesis, Anthropic frame helpers.
+- `src/turn-io.mjs`: turn lifecycle primitives shared by the session and code-run layers (writeEvent/endTurn/resolveTool, input queue).
+- `src/client-tools.mjs`: client tool registration, JSON-Schema-to-Zod parsing, tool_use correlation, the parking MCP server, late-tool merging.
+- `src/code-run.mjs`: dynamic code-run orchestration — wave dispatch, fabricated client turns, SDK event projection, tool-round teardown.
+- `src/code-recovery.mjs`: code-mode tool_result routing plus stale-edit and chunked-read recovery turns.
+- `src/metrics.mjs`: process-wide counters surfaced in /healthz.
+- `src/caveman.mjs`: deterministic rule-based prose compression for cache-critical description bytes (versioned via CAVEMAN_RULES_VERSION).
+- `src/debug-ring.mjs`: always-on in-memory debug ring with disk mirror, served at /debug/recent.
+- `src/exec-command.mjs`: quoting-safe command construction for codemode.exec.
 - `src/auth.mjs`: native-first Claude profile credential resolution and profile-dir preflight repair.
 - `src/config.mjs`: `profiles.json` loading and validation for multi-profile runs.
 - `src/code-mode.mjs` and `src/code-mode-worker.mjs`: `code({ script })` meta-tool description, ToolResult API, VM worker execution, batching, state, spill artifacts, script error formatting.
@@ -46,7 +57,7 @@ Anthropic-compatible HTTP bridge over the Claude Agent SDK. It exposes `/v1/mess
 ## File Placement Rules
 
 - CLI behavior belongs in `bin/cli.mjs`; reusable config/auth/self-update logic belongs under `src/`.
-- Protocol/session changes belong in `src/server.mjs` unless they can be isolated into a pure helper module.
+- HTTP routing/passthrough changes belong in `src/server.mjs`; session lifecycle in `src/session.mjs`; identity/priming in `src/session-identity.mjs`; code-run orchestration in `src/code-run.mjs` / `src/code-recovery.mjs`. New seams must be re-exported from `src/server.mjs` (the barrel).
 - Code-mode runtime or description changes belong in `src/code-mode.mjs` / `src/code-mode-worker.mjs`; update the golden fixture only deliberately.
 - Edit reliability behavior belongs in `src/anchor-edit.mjs` or `src/read-recovery.mjs`, not ad hoc inside unrelated server paths.
 - Add tests next to the closest existing coverage in `test/*.test.mjs`; put stable byte fixtures under `test/fixtures/`.
