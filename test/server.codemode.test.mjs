@@ -46,6 +46,7 @@ import {
   notifyTurnAttached,
   startServer,
   startCodeRun,
+  configureCaveman,
   rememberRateLimitHeaders,
   writeEvent,
 } from "../src/server.mjs";
@@ -179,7 +180,7 @@ test("formatCodeResult caps oversized console lines", () => {
 // ---------------------------------------------------------------------------
 
 test("buildCodeToolDescription lists client tools", () => {
-  const d = buildCodeToolDescription(CLIENT_TOOLS);
+  const d = buildCodeToolDescription(CLIENT_TOOLS, { caveman: "off" });
   assert.match(d, /Grep/);
   assert.match(d, /Glob/);
 });
@@ -194,8 +195,11 @@ test("buildCodeToolCatalog exposes focused tool docs", () => {
   assert.match(grep.docs, /pattern: string/);
 });
 
+// Description-prose tests render with { caveman: "off" }: they lock the
+// AUTHORED prose contract. The compressed default render is byte-locked by
+// test/code-description.golden.test.mjs and the caveman unit suite instead.
 test("buildCodeToolDescription emits typed signatures with required/optional and enums", () => {
-  const d = buildCodeToolDescription(CLIENT_TOOLS);
+  const d = buildCodeToolDescription(CLIENT_TOOLS, { caveman: "off" });
   assert.match(d, /pattern: string/);
   assert.match(d, /path: string/);
   assert.match(d, /output_mode\?: "content" \| "files_with_matches" \| "count"/);
@@ -218,7 +222,7 @@ test("buildCodeToolDescription renders the exact arg type that previously misfir
       },
     }],
   ]);
-  const d = buildCodeToolDescription(tools);
+  const d = buildCodeToolDescription(tools, { caveman: "off" });
   assert.match(d, /### AskUser/);
   assert.match(d, /Ask the user a question/);
   assert.match(d, /\/\/ the question text/);
@@ -237,7 +241,7 @@ test("buildCodeToolDescription does not hardcode client-specific DSLs", () => {
       },
     }],
   ]);
-  const d = buildCodeToolDescription(tools);
+  const d = buildCodeToolDescription(tools, { caveman: "off" });
   assert.match(d, /questionnaire: string/);
   assert.doesNotMatch(d, /\[question\]/);
 });
@@ -256,7 +260,7 @@ test("buildCodeToolDescription propagates generic schema metadata", () => {
       },
     }],
   ]);
-  const d = buildCodeToolDescription(tools);
+  const d = buildCodeToolDescription(tools, { caveman: "off" });
   assert.match(d, /\/\/ Execution mode/);
   assert.match(d, /\/\/ Default: "safe"/);
   assert.match(d, /\/\/ Examples: "safe"/);
@@ -279,13 +283,13 @@ test("buildCodeToolDescription describes nested object and array arg types", () 
       },
     }],
   ]);
-  const d = buildCodeToolDescription(tools);
+  const d = buildCodeToolDescription(tools, { caveman: "off" });
   assert.match(d, /items\?: Array<string>/);
   assert.match(d, /opts\?: \{ a\?: number; \}/);
 });
 
 test("buildCodeToolDescription script-first guidance mentions tools.X and Promise.all", () => {
-  const d = buildCodeToolDescription(new Map());
+  const d = buildCodeToolDescription(new Map(), { caveman: "off" });
   assert.match(d, /await tools\.<Name>\(args\)/);
   assert.match(d, /Promise\.all/);
   assert.match(d, /ToolResult/);
@@ -297,7 +301,7 @@ test("buildCodeToolDescription script-first guidance mentions tools.X and Promis
 });
 
 test("buildCodeToolDescription includes compact logic and anchored-edit guidance", () => {
-  const d = buildCodeToolDescription(new Map());
+  const d = buildCodeToolDescription(new Map(), { caveman: "off" });
   assert.match(d, /no time, wave, or call limit by default/);
   assert.match(d, /retr/i);
   assert.match(d, /dependent steps/);
@@ -307,7 +311,7 @@ test("buildCodeToolDescription includes compact logic and anchored-edit guidance
 });
 
 test("buildCodeToolDescription carries the one-call doctrine, example, and state-first guidance", () => {
-  const d = buildCodeToolDescription(new Map());
+  const d = buildCodeToolDescription(new Map(), { caveman: "off" });
   assert.match(d, /## Why one call/);
   assert.match(d, /full model round-trip/);
   assert.match(d, /single tool call wastes its round-trip/);
@@ -325,7 +329,7 @@ test("buildCodeToolDescription truncates long tool prose; catalog keeps full doc
   const tools = new Map([
     ["Big", { description: longDesc, input_schema: { type: "object", properties: { q: { type: "string" } }, required: ["q"] } }],
   ]);
-  const d = buildCodeToolDescription(tools);
+  const d = buildCodeToolDescription(tools, { caveman: "off" });
   assert.match(d, /\[truncated — full docs: codemode\.describe\("Big"\)\]/);
   assert.match(d, /Big\(args: \{ q: string; \}\)/, "signature survives truncation");
   assert.ok(!d.includes("END-OF-DOCS"), "over-budget tail is cut from the rendered description");
@@ -344,14 +348,14 @@ test("codeToolInputShape describes script by default and honors a frozen empty o
 });
 
 test("buildCodeToolDescription includes output mechanics", () => {
-  const d = buildCodeToolDescription(new Map());
+  const d = buildCodeToolDescription(new Map(), { caveman: "off" });
   assert.match(d, /Return a compact decision-ready object/);
   assert.match(d, /status, counts, paths with line numbers/);
   assert.match(d, /Keep raw reads, full diffs, test logs, and large arrays inside local variables/);
 });
 
 test("buildCodeToolDescription includes dependency guard, JS guard, and compact returns", () => {
-  const d = buildCodeToolDescription(new Map());
+  const d = buildCodeToolDescription(new Map(), { caveman: "off" });
   assert.match(d, /Only batch independent calls/);
   assert.match(d, /If B's args depend on A's result/);
   assert.match(d, /write executable JavaScript, not TypeScript syntax/);
@@ -1353,7 +1357,7 @@ test("runCodeScriptDynamic: TextEncoder is available", async () => {
 // ---------------------------------------------------------------------------
 
 test("buildCodeToolDescription documents state, recall, sleep, retry", () => {
-  const d = buildCodeToolDescription(CLIENT_TOOLS);
+  const d = buildCodeToolDescription(CLIENT_TOOLS, { caveman: "off" });
   assert.match(d, /`state` is a persistent object/);
   assert.match(d, /codemode\.recall\(id\)/);
   assert.match(d, /sleep\(ms\)/);
@@ -1447,19 +1451,24 @@ test("buildParkingMcpServer reuses a frozen scriptDesc verbatim", () => {
 });
 
 test("buildParkingMcpServer renders live when no frozen toolset is supplied", () => {
-  const session = fakeCodeSession({ clientTools: new Map(), inputParsers: new Map() });
-  let captured = null;
-  buildParkingMcpServer(
-    [{ name: "Grep", description: "grep", input_schema: GREP_SCHEMA }],
-    session,
-    (config) => { captured = config; return { ok: true }; },
-  );
-  assert.equal(captured.tools[0].description, session.codeDescription);
-  assert.ok(session.codeDescription.includes("Grep"));
-  assert.deepEqual(session.toolsetRawTools.map((t) => t.name), ["Grep"]);
-  // Fresh sessions carry the current script-field doctrine and freeze it.
-  assert.equal(captured.tools[0].inputSchema.script.description, SCRIPT_FIELD_DESCRIPTION);
-  assert.equal(session.scriptDesc, SCRIPT_FIELD_DESCRIPTION);
+  configureCaveman({ caveman: "off" }); // authored-prose contract; compressed render covered separately
+  try {
+    const session = fakeCodeSession({ clientTools: new Map(), inputParsers: new Map() });
+    let captured = null;
+    buildParkingMcpServer(
+      [{ name: "Grep", description: "grep", input_schema: GREP_SCHEMA }],
+      session,
+      (config) => { captured = config; return { ok: true }; },
+    );
+    assert.equal(captured.tools[0].description, session.codeDescription);
+    assert.ok(session.codeDescription.includes("Grep"));
+    assert.deepEqual(session.toolsetRawTools.map((t) => t.name), ["Grep"]);
+    // Fresh sessions carry the current script-field doctrine and freeze it.
+    assert.equal(captured.tools[0].inputSchema.script.description, SCRIPT_FIELD_DESCRIPTION);
+    assert.equal(session.scriptDesc, SCRIPT_FIELD_DESCRIPTION);
+  } finally {
+    configureCaveman({});
+  }
 });
 
 test("mergeLateTool makes a late tool callable and queues an announcement", () => {
@@ -1783,14 +1792,14 @@ test("multi-call and zero-call runs never trigger the nudge", async () => {
 });
 
 test("buildCodeToolDescription includes shell exit-code guidance (grep no-match is data)", () => {
-  const d = buildCodeToolDescription(new Map());
+  const d = buildCodeToolDescription(new Map(), { caveman: "off" });
   assert.match(d, /exit 1 on no match/);
   assert.match(d, /\|\| true/);
   assert.match(d, /do not retry a shell call solely because/);
 });
 
 test("buildCodeToolDescription includes BSD userland guidance steering to codemode.exec", () => {
-  const d = buildCodeToolDescription(new Map());
+  const d = buildCodeToolDescription(new Map(), { caveman: "off" });
   assert.match(d, /BSD userland/);
   assert.match(d, /sed -n 'N,\+Kp'/);
 });

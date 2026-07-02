@@ -14,7 +14,12 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { buildCodeToolDescription } from "../src/code-mode.mjs";
+import { configureCaveman } from "../src/caveman.mjs";
 import { registerClientTool } from "../src/server.mjs";
+
+// The fixture locks the PRODUCTION rendering: caveman full is the shipped
+// default, pinned here so the byte-lock is deterministic under any CAVEMAN env.
+configureCaveman({ caveman: "full" });
 
 const GOLDEN_PATH = join(dirname(fileURLToPath(import.meta.url)), "fixtures", "code-description.golden.txt");
 

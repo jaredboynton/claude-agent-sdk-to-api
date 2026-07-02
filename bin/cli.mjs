@@ -102,6 +102,8 @@ function cmdRun(args) {
   startServer({
     port, host, account: auth.account, profileDir: auth.configDir, version: PKG.version,
     cacheLog: args["cache-log"] ?? process.env.CACHE_LOG,
+    caveman: args.caveman ?? process.env.CAVEMAN,
+    cavemanSystem: args["caveman-system"] ?? process.env.CAVEMAN_SYSTEM,
   });
 
   if (!args["no-self-update"] && process.env.CLAUDE_AGENT_API_NO_SELF_UPDATE !== "1") {
@@ -145,6 +147,9 @@ function cmdStartAll(args) {
       [join(__dirname, "cli.mjs"), "run", "--no-self-update", "--profile", p.configDir, "--port", String(p.port), "--host", p.host].concat(
         // boolean form so each child logs to its own <profileDir>/cache-log.jsonl
         (args["cache-log"] || p.cacheLog) ? ["--cache-log"] : [],
+        // per-profile caveman level (config field), overridable by a global --caveman
+        (args.caveman ?? p.caveman) != null ? ["--caveman", String(args.caveman ?? p.caveman)] : [],
+        args["caveman-system"] != null ? ["--caveman-system", String(args["caveman-system"])] : [],
       ),
       { stdio: ["ignore", "inherit", "inherit"], env: { ...process.env, CLAUDE_AGENT_API_NO_SELF_UPDATE: "1" } }
     );
@@ -342,7 +347,7 @@ function usage() {
   process.stdout.write(
     `claude-agent-api — expose the Claude Agent SDK as an Anthropic /v1/messages API\n\n` +
       `Usage:\n` +
-      `  claude-agent-api [run] --profile <configDir> --port <n> [--host h] [--token-file f] [--no-self-update] [--cache-log [path]]\n` +
+      `  claude-agent-api [run] --profile <configDir> --port <n> [--host h] [--token-file f] [--no-self-update] [--cache-log [path]] [--caveman full|lite|off] [--caveman-system full|lite|off]\n` +
       `  claude-agent-api start-all [--config profiles.json]\n` +
       `  claude-agent-api install   [--config profiles.json]\n` +
       `  claude-agent-api uninstall [--config profiles.json]\n` +
