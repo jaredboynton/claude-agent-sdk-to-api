@@ -40,7 +40,7 @@ return { status: test.isError ? "tests-failed" : "done", tail: test.lines({ nonE
 ```
 
 ## Tool signatures
-Signatures below are TypeScript-shaped docs only; write executable JavaScript, not TypeScript syntax. Args must match signature:? means optional, literal unions list allowed values, and Array<T> is array. Schema descriptions, defaults, examples, formats, and patterns are authoritative. Long tool descriptions are truncated below — `codemode.describe("Name")` returns full docs in-script.
+Signatures below are TypeScript-shaped docs only; write executable JavaScript, not TypeScript syntax. Args must match signature: ? means optional, literal unions list allowed values, and Array<T> is array. Schema descriptions, defaults, examples, formats, and patterns are authoritative. Long tool descriptions are truncated below — `codemode.describe("Name")` returns full docs in-script.
 
 Available tools:
 

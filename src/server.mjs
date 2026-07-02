@@ -540,9 +540,12 @@ export function startServer({ port = 32809, host = "127.0.0.1", account = null, 
         update: getUpdateStatus(),
       });
     }
-    // Manual update trigger: runs one poll tick immediately (check + gated
-    // apply + drain-aware relaunch), so deploys never wait on the poll cadence.
-    if (req.method === "POST" && (url === "/update/check" || url === "/update/check/")) {
+    // Update status + manual trigger. Background polling may be off during
+    // development; POST still runs one registry check / gated apply tick.
+    if (req.method === "GET" && (url === "/update" || url === "/update/")) {
+      return jsonResp(res, 200, { ok: true, update: getUpdateStatus() });
+    }
+    if (req.method === "POST" && (url === "/update" || url === "/update/" || url === "/update/check" || url === "/update/check/")) {
       const r = await triggerUpdateCheck();
       return jsonResp(res, 200, { ok: true, outcome: r?.outcome ?? null, detail: r?.detail ?? r?.reason ?? null, update: getUpdateStatus() });
     }

@@ -24,7 +24,7 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync } from "
 import { setupAuth, resolveProfileDir, readProfileAccount, expandHome, preflightProfileDir } from "../src/auth.mjs";
 import { startServer, activeWork } from "../src/server.mjs";
 import { loadProfilesConfig, defaultConfigPath } from "../src/config.mjs";
-import { startAutoUpdateLoop, defaultStatePath } from "../src/self-update.mjs";
+import { startAutoUpdateLoop, defaultStatePath, defaultAppSupportDir, killSwitchDisabled, registerManualUpdate } from "../src/self-update.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PKG_ROOT = join(__dirname, "..");
@@ -106,16 +106,21 @@ function cmdRun(args) {
     cavemanSystem: args["caveman-system"] ?? process.env.CAVEMAN_SYSTEM,
   });
 
-  if (!args["no-self-update"] && process.env.CLAUDE_AGENT_API_NO_SELF_UPDATE !== "1") {
-    startAutoUpdateLoop({
-      pkgName: PKG.name,
-      ownInstallDir: PKG_ROOT,
-      currentVersion: PKG.version,
-      statePath: defaultStatePath(HOME),
-      // Drain-aware relaunch: after a successful install, wait for live turns
-      // and code runs to finish before exiting for launchd to restart us.
-      isBusy: () => activeWork().busy,
-    });
+  const selfUpdateOpts = {
+    pkgName: PKG.name,
+    ownInstallDir: PKG_ROOT,
+    currentVersion: PKG.version,
+    statePath: defaultStatePath(HOME),
+    isBusy: () => activeWork().busy,
+  };
+  registerManualUpdate(selfUpdateOpts);
+
+  const pollDisabled =
+    args["no-self-update"] ||
+    process.env.CLAUDE_AGENT_API_NO_SELF_UPDATE === "1" ||
+    killSwitchDisabled(defaultAppSupportDir(HOME));
+  if (!pollDisabled) {
+    startAutoUpdateLoop(selfUpdateOpts);
   }
 }
 

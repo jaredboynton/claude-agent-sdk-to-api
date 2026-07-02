@@ -32,6 +32,7 @@ import {
   _resetDrainGuardForTests,
   getUpdateStatus,
   triggerUpdateCheck,
+  registerManualUpdate,
   startAutoUpdateLoop,
   _resetLoopGuardForTests,
 } from "../src/self-update.mjs";
@@ -321,6 +322,20 @@ test("autoUpdateTick returns Disabled when the kill-switch sentinel exists", asy
   s.cleanup();
 });
 
+test("autoUpdateTick ignoreKillSwitch runs the check despite the sentinel (manual POST /update path)", async () => {
+  const s = makeStateDir();
+  writeFileSync(join(s.appSupportDir, "auto-update.disabled"), "");
+  const r = await autoUpdateTick({
+    pkgName: PKG, ownInstallDir: globalInstallDir(PKG, "/npm-prefix"),
+    currentVersion: "0.2.0", statePath: s.statePath, appSupportDir: s.appSupportDir,
+    npmPrefix: "/npm-prefix", fetchImpl: async () => ({ ok: true, json: async () => ({ version: "0.2.0" }) }),
+    shouldExit: false,
+    ignoreKillSwitch: true,
+  });
+  assert.equal(r.outcome, AutoUpdateOutcome.Current, "manual tick must reach the registry check with the kill switch present");
+  s.cleanup();
+});
+
 test("autoUpdateTick returns DevCheckout when running outside the npm global lib", async () => {
   const s = makeStateDir();
   let fetched = false;
@@ -520,10 +535,58 @@ test("scheduleExitWhenIdle records draining status and clears it on exit", () =>
   _resetDrainGuardForTests();
 });
 
-test("triggerUpdateCheck without a running loop resolves loop_not_running", async () => {
+test("triggerUpdateCheck without registration resolves not_configured", async () => {
   _resetLoopGuardForTests();
   const r = await triggerUpdateCheck();
-  assert.equal(r.outcome, "loop_not_running");
+  assert.equal(r.outcome, "not_configured");
+});
+
+test("triggerUpdateCheck runs a manual tick when polling is off", async () => {
+  _resetLoopGuardForTests();
+  const dir = mkdtempSync(join(tmpdir(), "su-manual-"));
+  registerManualUpdate({
+    pkgName: PKG,
+    ownInstallDir: dir,
+    currentVersion: "0.0.1",
+    statePath: join(dir, "state.json"),
+    fetchImpl: async () => { throw new Error("must not fetch in a dev checkout"); },
+  });
+  const r = await triggerUpdateCheck();
+  assert.equal(r.outcome, AutoUpdateOutcome.DevCheckout);
+  const st = getUpdateStatus();
+  assert.equal(st.currentVersion, "0.0.1");
+  assert.equal(st.pollActive, false);
+  assert.equal(st.manualCheckAvailable, true);
+  assert.equal(st.lastOutcome, "dev_checkout");
+  _resetLoopGuardForTests();
+});
+
+test("triggerUpdateCheck bypasses the kill switch; scheduled polls stay parked", async () => {
+  _resetLoopGuardForTests();
+  const s = makeStateDir();
+  writeFileSync(join(s.appSupportDir, "auto-update.disabled"), "");
+  registerManualUpdate({
+    pkgName: PKG,
+    ownInstallDir: globalInstallDir(PKG, "/npm-prefix"),
+    currentVersion: "0.2.0",
+    statePath: s.statePath,
+    appSupportDir: s.appSupportDir,
+    npmPrefix: "/npm-prefix",
+    fetchImpl: async () => ({ ok: true, json: async () => ({ version: "0.2.0" }) }),
+  });
+  const manual = await triggerUpdateCheck();
+  assert.equal(manual.outcome, AutoUpdateOutcome.Current, "manual trigger works with the kill switch present");
+  // The same tick invoked WITHOUT the manual bypass (what the poll timer runs)
+  // still honors the sentinel.
+  const polled = await autoUpdateTick({
+    pkgName: PKG, ownInstallDir: globalInstallDir(PKG, "/npm-prefix"),
+    currentVersion: "0.2.0", statePath: s.statePath, appSupportDir: s.appSupportDir,
+    npmPrefix: "/npm-prefix", fetchImpl: async () => ({ ok: true, json: async () => ({ version: "0.2.0" }) }),
+    shouldExit: false,
+  });
+  assert.equal(polled.outcome, AutoUpdateOutcome.Disabled);
+  s.cleanup();
+  _resetLoopGuardForTests();
 });
 
 test("triggerUpdateCheck runs a tick immediately, single-flight, and records status", async () => {
@@ -539,6 +602,7 @@ test("triggerUpdateCheck runs a tick immediately, single-flight, and records sta
   const st0 = getUpdateStatus();
   assert.equal(st0.currentVersion, "0.0.1");
   assert.ok(st0.nextCheckAt >= Date.now() - 1000, "boot tick is scheduled");
+  assert.equal(st0.pollActive, true);
   const p1 = triggerUpdateCheck();
   const p2 = triggerUpdateCheck();
   assert.equal(p1, p2, "second trigger joins the in-flight tick");

@@ -468,6 +468,27 @@ test("findResumeCandidate carries toolsetHash and updatedAt", () => {
   });
   assert.equal(candidate.toolsetHash, "abcdef0123456789");
   assert.equal(candidate.updatedAt, e.updatedAt);
+  assert.equal(candidate.caveman, null, "entries without a caveman tag surface null");
+});
+
+test("upsertResumeEntry and findResumeCandidate round-trip the caveman tag", () => {
+  const base = [
+    { role: "user", content: [{ type: "text", text: "start" }] },
+    { role: "assistant", content: [{ type: "text", text: "ok" }] },
+  ];
+  const incoming = [...base, { role: "user", content: [{ type: "text", text: "next" }] }];
+  const updated = upsertResumeEntry({ entries: [] }, { ...entry(2, incoming), caveman: "full/full/v1" });
+  assert.equal(updated.entries[0].caveman, "full/full/v1");
+  const candidate = findResumeCandidate({
+    entries: updated.entries,
+    model: "claude-opus-4-8",
+    profileKey: PK,
+    bucket: BUCKET,
+    messages: incoming,
+    lastIsToolResult: false,
+    hashMessages,
+  });
+  assert.equal(candidate.caveman, "full/full/v1");
 });
 
 test("upsertResumeEntry preserves toolsetHash", () => {

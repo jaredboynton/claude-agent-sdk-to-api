@@ -303,10 +303,34 @@ const _updateStatus = {
   nextCheckAt: null,
   installing: false,
   draining: null, // { version, since, hardDeadlineAt } while a relaunch waits on live work
+  pollActive: false,
 };
 
+let _manualUpdateOpts = null;
+let _manualInFlight = null;
+
+/** Register config for manual POST /update ticks (works with polling off). */
+export function registerManualUpdate(opts = {}) {
+  _manualUpdateOpts = {
+    pkgName: opts.pkgName,
+    ownInstallDir: opts.ownInstallDir,
+    currentVersion: opts.currentVersion,
+    statePath: opts.statePath,
+    appSupportDir: opts.appSupportDir ?? (opts.statePath ? dirname(opts.statePath) : defaultAppSupportDir()),
+    npmPrefix: opts.npmPrefix,
+    fetchImpl: opts.fetchImpl,
+    spawnFn: opts.spawnFn,
+    isBusy: opts.isBusy,
+  };
+  _updateStatus.currentVersion = opts.currentVersion ?? null;
+}
+
 export function getUpdateStatus() {
-  return { ..._updateStatus, draining: _updateStatus.draining ? { ..._updateStatus.draining } : null };
+  return {
+    ..._updateStatus,
+    draining: _updateStatus.draining ? { ..._updateStatus.draining } : null,
+    manualCheckAvailable: _runTickNow != null || _manualUpdateOpts != null,
+  };
 }
 
 // Set by startAutoUpdateLoop; lets POST /update/check run a tick immediately.
@@ -314,11 +338,26 @@ let _runTickNow = null;
 
 /**
  * Run one update tick now instead of waiting for the poll. Single-flight: a
- * trigger while a tick is in flight joins it. Resolves to the tick outcome.
+ * trigger while a tick is in flight joins it. Uses the background loop when
+ * active; otherwise runs a one-off tick from registerManualUpdate() config.
  */
 export function triggerUpdateCheck() {
-  if (!_runTickNow) return Promise.resolve({ outcome: "loop_not_running" });
-  return _runTickNow();
+  // Manual ticks bypass the auto-update kill switch (it parks polling only).
+  if (_runTickNow) return _runTickNow({ ignoreKillSwitch: true });
+  if (!_manualUpdateOpts) return Promise.resolve({ outcome: "not_configured" });
+  if (_manualInFlight) return _manualInFlight;
+  _manualInFlight = (async () => {
+    try {
+      const r = await autoUpdateTick({ ..._manualUpdateOpts, shouldExit: true, ignoreKillSwitch: true });
+      _updateStatus.lastOutcome = r?.outcome ?? null;
+      _updateStatus.lastDetail = r?.detail ?? r?.reason ?? null;
+      if (r?.latestVersion) _updateStatus.latestSeen = r.latestVersion;
+      return r;
+    } finally {
+      _manualInFlight = null;
+    }
+  })();
+  return _manualInFlight;
 }
 
 // --- drain-aware relaunch ---------------------------------------------------
@@ -403,8 +442,12 @@ export async function autoUpdateTick({
   drainRecheckMs = DRAIN_RECHECK_MS,
   drainHardDeadlineMs = DRAIN_HARD_DEADLINE_MS,
   exitFn = (code) => process.exit(code),
+  ignoreKillSwitch = false,
 }) {
-  if (killSwitchDisabled(appSupportDir)) return { outcome: AutoUpdateOutcome.Disabled };
+  // The kill switch parks BACKGROUND polling only. A manual POST /update is an
+  // explicit operator action and must keep working while polling is disabled —
+  // that is the whole point of the manual endpoint during development.
+  if (!ignoreKillSwitch && killSwitchDisabled(appSupportDir)) return { outcome: AutoUpdateOutcome.Disabled };
 
   if (!isGlobalInstall(ownInstallDir, pkgName, npmPrefix)) {
     return { outcome: AutoUpdateOutcome.DevCheckout };
@@ -476,7 +519,9 @@ export function startAutoUpdateLoop({
 } = {}) {
   if (_loopRunning) return;
   _loopRunning = true;
+  _updateStatus.pollActive = true;
   _updateStatus.currentVersion = currentVersion;
+  if (!_manualUpdateOpts) registerManualUpdate({ pkgName, ownInstallDir, currentVersion, statePath, appSupportDir, npmPrefix, fetchImpl, spawnFn, isBusy });
 
   let timer = null;
   let inFlight = null;
@@ -491,7 +536,9 @@ export function startAutoUpdateLoop({
 
   // Single-flight tick shared by the poll timer and triggerUpdateCheck(): a
   // manual trigger while a tick is in flight joins it instead of stacking.
-  const runTick = () => {
+  // `extra` carries manual-trigger overrides (ignoreKillSwitch); the timer
+  // invokes with no args, so scheduled polls never inherit the bypass.
+  const runTick = (extra) => {
     if (inFlight) return inFlight;
     if (timer) { clearTimeout(timer); timer = null; }
     inFlight = (async () => {
@@ -507,6 +554,7 @@ export function startAutoUpdateLoop({
           fetchImpl,
           spawnFn,
           isBusy,
+          ...(extra && typeof extra === "object" ? extra : {}),
         });
         switch (r.outcome) {
           case AutoUpdateOutcome.Disabled:
@@ -555,6 +603,8 @@ export function _resetLoopGuardForTests() {
   _loopRunning = false;
   _devCheckoutLogged = false;
   _runTickNow = null;
+  _manualUpdateOpts = null;
+  _manualInFlight = null;
   Object.assign(_updateStatus, {
     currentVersion: null,
     lastCheckAt: null,
@@ -564,6 +614,7 @@ export function _resetLoopGuardForTests() {
     nextCheckAt: null,
     installing: false,
     draining: null,
+    pollActive: false,
   });
 }
 

@@ -33,7 +33,7 @@ Anthropic-compatible HTTP bridge over the Claude Agent SDK. It exposes `/v1/mess
 - `src/local-checks.mjs`: daemon-side syntax checks and git snapshot helpers for code mode.
 - `src/resume-index.mjs`: persistent SDK resume index, resume-catchup, frozen toolset blobs, cache-warm window rules.
 - `src/cache-log.mjs`: opt-in per-turn cache receipt logging.
-- `src/self-update.mjs`: npm registry polling, global-install gate, drain-aware relaunch.
+- `src/self-update.mjs`: npm registry polling, global-install gate, drain-aware relaunch, manual `POST /update` ticks via `registerManualUpdate()`.
 - `scripts/`: live/integration validations that require a running bridge unless noted in the script header.
 - `service/`: launchd/systemd templates rendered by `bin/cli.mjs install`.
 - `test/`: focused `node:test` coverage; server tests use test seams exported from `src/server.mjs`.
@@ -43,7 +43,20 @@ Anthropic-compatible HTTP bridge over the Claude Agent SDK. It exposes `/v1/mess
 - `README.md`: architecture, setup, profile usage, code mode contract, env knobs, live validation commands.
 - `docs/code-mode-cache-savings.md`: cache-cost model, measured receipts, frozen toolset rationale, cache-bust reporting workflow.
 - `examples/`: sample profiles, Factory model config, and a curl/client tool round-trip.
-- `test/fixtures/code-description.golden.txt`: byte-for-byte fixture for the rendered `code` tool description.
+- `test/fixtures/code-description.golden.txt`: byte-for-byte fixture for the rendered `code` tool description (caveman full, the production default); `code-description.off.golden.txt` locks the authored uncompressed render.
+
+### Auto-update during development
+
+Background npm polling is **off** on local launchd/systemd services while this repo is under active development. Installed services pass `--no-self-update`, set `CLAUDE_AGENT_API_NO_SELF_UPDATE=1`, and the operator kill switch at `~/Library/Application Support/claude-agent-api/auto-update.disabled` parks polling even when flags are removed.
+
+Manual updates remain available over HTTP (polling not required):
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/update` | Update status snapshot (`pollActive`, `manualCheckAvailable`, `latestSeen`, `lastOutcome`, `installing`, `draining`, …) |
+| `POST` | `/update` or `/update/check` | Run one registry check + gated `npm install -g` apply tick; drain-aware relaunch when a newer version lands |
+
+`/healthz` also embeds the same `update` object for quick health probes. Re-enable background polling only after a fixed release is on npm: remove the kill switch, drop `--no-self-update` from the service template, and `claude-agent-api install` to rewrite LaunchAgents.
 
 ## Coding Conventions
 
@@ -75,7 +88,9 @@ Turn teardown is event-driven off the SDK `query()` lifecycle: when the async it
 
 The rendered `code` tool description sits in every conversation's cached prompt prefix; changing its bytes re-writes that prefix at 2x. Its bytes may change only when the cache is already dead: fresh sessions and past-TTL resumes. Never re-render it for a live or warm-resumed conversation; warm resumes reuse the persisted frozen-toolset blob.
 
-Never edit the `code` prose or schema rendering without deliberately regenerating `test/fixtures/code-description.golden.txt`; batch such edits into as few releases as possible. Tools that appear mid-conversation merge into the script runtime and are announced inside a `code` tool_result append-only, never via the description.
+Never edit the `code` prose or schema rendering without deliberately regenerating both golden fixtures (`test/fixtures/code-description.golden.txt` and `code-description.off.golden.txt`); batch such edits into as few releases as possible. Tools that appear mid-conversation merge into the script runtime and are announced inside a `code` tool_result append-only, never via the description.
+
+Caveman rule-table or protection-regex edits in `src/caveman.mjs` ARE description-byte changes: they rewrite the compressed render for every fresh session. Bump `CAVEMAN_RULES_VERSION`, regenerate both goldens, review the golden diff line-by-line for garbled prose (that diff is the compression QA gate), and batch with other description releases. Compression runs at the render layer only — never compress `session.toolsetRawTools`, the worker catalog (`codemode.describe` full docs), or anything inside a frozen blob.
 
 ### Auth and local state
 
@@ -86,7 +101,7 @@ Never edit the `code` prose or schema rendering without deliberately regeneratin
 ## Testing and Quality
 
 - Run `npm test` for normal verification.
-- If `src/code-mode.mjs`, `src/anchor-edit.mjs`, tool schema rendering, or the `code` description changes, run `node --test test/code-description.golden.test.mjs`.
+- If `src/code-mode.mjs`, `src/anchor-edit.mjs`, `src/caveman.mjs`, tool schema rendering, or the `code` description changes, run `node --test test/code-description.golden.test.mjs`.
 - If the golden description change is intentional, regenerate with `UPDATE_GOLDEN=1 node --test test/code-description.golden.test.mjs`, then run `npm test`.
 - For live code-mode behavior, start a bridge first (`npm start -- --profile ~/.claude --port 32809`) and run the relevant `scripts/live-*.mjs` command from `README.md`.
 - For cache-bust analysis, use `node scripts/cache-bust-report.mjs <cache-log.jsonl>` against logs produced with `--cache-log` or `CACHE_LOG=1`.

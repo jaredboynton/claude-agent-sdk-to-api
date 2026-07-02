@@ -22,7 +22,10 @@
 // span is a bug. If the restore round-trip is ever imperfect, the ORIGINAL
 // text is returned unchanged (all-or-nothing fail-safe).
 
-export const CAVEMAN_RULES_VERSION = 1;
+// v2: space-before-punctuation cleanup narrowed to , . ; : with a lookahead —
+// v1 (shipped in 0.1.46) glued quoted ?/! symbol references to the prior word
+// ("signature: ?" -> "signature:?").
+export const CAVEMAN_RULES_VERSION = 2;
 
 /** Normalize a level knob value ("full" | "lite" | "off"). */
 export function normalizeCavemanLevel(v, fallback = "off") {
@@ -283,7 +286,11 @@ const COMPILED_WS = [
   (s) => s.replace(/[ \t]+$/gm, ""), // trailing spaces
   (s) => s.replace(/\n{3,}/g, "\n\n"), // repeated blank lines
   (s) => s.replace(/(\S)[ \t]{2,}/g, "$1 "), // interior runs (leading indent untouched)
-  (s) => s.replace(/[ \t]+([,.;:!?])/g, "$1"), // space left behind by deletions
+  // Space left behind by deletions. Only , . ; : — a space before ? or ! is
+  // usually a quoted symbol reference ("the signature: ? means optional") and
+  // eating it garbles the prose. The lookahead keeps ellipses (" ...") and
+  // bare member references (" .anchored") from being glued to the prior word.
+  (s) => s.replace(/[ \t]+([,.;:])(?![\w?!.])/g, "$1"),
 ];
 
 // ---------------------------------------------------------------------------

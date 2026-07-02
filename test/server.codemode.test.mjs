@@ -47,6 +47,7 @@ import {
   startServer,
   startCodeRun,
   configureCaveman,
+  compressProse,
   rememberRateLimitHeaders,
   writeEvent,
 } from "../src/server.mjs";
@@ -1471,6 +1472,46 @@ test("buildParkingMcpServer renders live when no frozen toolset is supplied", ()
   }
 });
 
+test("buildParkingMcpServer fresh render is caveman-compressed and reports savings", () => {
+  configureCaveman({ caveman: "full" });
+  try {
+    const session = fakeCodeSession({ clientTools: new Map(), inputParsers: new Map() });
+    let captured = null;
+    buildParkingMcpServer(
+      [{ name: "Grep", description: "Searches for a pattern in order to find the files that match it.", input_schema: GREP_SCHEMA }],
+      session,
+      (config) => { captured = config; return { ok: true }; },
+    );
+    assert.equal(session.codeDescription, buildCodeToolDescription(session.clientTools, { caveman: "full" }));
+    assert.ok(session.codeDescription.length < buildCodeToolDescription(session.clientTools, { caveman: "off" }).length);
+    assert.ok(session.cavemanDescSaved > 0, "fresh compressed render must report a savings receipt");
+    // Script-field prose is compressed at the same level and frozen with the description.
+    assert.equal(session.scriptDesc, compressProse(SCRIPT_FIELD_DESCRIPTION, { level: "full" }).text);
+    assert.equal(captured.tools[0].description, session.codeDescription);
+  } finally {
+    configureCaveman({});
+  }
+});
+
+test("buildParkingMcpServer frozen resume replays bytes verbatim with no savings receipt", () => {
+  configureCaveman({ caveman: "full" });
+  try {
+    const frozen = {
+      description: "FROZEN DESCRIPTION BYTES: note that the prose here would compress if it were re-rendered.",
+      tools: [{ name: "Grep", description: "grep", input_schema: GREP_SCHEMA }],
+      scriptDesc: "OLD FROZEN SCRIPT FIELD PROSE",
+    };
+    const session = fakeCodeSession({ clientTools: new Map(), inputParsers: new Map() });
+    let captured = null;
+    buildParkingMcpServer([], session, (config) => { captured = config; return { ok: true }; }, frozen);
+    assert.equal(captured.tools[0].description, frozen.description, "frozen bytes replay verbatim, never re-compressed");
+    assert.equal(session.scriptDesc, frozen.scriptDesc);
+    assert.equal(session.cavemanDescSaved, undefined, "no savings receipt when nothing was rendered");
+  } finally {
+    configureCaveman({});
+  }
+});
+
 test("mergeLateTool makes a late tool callable and queues an announcement", () => {
   const session = fakeCodeSession({ clientTools: new Map(), inputParsers: new Map(), toolsetRawTools: [] });
   mergeLateTool(session, {
@@ -1659,6 +1700,22 @@ test("runCodeScriptDynamic: codemode.exec runs inline source through the shell t
   assert.equal(r.value.text.trim(), "h['x-access']|$[ok]|A B");
   assert.equal(r.value.err, false);
   assert.equal(r.waves, 1);
+});
+
+test("runCodeScriptDynamic: codemode.exec threads interpreterArgs before the script path", async () => {
+  const seen = [];
+  const script = `const r = await codemode.exec("console.log('ok')", { interpreterArgs: ["--no-warnings"] }); return { text: r.text };`;
+  const r = await runCodeScriptDynamic(script, {
+    toolNames: ["Bash"],
+    toolDocs: [{ name: "Bash", path: "tools.Bash", summary: "run", docs: "Bash(args: { command: string })" }],
+    dispatchWave: async (_w, calls) => calls.map((c) => { seen.push(c); return { text: "ran", raw: null, isError: false }; }),
+    timeoutMs: 5000,
+  });
+  assert.equal(seen.length, 1);
+  // Interpreter flags must precede the script path (node CLI flags), while
+  // `args` stay after it as the script's argv.
+  assert.match(seen[0].args.command, /'node' '--no-warnings' "\$__cma_d\/exec\.cjs"/);
+  assert.equal(r.value.text, "ran");
 });
 
 test("runCodeScriptDynamic: codemode.exec with no shell tool errors clearly (no wave)", async () => {

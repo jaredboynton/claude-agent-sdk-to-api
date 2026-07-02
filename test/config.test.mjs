@@ -22,6 +22,22 @@ test("validates a good config and expands ~ in configDir", () => {
   assert.equal(cfg.profiles[0].host, "127.0.0.1");
 });
 
+test("caveman profile field normalizes levels and rejects garbage", () => {
+  const cfg = validateProfilesConfig({
+    profiles: [
+      { name: "a", configDir: "~/.claude-a", port: 32801, caveman: "lite" },
+      { name: "b", configDir: "~/.claude-b", port: 32802, caveman: false },
+      { name: "c", configDir: "~/.claude-c", port: 32803, caveman: true },
+      { name: "d", configDir: "~/.claude-d", port: 32804 },
+    ],
+  }, { home: HOME });
+  assert.deepEqual(cfg.profiles.map((p) => p.caveman), ["lite", "off", "full", null]);
+  assert.throws(
+    () => validateProfilesConfig({ profiles: [{ name: "x", configDir: "~/.c", port: 32805, caveman: "mega" }] }, { home: HOME }),
+    /invalid "caveman"/,
+  );
+});
+
 test("rejects empty / missing profiles", () => {
   assert.throws(() => validateProfilesConfig({}, { home: HOME }), /non-empty "profiles"/);
   assert.throws(() => validateProfilesConfig({ profiles: [] }, { home: HOME }), /non-empty "profiles"/);

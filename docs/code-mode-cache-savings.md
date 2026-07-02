@@ -170,3 +170,9 @@ One batched description release targeting the two remaining shapes in §6: the w
 
 Expected movement on the next §7 re-run: cache-create tokens per conversation down (prefix compression), `p_c` up and turns per task down (doctrine + example + nudge), `c` down (return-size target), `singleCallRuns/codeCalls` trending toward zero.
 
+
+## 11. Caveman prose compression (2026-07-02)
+
+Deterministic rule-based compression (`src/caveman.mjs`, on by default at `full`) shrinks the prompt-bound prose itself before it is ever cache-written: the `code` description head, per-tool prose (compressed *before* the `CODE_TOOL_DESC_MAX_CHARS` cut, so more substance survives the cap), the frozen `script`-field prose, and the client system append. Protected spans (fences, backticks, headings, signatures, URLs, paths, quoted literals, tags, ALL-CAPS, JSON-ish lines) pass through byte-identical, and the worker catalog stays uncompressed so `codemode.describe()` remains the lossless fallback.
+
+Cache mechanics are unchanged by construction: compression happens at render time only, so compressed bytes freeze into the toolset blob and replay verbatim on warm resumes; pre-caveman conversations keep their uncompressed frozen bytes. Rule-table edits are description-byte changes (bump `CAVEMAN_RULES_VERSION`, regenerate both goldens, batch releases). The canonical test toolset shows ~3% off the already-tight authored description; the real win scales with verbose client toolsets (tens of KB of tool prose, written at 2x per conversation) and CLAUDE.md-heavy system appends. Receipts: `cavemanSaved` / `cavemanSystemSaved` per cache-log row, plus a per-fresh-render stderr line.
