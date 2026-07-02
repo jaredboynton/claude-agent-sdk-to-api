@@ -28,6 +28,12 @@ const DEFAULT_MAX_CALLS = Number(process.env.CODE_MAX_CALLS || 0);
 // (never errored — the run's work is preserved) with the full text spilled to a
 // session artifact reachable via codemode.recall(). 0 = no cap.
 const DEFAULT_SCRIPT_OUTPUT_MAX_BYTES = Number(process.env.CODE_SCRIPT_MAX_OUTPUT_BYTES ?? 16384);
+// The rendered `code` description embeds every client tool's prose verbatim;
+// real harness toolsets carry multi-KB descriptions (Bash alone ~5KB), all
+// cache-written at 2x per conversation. Cap the prose per tool in the RENDERED
+// description only — signatures always survive, and codemode.describe() serves
+// the full docs in-script (worker-local, zero transcript bytes). 0 = uncapped.
+const DEFAULT_TOOL_DESC_MAX_CHARS = Number(process.env.CODE_TOOL_DESC_MAX_CHARS ?? 700);
 const TRUNCATE_HEAD_BYTES = 6144;
 const TRUNCATE_TAIL_BYTES = 2048;
 const CONSOLE_LINE_MAX = 2048;
@@ -178,11 +184,25 @@ function propCommentLines(schema) {
   return lines;
 }
 
+// Cut long tool prose at the largest paragraph/line/word boundary inside the
+// budget (never mid-word) and point at the in-script full docs. Deterministic
+// string ops only: the output is part of the byte-stable cached description.
+export function truncateToolProse(desc, name, maxChars) {
+  const text = String(desc ?? "");
+  if (!maxChars || maxChars <= 0 || text.length <= maxChars) return text;
+  const slice = text.slice(0, maxChars);
+  const paraCut = slice.lastIndexOf("\n\n");
+  const lineCut = slice.lastIndexOf("\n");
+  const spaceCut = slice.lastIndexOf(" ");
+  const cut = paraCut >= maxChars / 2 ? paraCut : lineCut >= maxChars / 2 ? lineCut : spaceCut > 0 ? spaceCut : maxChars;
+  return `${text.slice(0, cut).trimEnd()} ...\n[truncated — full docs: codemode.describe(${jsonLiteral(name)})]`;
+}
+
 /** Build a typed declaration block for one client tool (codex-style). */
-function describeClientTool(name, meta) {
+function describeClientTool(name, meta, maxDescChars = 0) {
   const normalized = normalizeClientToolMeta(name, meta);
   const argsType = jsonSchemaToTs(normalized.input_schema);
-  const desc = normalized.description.trim();
+  const desc = truncateToolProse(normalized.description.trim(), name, maxDescChars);
   const heading = `### ${name}`;
   const sig = `${name}(args: ${argsType})`;
   return desc ? `${heading}\n${desc}\n${sig}` : `${heading}\n${sig}`;
@@ -218,22 +238,58 @@ export function buildCodeToolCatalog(clientTools) {
 /** Build dynamic description for the single `code` MCP tool. */
 export function buildCodeToolDescription(clientTools) {
   const entries = sortedToolEntries(clientTools);
-  const toolBlocks = entries.map(([name, meta]) => describeClientTool(name, meta));
+  const toolBlocks = entries.map(([name, meta]) => describeClientTool(name, meta, DEFAULT_TOOL_DESC_MAX_CHARS));
   return (
-    "Run a full async JavaScript program that calls the client's tools and returns a summary. "
-    + "Favor intelligent logic, batching, and parallelism: every independent tool call should run in one `Promise.all` or `codemode.batch` wave. Push branching, loops, retries, and aggregation into this script instead of returning to the model between dependent steps. There is no time, wave, or call limit by default. "
-    + "All client tools are available only through this script runtime; do not expect original tools outside `code`. "
-    + "Runtime API: `await tools.<Name>(args)`, `await tools[\"Any-Name\"](args)`, `await callTool(name, args)`, or `await codemode.call(name, args)`. `codemode.batch([['Tool', args], ...])` starts independent calls together. `codemode.search(query)` finds matching tool docs (top 20), `codemode.list()` enumerates the full catalog, and `codemode.describe(nameOrPath)` returns focused TypeScript-shaped docs for one tool. `await sleep(ms)` pauses (30s cap per call); `await codemode.retry(fn, { attempts, delayMs })` retries a failing async thunk with linear backoff. "
-    + "`await codemode.exec(source, { interpreter?, cwd?, args?, tool? })` runs an inline script through the client's shell tool with zero quoting hazards: the source is base64-armored into a mktemp file and executed in one atomic command (interpreter defaults to `node`; `.mjs`/`.cjs` inferred from the source). Always use it instead of `node -e`/`python -c` one-liners — the shell mangles `$[`, `$(`, and nested quotes inside those — and instead of separate write-temp-file-then-run steps. "
-    + "`await codemode.verify(path)` syntax-checks the real file on disk (js/mjs/cjs, py, json, sh) with no extra turn — call it after edits instead of `tools.Bash(\"node --check ...\")`, and check `.isError` on the result. Files you edit are also auto-checked after the run; failures are appended to this result. "
+    "Run one complete async JavaScript program that performs as much of the task as possible in a single call and returns a compact summary.\n"
+    + "\n"
+    + "## Why one call\n"
+    + "Every `code` call is a full model round-trip: the entire conversation prefix is re-read and re-extended. N small scripts cost N round-trips; one script that branches on its own results costs 1. Push branching, loops, retries, and aggregation into this script instead of returning to the model between dependent steps — never return just to look at data and decide; decide in-script with if/else on tool results. Return only when the task is done, when you need a judgment or approval only the model or user can make, or when a failure is unrecoverable in-script. A run that makes a single tool call wastes its round-trip: fold the surrounding recon, action, and verification into the same script. There is no time, wave, or call limit by default. All client tools are available only through this script runtime; do not expect original tools outside `code`.\n"
+    + "\n"
+    + "## Runtime API\n"
+    + "`await tools.<Name>(args)` calls a client tool (`tools[\"Any-Name\"]`, `callTool(name, args)`, and `codemode.call(name, args)` are equivalent forms). `codemode.batch([['Tool', args], ...])` starts independent calls together. `codemode.search(query)` finds matching tool docs (top 20), `codemode.list()` enumerates the full catalog, and `codemode.describe(nameOrPath)` returns the FULL docs for one tool. `await sleep(ms)` pauses (30s cap per call); `await codemode.retry(fn, { attempts, delayMs })` retries a failing async thunk with linear backoff. "
+    + "`await codemode.exec(source, { interpreter?, cwd?, args?, tool? })` runs an inline script through the client's shell tool with zero quoting hazards: the source is base64-armored into a mktemp file and executed in one atomic command (interpreter defaults to `node`; `.mjs`/`.cjs` inferred from the source). Always use it instead of `node -e`/`python -c` one-liners — the shell mangles `$[`, `$(`, and nested quotes inside those — and instead of separate write-temp-file-then-run steps. The client shell on macOS is BSD userland: GNU-only extensions (`sed -n 'N,+Kp'`, `grep -P`, `date -d`) fail there, so put anything beyond a trivial one-liner in `codemode.exec` instead of stacking sed/awk flags. "
+    + "Pure helpers available: `structuredClone`, `URL`/`URLSearchParams`, `atob`/`btoa`, `queueMicrotask`, `TextEncoder`/`TextDecoder`, `crypto.randomUUID()`, `crypto.sha256(data)`.\n"
+    + "\n"
+    + "## Tool results\n"
     + "Each tool call returns a string-like `ToolResult` with `{ text, raw, isError }`, optional `.anchored`, `.json()` for JSON text, and `.lines({ trim, nonEmpty })` for line processing. Prefer `.text` for clarity, but string methods like `.includes()` and `.split()` work directly on the result. "
-    + "If the client environment truncated or annotated a tool's output, `.truncated` is true and the injected notices are moved out of `.text` into `.notes` (an array of strings) so they never pollute data processing — treat such `.text` as incomplete (inline `[... truncated ...]` gap markers may remain) and check `.notes` for where the client saved the full output. "
-    + "`state` is a persistent object that survives across `code` calls in this conversation (it may be empty after long gaps or restarts): stash parsed files, indexes, and intermediate results there instead of returning them or re-reading files in the next call. `state` is size-capped (~2MB serialized); if a save is rejected you get a `[state NOT saved ...]` notice on that result — keep large raw text out of `state`. When the working directory is a git repo, `state.git` holds a session-start snapshot `{ branch, upstream, ahead, behind, dirty, changes, recentCommits, capturedAt }` (a snapshot, not live status — use `tools.Bash` for fresh state). "
-    + "Pure helpers available: `structuredClone`, `URL`/`URLSearchParams`, `atob`/`btoa`, `queueMicrotask`, `TextEncoder`/`TextDecoder`, `crypto.randomUUID()`, `crypto.sha256(data)`. "
-    + "Only batch independent calls. If B's args depend on A's result, or the calls have ordered side effects, use separate awaits. For edits, read first; use exact bytes from the read result or start_anchor/end_anchor from `.anchored` when available, and never parallelize multiple edits to the same file. "
-    + "Reads of any size work: an oversized file is read in windows and stitched into one result automatically, so read whole files freely. Edits require a fresh read of the file (client rule); if an edit fails only because the read state went stale, the proxy re-reads and retries it for you and appends a note — an edit error you actually see means the content truly changed, so re-read the region (an offset/limit window is enough) before retrying. "
-    + "Return a compact decision-ready object: status, counts, paths with line numbers, first failing assertion or error tail, and exact snippets needed for the next step. Keep raw reads, full diffs, test logs, and large arrays inside local variables or `state`. Oversized returns are truncated head+tail; the full text is kept as a session artifact you can fetch with `await codemode.recall(id)` in a later `code` call. "
-    + "The signatures below are TypeScript-shaped docs only; write executable JavaScript, not TypeScript syntax. Args must match the signature: ? means optional, literal unions list allowed values, and Array<T> is an array. Schema descriptions, defaults, examples, formats, and patterns are authoritative.\n\n"
+    + "If the client environment truncated or annotated a tool's output, `.truncated` is true and the injected notices are moved out of `.text` into `.notes` (an array of strings) so they never pollute data processing — treat such `.text` as incomplete (inline `[... truncated ...]` gap markers may remain) and check `.notes` for where the client saved the full output. A nonzero exit is not always a failure: `grep`/`rg` exit 1 on no match and `diff` exits 1 when files differ — that is data (empty output = no matches), so append ` || true` inside `&&` chains where no-match is acceptable and do not retry a shell call solely because `.isError` is set with empty output.\n"
+    + "\n"
+    + "## Batching\n"
+    + "Every independent call belongs in one `Promise.all` or `codemode.batch` wave; sequential `await`s are sequential waves. Only batch independent calls. If B's args depend on A's result, or the calls have ordered side effects, use separate awaits. Reads of any size work: an oversized file is read in windows and stitched into one result automatically, so read whole files freely.\n"
+    + "\n"
+    + "## Persistent state\n"
+    + "`state` is a persistent object that survives across `code` calls in this conversation (it may be empty after long gaps or restarts). Start scripts by checking `state` for work already done — indexes, parsed files, prior results — before re-reading anything. Stash parsed files, indexes, and intermediate results there instead of returning them or re-reading files in the next call. `state` is size-capped (~2MB serialized); if a save is rejected you get a `[state NOT saved ...]` notice on that result — keep large raw text out of `state`. When the working directory is a git repo, `state.git` holds a session-start snapshot `{ branch, upstream, ahead, behind, dirty, changes, recentCommits, capturedAt }` (a snapshot, not live status — use `tools.Bash` for fresh state). If a script throws, `state` is still saved and the error result lists every completed call — write a follow-up script that continues from there; never redo work the ledger shows as done.\n"
+    + "\n"
+    + "## Editing files\n"
+    + "For edits, read first; use exact bytes from the read result or start_anchor/end_anchor from `.anchored` when available, and never parallelize multiple edits to the same file. "
+    + "Anchored editing (recommended): each Read result also carries `.anchored` — the same text with a stable anchor token (like ⟦a5⟧) prefixed to every line. Pass start_anchor + end_anchor (the first and last line of the range to change, copied from `.anchored`) plus new_string INSTEAD of old_string; the bridge reconstructs the byte-exact old_string from the file it cached, so whitespace and indentation can never mismatch. Pass new_string as the literal replacement WITHOUT anchor tokens or the line-number gutter. Anchors are valid for files Read earlier in THIS script and stay valid after each successful edit, so sequential edits to one file need no re-Read. The native old_string form (exact bytes copied from `.text`) still works; use one form or the other per edit, not both. "
+    + "Edits require a fresh read of the file (client rule); if an edit fails only because the read state went stale, the proxy re-reads and retries it for you and appends a note — an edit error you actually see means the content truly changed, so re-read the region (an offset/limit window is enough) and retry in this same run. "
+    + "After edits, `await codemode.verify(path)` syntax-checks the real file on disk (js/mjs/cjs, py, json, sh) with no extra turn — call it instead of `tools.Bash(\"node --check ...\")`, and check `.isError` on the result. If verify fails, repair it in this run: re-read the window, fix the edit, verify again — return only if it still fails. Files you edit are also auto-checked after the run; failures are appended to this result.\n"
+    + "\n"
+    + "## Returning\n"
+    + "Return a compact decision-ready object: status, counts, paths with line numbers, first failing assertion or error tail, and exact snippets needed for the next step. Aim under ~1-2 KB. Keep raw reads, full diffs, test logs, and large arrays inside local variables or `state` — return the decision and its evidence, not the data behind it. Oversized returns are truncated head+tail; the full text is kept as a session artifact you can fetch with `await codemode.recall(id)` in a later `code` call.\n"
+    + "\n"
+    + "## Example\n"
+    + "One call does recon, decision, action, and verification:\n"
+    + "```js\n"
+    + "const [pkg, cfg] = await Promise.all([        // batch independent reads\n"
+    + "  tools.Read({ file_path: \"/app/package.json\" }),\n"
+    + "  tools.Read({ file_path: \"/app/src/config.js\" }),\n"
+    + "]);\n"
+    + "if (!(pkg.json().dependencies ?? {}).zod) return { status: \"skip\", reason: \"zod not a dependency\" };\n"
+    + "if (cfg.includes(\"strict: false\")) {          // decide in-script, don't return to ask\n"
+    + "  await tools.Edit({ file_path: \"/app/src/config.js\", old_string: \"strict: false\", new_string: \"strict: true\" });\n"
+    + "  const v = await codemode.verify(\"/app/src/config.js\");\n"
+    + "  if (v.isError) return { status: \"verify-failed\", error: v.text.slice(0, 300) };\n"
+    + "}\n"
+    + "const test = await tools.Bash({ command: \"npm test 2>&1 | tail -20\" });\n"
+    + "state.lastTestTail = test.text;               // stash bulk output, don't return it\n"
+    + "return { status: test.isError ? \"tests-failed\" : \"done\", tail: test.lines({ nonEmpty: true }).slice(-3) };\n"
+    + "```\n"
+    + "\n"
+    + "## Tool signatures\n"
+    + "The signatures below are TypeScript-shaped docs only; write executable JavaScript, not TypeScript syntax. Args must match the signature: ? means optional, literal unions list allowed values, and Array<T> is an array. Schema descriptions, defaults, examples, formats, and patterns are authoritative. Long tool descriptions are truncated below — `codemode.describe(\"Name\")` returns the full docs in-script.\n"
+    + "\n"
     + (toolBlocks.length ? `Available tools:\n\n${toolBlocks.join("\n\n")}` : "Available tools: (none)")
   );
 }
@@ -532,9 +588,20 @@ export function runCodeScriptDynamic(script, {
   });
 }
 
+// Point-of-generation reinforcement of the one-call doctrine. These bytes land
+// in the cached tools block alongside the description: frozen per conversation
+// (see buildParkingMcpServer), so legacy warm resumes pass "" to keep the bytes
+// their prefix already cached.
+export const SCRIPT_FIELD_DESCRIPTION =
+  "Complete async JavaScript program that performs the ENTIRE task in one call: "
+  + "batch independent tool calls with Promise.all, branch on results in-script "
+  + "instead of returning to decide, verify edits in the same run, and return a "
+  + "compact summary.";
+
 /** Zod raw shape for the code tool's input_schema (used by buildParkingMcpServer). */
-export function codeToolInputShape(z) {
+export function codeToolInputShape(z, scriptDescription = SCRIPT_FIELD_DESCRIPTION) {
+  const script = z.string();
   return {
-    script: z.string(),
+    script: scriptDescription ? script.describe(scriptDescription) : script,
   };
 }

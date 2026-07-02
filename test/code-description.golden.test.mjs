@@ -18,8 +18,16 @@ import { registerClientTool } from "../src/server.mjs";
 
 const GOLDEN_PATH = join(dirname(fileURLToPath(import.meta.url)), "fixtures", "code-description.golden.txt");
 
-// Canonical toolset: plain tools, enum/nested/optional rendering, and an
-// anchored edit tool (Edit) so anchor-schema drift changes bytes here too.
+// Canonical toolset: plain tools, enum/nested/optional rendering, both
+// anchored edit tools (Edit + MultiEdit) so anchor-schema/note drift changes
+// bytes here too, and one long-description tool (Task) so the per-tool prose
+// budget's truncation rendering is byte-locked as well.
+const LONG_TASK_DESCRIPTION = [
+  "Launch a new agent to handle complex, multi-step tasks autonomously. The agent runs with its own context window and returns a single final report when it completes, so give it a fully self-contained prompt with the goal, the relevant paths, the constraints, and the exact output format you expect back.",
+  "Each agent invocation is stateless: it cannot ask follow-up questions, receive additional messages, or see anything outside the prompt you provide. When you need parallel research, launch several agents in one message and merge their reports yourself.",
+  "Avoid using this tool when you already know which one or two files matter — direct reads are faster and cheaper. Prefer it for open-ended exploration, broad searches across an unfamiliar codebase, or work that would otherwise flood your own context with intermediate results.",
+].join("\n\n");
+
 const CANONICAL_TOOLS = [
   {
     name: "Read",
@@ -46,6 +54,41 @@ const CANONICAL_TOOLS = [
         replace_all: { type: "boolean", default: false },
       },
       required: ["file_path", "old_string", "new_string"],
+    },
+  },
+  {
+    name: "MultiEdit",
+    description: "Makes multiple edits to a single file in one operation.",
+    input_schema: {
+      type: "object",
+      properties: {
+        file_path: { type: "string" },
+        edits: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              old_string: { type: "string" },
+              new_string: { type: "string" },
+              replace_all: { type: "boolean", default: false },
+            },
+            required: ["old_string", "new_string"],
+          },
+        },
+      },
+      required: ["file_path", "edits"],
+    },
+  },
+  {
+    name: "Task",
+    description: LONG_TASK_DESCRIPTION,
+    input_schema: {
+      type: "object",
+      properties: {
+        prompt: { type: "string", description: "The task for the agent to perform" },
+        subagent_type: { type: "string" },
+      },
+      required: ["prompt", "subagent_type"],
     },
   },
   {

@@ -466,24 +466,13 @@ export function mergeAnchorEditSchema(toolName, nativeSchema) {
   return base;
 }
 
+// One-line pointer only: the full anchored-editing doctrine lives once in the
+// `code` description's "Editing files" section. Duplicating the ~1.6KB note
+// per anchored tool (Edit AND MultiEdit) was pure cache-write weight.
 export function patchCodeEditDescription(toolName, original = "") {
   const note =
-    "ANCHORED EDITING (recommended): each Read result you get back in this " +
-    "script ALSO carries an `.anchored` string \u2014 the same text with a stable " +
-    "anchor token (like \u27e6a5\u27e7) prefixed to every line. Instead of " +
-    "old_string, you may pass start_anchor + end_anchor (the first and last line " +
-    "of the range to change, copied from `.anchored`) plus new_string; the proxy " +
-    "reconstructs the byte-exact old_string from the file it cached, so " +
-    "whitespace and indentation can never mismatch. Pass new_string as the " +
-    "literal replacement WITHOUT anchor tokens or the line-number gutter. " +
-    "Anchors are only valid for a file you Read earlier in THIS script, but the " +
-    "proxy keeps the remaining anchors valid after each successful edit, so you " +
-    "can make several edits to the same file in sequence (await them one after " +
-    "another) using anchors from the original Read \u2014 no re-Read needed. The " +
-    "native old_string/new_string form still works unchanged if you prefer to " +
-    "copy bytes from r.text. Use one form or the other per edit, not both. " +
-    "Anchors are the most reliable way to edit large files. Stale-read " +
-    "failures are auto-recovered by the proxy; an edit error you still see " +
-    "means the file content really changed.";
+    "Supports anchored editing: pass start_anchor + end_anchor (copied from a " +
+    "Read result's `.anchored` view) instead of old_string \u2014 see the " +
+    "Editing files section above.";
   return `${note}\n\n${original}`.trim();
 }

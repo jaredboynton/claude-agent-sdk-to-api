@@ -80,14 +80,25 @@ function attachTurn(session) {
 }
 
 function toolUses(events) {
-  return events
-    .filter((e) => e.type === "content_block_start" && e.content_block?.type === "tool_use")
-    .map((e) => {
-      const idx = e.index;
-      const deltas = events.filter((d) => d.type === "content_block_delta" && d.index === idx);
-      const json = deltas.map((d) => d.delta?.partial_json || "").join("");
-      return { id: e.content_block.id, name: e.content_block.name, args: json ? JSON.parse(json) : {} };
-    });
+  // Content-block indices restart at 0 in each fabricated message frame, so a
+  // delta must attach to the block most recently OPENED at its index — a
+  // global index match would concatenate JSON across waves.
+  const out = [];
+  const open = new Map(); // index -> accumulating record
+  for (const e of events) {
+    if (e.type === "content_block_start" && e.content_block?.type === "tool_use") {
+      const rec = { id: e.content_block.id, name: e.content_block.name, json: "" };
+      open.set(e.index, rec);
+      out.push(rec);
+    } else if (e.type === "content_block_delta" && open.has(e.index)) {
+      open.get(e.index).json += e.delta?.partial_json || "";
+    } else if (e.type === "content_block_stop") {
+      open.delete(e.index);
+    } else if (e.type === "message_start") {
+      open.clear();
+    }
+  }
+  return out.map((r) => ({ id: r.id, name: r.name, args: r.json ? JSON.parse(r.json) : {} }));
 }
 
 function newRun(codeId = "toolu_code_main") {

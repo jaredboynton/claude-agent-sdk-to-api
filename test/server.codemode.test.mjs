@@ -8,6 +8,8 @@ import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { z } from "zod";
+
 import {
   validateCodeInput,
   runCodeScriptDynamic,
@@ -16,6 +18,8 @@ import {
   ledgerEntry,
   buildCodeToolDescription,
   buildCodeToolCatalog,
+  codeToolInputShape,
+  SCRIPT_FIELD_DESCRIPTION,
   CodeValidationError,
 } from "../src/code-mode.mjs";
 import {
@@ -293,13 +297,49 @@ test("buildCodeToolDescription script-first guidance mentions tools.X and Promis
 
 test("buildCodeToolDescription includes compact logic and anchored-edit guidance", () => {
   const d = buildCodeToolDescription(new Map());
-  assert.match(d, /Favor intelligent logic, batching, and parallelism/);
   assert.match(d, /no time, wave, or call limit by default/);
   assert.match(d, /retr/i);
   assert.match(d, /dependent steps/);
   assert.match(d, /exact bytes from the read result/);
   assert.match(d, /start_anchor\/end_anchor/);
   assert.match(d, /never parallelize multiple edits to the same file/);
+});
+
+test("buildCodeToolDescription carries the one-call doctrine, example, and state-first guidance", () => {
+  const d = buildCodeToolDescription(new Map());
+  assert.match(d, /## Why one call/);
+  assert.match(d, /full model round-trip/);
+  assert.match(d, /single tool call wastes its round-trip/);
+  assert.match(d, /never return just to look at data and decide/);
+  assert.match(d, /## Example/);
+  assert.match(d, /decide in-script/);
+  assert.match(d, /Start scripts by checking `state`/);
+  assert.match(d, /never redo work the ledger shows as done/);
+  assert.match(d, /repair it in this run/);
+  assert.match(d, /Aim under ~1-2 KB/);
+});
+
+test("buildCodeToolDescription truncates long tool prose; catalog keeps full docs", () => {
+  const longDesc = `First line of the docs.\n\n${"alpha beta gamma delta ".repeat(60)}END-OF-DOCS`;
+  const tools = new Map([
+    ["Big", { description: longDesc, input_schema: { type: "object", properties: { q: { type: "string" } }, required: ["q"] } }],
+  ]);
+  const d = buildCodeToolDescription(tools);
+  assert.match(d, /\[truncated — full docs: codemode\.describe\("Big"\)\]/);
+  assert.match(d, /Big\(args: \{ q: string; \}\)/, "signature survives truncation");
+  assert.ok(!d.includes("END-OF-DOCS"), "over-budget tail is cut from the rendered description");
+  // codemode.describe()/search() read the catalog, which must stay complete.
+  const big = buildCodeToolCatalog(tools).find((t) => t.name === "Big");
+  assert.ok(big.docs.includes("END-OF-DOCS"));
+  assert.ok(!big.docs.includes("[truncated"));
+});
+
+test("codeToolInputShape describes script by default and honors a frozen empty override", () => {
+  const shape = codeToolInputShape(z);
+  assert.equal(shape.script.description, SCRIPT_FIELD_DESCRIPTION);
+  assert.match(SCRIPT_FIELD_DESCRIPTION, /ENTIRE task in one call/);
+  const frozenBare = codeToolInputShape(z, "");
+  assert.equal(frozenBare.script.description, undefined);
 });
 
 test("buildCodeToolDescription includes output mechanics", () => {
@@ -658,7 +698,7 @@ test("buildParkingMcpServer exposes only code while preserving script tool catal
 // projectEvent (buffered projection while codeDriving)
 // ---------------------------------------------------------------------------
 
-test("projectEvent streams text/thinking live while codeDriving, suppresses framing and tool_use", () => {
+test("projectEvent streams text/thinking live while codeDriving, opens one lazy frame, suppresses tool_use", () => {
   const events = [];
   const session = fakeCodeSession({
     codeDriving: true,
@@ -679,19 +719,24 @@ test("projectEvent streams text/thinking live while codeDriving, suppresses fram
   projectEvent(session, { type: "message_delta", delta: { stop_reason: "tool_use" } });
   projectEvent(session, { type: "message_stop", message: { stop_reason: "end_turn" } });
 
-  // Content streams live: thinking + text blocks (start/delta/stop each).
+  // Content streams live inside ONE lazily-opened fabricated frame: the SDK's
+  // own message_start is suppressed (the run owns framing), but the first
+  // passthrough content block opens a client frame so no content_block event
+  // ever arrives orphaned outside a message.
   const types = events.map((e) => e.type);
   assert.deepEqual(types, [
+    "message_start",
     "content_block_start", "content_block_delta", "content_block_stop",
     "content_block_start", "content_block_delta", "content_block_stop",
   ]);
-  assert.equal(events[0].content_block.type, "thinking");
-  assert.equal(events[1].delta.thinking, "hmm");
-  assert.equal(events[3].content_block.type, "text");
-  assert.equal(events[4].delta.text, "hi");
-  // Message framing and the code tool_use are suppressed (no message_start/
-  // message_stop, no tool_use block, no input_json deltas).
-  assert.equal(events.some((e) => e.type === "message_start" || e.type === "message_stop" || e.type === "message_delta"), false);
+  assert.equal(events[0].message.role, "assistant");
+  assert.equal(events[1].content_block.type, "thinking");
+  assert.equal(events[2].delta.thinking, "hmm");
+  assert.equal(events[4].content_block.type, "text");
+  assert.equal(events[5].delta.text, "hi");
+  // The frame stays open (a fabricated wave or the next real message closes
+  // it): message_delta/message_stop are suppressed, as is the code tool_use.
+  assert.equal(events.some((e) => e.type === "message_stop" || e.type === "message_delta"), false);
   assert.equal(events.some((e) => e.content_block?.type === "tool_use"), false);
 });
 
@@ -1140,6 +1185,33 @@ test("persistResumeIndex writes code-mode resume entries", () => {
   }
 });
 
+test("persistResumeIndex freezes scriptDesc in the toolset blob", () => {
+  const dir = mkdtempSync(join(tmpdir(), "claude-agent-api-resume-"));
+  const indexPath = join(dir, "resume-index.json");
+  const server = startServer({ port: 0, profileDir: dir });
+  try {
+    const messages = [{ role: "user", content: [{ type: "text", text: "start" }] }];
+    const session = {
+      sdkSessionId: "sdk-2",
+      bucket: bucketKey("sys", messages),
+      seenCount: 1,
+      seenHash: hashMessages(messages, 1),
+      codeDescription: "RENDERED DESCRIPTION BYTES",
+      toolsetRawTools: [{ name: "Grep", description: "grep", input_schema: GREP_SCHEMA }],
+      scriptDesc: SCRIPT_FIELD_DESCRIPTION,
+    };
+    persistResumeIndex(session, "model", "sys", messages, indexPath);
+    const parsed = JSON.parse(readFileSync(indexPath, "utf8"));
+    const hash = parsed.entries[0].toolsetHash;
+    assert.match(hash, /^[0-9a-f]{16}$/);
+    const blob = JSON.parse(readFileSync(join(dir, "toolsets", `${hash}.json`), "utf8"));
+    assert.equal(blob.description, "RENDERED DESCRIPTION BYTES");
+    assert.equal(blob.scriptDesc, SCRIPT_FIELD_DESCRIPTION);
+  } finally {
+    server.close();
+  }
+});
+
 // ---------------------------------------------------------------------------
 // findSession with synthetic tool blocks (multi-wave)
 // ---------------------------------------------------------------------------
@@ -1354,6 +1426,23 @@ test("buildParkingMcpServer reuses frozen toolset bytes on warm resume", () => {
   // Runtime seeded from the frozen raw tools, not the incoming ones.
   assert.equal(session.clientTools.get("Grep").description.includes("NEWER PROSE"), false);
   assert.equal(session.inputParsers.has("Grep"), true);
+  // Legacy blob (no scriptDesc): the script field renders bare, matching the
+  // schema bytes that conversation cached before the field description existed.
+  assert.equal(captured.tools[0].inputSchema.script.description, undefined);
+  assert.equal(session.scriptDesc, "");
+});
+
+test("buildParkingMcpServer reuses a frozen scriptDesc verbatim", () => {
+  const session = fakeCodeSession({ clientTools: new Map(), inputParsers: new Map() });
+  const frozen = {
+    description: "FROZEN DESCRIPTION BYTES",
+    tools: [{ name: "Grep", description: "grep", input_schema: GREP_SCHEMA }],
+    scriptDesc: "OLD FROZEN SCRIPT FIELD PROSE",
+  };
+  let captured = null;
+  buildParkingMcpServer([], session, (config) => { captured = config; return { ok: true }; }, frozen);
+  assert.equal(captured.tools[0].inputSchema.script.description, frozen.scriptDesc);
+  assert.equal(session.scriptDesc, frozen.scriptDesc);
 });
 
 test("buildParkingMcpServer renders live when no frozen toolset is supplied", () => {
@@ -1367,6 +1456,9 @@ test("buildParkingMcpServer renders live when no frozen toolset is supplied", ()
   assert.equal(captured.tools[0].description, session.codeDescription);
   assert.ok(session.codeDescription.includes("Grep"));
   assert.deepEqual(session.toolsetRawTools.map((t) => t.name), ["Grep"]);
+  // Fresh sessions carry the current script-field doctrine and freeze it.
+  assert.equal(captured.tools[0].inputSchema.script.description, SCRIPT_FIELD_DESCRIPTION);
+  assert.equal(session.scriptDesc, SCRIPT_FIELD_DESCRIPTION);
 });
 
 test("mergeLateTool makes a late tool callable and queues an announcement", () => {
@@ -1508,6 +1600,31 @@ test("runCodeScriptDynamic: SyntaxError carries a line number", async () => {
   assert.match(r.error, /line 2/);
 });
 
+test("runCodeScriptDynamic: backtick-free SyntaxError carries no backtick hint", async () => {
+  const r = await runCodeScriptDynamic(
+    "const ok = 1;\nconst x = ;\nreturn ok;",
+    { toolNames: [], dispatchWave: async () => [], timeoutMs: 5000 },
+  );
+  assert.ok(r.error, "script should error");
+  assert.doesNotMatch(r.error, /hint:/);
+});
+
+test("runCodeScriptDynamic: unterminated template literal gets the backtick hint", async () => {
+  const script = "const src = `unterminated;\nreturn 1;";
+  const r = await runCodeScriptDynamic(script, { toolNames: [], dispatchWave: async () => [], timeoutMs: 5000 });
+  assert.ok(r.error, "script should error");
+  assert.match(r.error, /hint: an unescaped backtick inside a template literal/);
+});
+
+test("runCodeScriptDynamic: backtick embedded in a template literal gets the hint", async () => {
+  // The inner `pair` closes the outer literal early; V8 blames the innocent
+  // identifier between them. The hint must name the real hazard.
+  const script = "const src = `header\nuses `backticks` inside\n`;\nreturn src;";
+  const r = await runCodeScriptDynamic(script, { toolNames: [], dispatchWave: async () => [], timeoutMs: 5000 });
+  assert.ok(r.error, "script should error");
+  assert.match(r.error, /hint: an unescaped backtick inside a template literal/);
+});
+
 // ---------------------------------------------------------------------------
 // codemode.exec (worker helper -> shell tool wave)
 // ---------------------------------------------------------------------------
@@ -1571,3 +1688,104 @@ test("runCodeScriptDynamic: codemode.exec explicit tool override and empty-sourc
   assert.equal(r.value.okText.trim(), "via override");
 });
 
+// ---------------------------------------------------------------------------
+// Consolidation nudge (single-call runs) + singleCallRuns telemetry
+// ---------------------------------------------------------------------------
+
+function waitFor(predicate, timeoutMs = 5000) {
+  return new Promise((resolve, reject) => {
+    const t0 = Date.now();
+    const iv = setInterval(() => {
+      if (predicate()) { clearInterval(iv); resolve(); }
+      else if (Date.now() - t0 > timeoutMs) { clearInterval(iv); reject(new Error("waitFor timeout")); }
+    }, 10);
+  });
+}
+
+// Drive one full code run through the real path (worker -> wave fabrication ->
+// client tool_results -> collapsed result) and return the collapsed text.
+async function runCodeTurn(session, codeId, script) {
+  const events = [];
+  session.currentTurn = { resolve: () => {}, reject: () => {} };
+  session.res = {
+    writableEnded: false,
+    write: (s) => {
+      for (const m of String(s).matchAll(/^data: (.+)$/gm)) {
+        try { events.push(JSON.parse(m[1])); } catch {}
+      }
+    },
+  };
+  initMessageProjection(session);
+  const done = new Promise((resolve) => session.pendingTools.set(codeId, resolve));
+  startCodeRun(session, codeId, { script });
+  await waitFor(() => events.some((e) => e.content_block?.type === "tool_use"));
+  const uses = events
+    .filter((e) => e.type === "content_block_start" && e.content_block?.type === "tool_use")
+    .map((e) => e.content_block);
+  await resolveCodeModeToolResults(session, uses.map((u) => ({
+    tool_use_id: u.id,
+    content: [{ type: "text", text: "hit" }],
+  })));
+  const collapsed = await done;
+  return collapsed.content[0].text;
+}
+
+test("single-call code runs get the consolidation nudge, capped at 2 per session", async () => {
+  const session = fakeCodeSession({
+    clientTools: CLIENT_TOOLS,
+    codeState: {},
+    turnMetrics: {
+      codeSubCalls: 0, codeWaves: 0, scriptOutBytes: 0, scriptInBytes: 0,
+      spills: 0, stateBytes: 0, codeErrors: 0, codeRecoveries: 0, singleCallRuns: 0,
+    },
+  });
+  const oneCall = "const r = await tools.Grep({ pattern: 'x', path: '/tmp' }); return r.text;";
+
+  const t1 = await runCodeTurn(session, "toolu_code_n1", oneCall);
+  assert.match(t1, /\[note: this run made a single tool call/);
+  assert.equal(session.turnMetrics.singleCallRuns, 1);
+  assert.equal(session.consolidationNudges, 1);
+
+  const t2 = await runCodeTurn(session, "toolu_code_n2", oneCall);
+  assert.match(t2, /single tool call/);
+  assert.equal(session.consolidationNudges, 2);
+
+  // Third single-call run: still counted, no longer nudged.
+  const t3 = await runCodeTurn(session, "toolu_code_n3", oneCall);
+  assert.doesNotMatch(t3, /single tool call/);
+  assert.equal(session.turnMetrics.singleCallRuns, 3);
+  assert.equal(session.consolidationNudges, 2);
+});
+
+test("multi-call and zero-call runs never trigger the nudge", async () => {
+  const session = fakeCodeSession({ clientTools: CLIENT_TOOLS, codeState: {} });
+  const batched =
+    "const [a, b] = await Promise.all([tools.Grep({ pattern: 'x', path: '/1' }), tools.Grep({ pattern: 'y', path: '/2' })]); return a.text + b.text;";
+  const t1 = await runCodeTurn(session, "toolu_code_m1", batched);
+  assert.doesNotMatch(t1, /single tool call/);
+  assert.equal(session.consolidationNudges ?? 0, 0);
+
+  // Pure-compute run: zero fabricated calls, zero nudges.
+  const events = [];
+  session.currentTurn = { resolve: () => {}, reject: () => {} };
+  session.res = { writableEnded: false, write: () => events.push(1) };
+  initMessageProjection(session);
+  const done = new Promise((resolve) => session.pendingTools.set("toolu_code_m2", resolve));
+  startCodeRun(session, "toolu_code_m2", { script: "state.n = (state.n || 0) + 1; return state.n;" });
+  const collapsed = await done;
+  assert.doesNotMatch(collapsed.content[0].text, /single tool call/);
+  assert.equal(session.consolidationNudges ?? 0, 0);
+});
+
+test("buildCodeToolDescription includes shell exit-code guidance (grep no-match is data)", () => {
+  const d = buildCodeToolDescription(new Map());
+  assert.match(d, /exit 1 on no match/);
+  assert.match(d, /\|\| true/);
+  assert.match(d, /do not retry a shell call solely because/);
+});
+
+test("buildCodeToolDescription includes BSD userland guidance steering to codemode.exec", () => {
+  const d = buildCodeToolDescription(new Map());
+  assert.match(d, /BSD userland/);
+  assert.match(d, /sed -n 'N,\+Kp'/);
+});

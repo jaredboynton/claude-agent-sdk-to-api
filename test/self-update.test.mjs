@@ -30,6 +30,10 @@ import {
   DONE_SUPPRESS_MS,
   scheduleExitWhenIdle,
   _resetDrainGuardForTests,
+  getUpdateStatus,
+  triggerUpdateCheck,
+  startAutoUpdateLoop,
+  _resetLoopGuardForTests,
 } from "../src/self-update.mjs";
 
 const PKG = "@jaredboynton/claude-agent-api";
@@ -487,4 +491,61 @@ test("scheduleExitWhenIdle is single-flight", () => {
   assert.equal(first, true);
   assert.equal(second, false);
   _resetDrainGuardForTests();
+});
+// ---------------------------------------------------------------------------
+// status surface + manual trigger
+// ---------------------------------------------------------------------------
+
+test("scheduleExitWhenIdle records draining status and clears it on exit", () => {
+  _resetDrainGuardForTests();
+  const timeouts = [];
+  const setTimeoutFn = (fn, ms) => { timeouts.push({ fn, ms }); return { unref() {} }; };
+  let busy = true;
+  let exited = null;
+  scheduleExitWhenIdle({
+    isBusy: () => busy,
+    recheckMs: 10,
+    hardDeadlineMs: 1000,
+    nowFn: () => 5000,
+    setTimeoutFn,
+    exitFn: (c) => { exited = c; },
+    version: "9.9.9",
+  });
+  assert.deepEqual(getUpdateStatus().draining, { version: "9.9.9", since: 5000, hardDeadlineAt: 6000 });
+  busy = false;
+  timeouts.shift().fn(); // recheck: now idle -> clears draining, schedules exit
+  assert.equal(getUpdateStatus().draining, null);
+  timeouts.shift().fn();
+  assert.equal(exited, 0);
+  _resetDrainGuardForTests();
+});
+
+test("triggerUpdateCheck without a running loop resolves loop_not_running", async () => {
+  _resetLoopGuardForTests();
+  const r = await triggerUpdateCheck();
+  assert.equal(r.outcome, "loop_not_running");
+});
+
+test("triggerUpdateCheck runs a tick immediately, single-flight, and records status", async () => {
+  _resetLoopGuardForTests();
+  const dir = mkdtempSync(join(tmpdir(), "su-status-"));
+  startAutoUpdateLoop({
+    pkgName: PKG,
+    ownInstallDir: dir, // not the global install dir => dev_checkout, no network
+    currentVersion: "0.0.1",
+    statePath: join(dir, "state.json"),
+    fetchImpl: async () => { throw new Error("must not fetch in a dev checkout"); },
+  });
+  const st0 = getUpdateStatus();
+  assert.equal(st0.currentVersion, "0.0.1");
+  assert.ok(st0.nextCheckAt >= Date.now() - 1000, "boot tick is scheduled");
+  const p1 = triggerUpdateCheck();
+  const p2 = triggerUpdateCheck();
+  assert.equal(p1, p2, "second trigger joins the in-flight tick");
+  const r = await p1;
+  assert.equal(r.outcome, AutoUpdateOutcome.DevCheckout);
+  const st = getUpdateStatus();
+  assert.equal(st.lastOutcome, "dev_checkout");
+  assert.ok(st.nextCheckAt > Date.now(), "next poll rescheduled after the manual tick");
+  _resetLoopGuardForTests();
 });

@@ -182,5 +182,6 @@ test("code-mode buildParkingMcpServer merges anchor fields into Edit signature",
   const editMeta = session.clientTools.get("Edit");
   assert.ok(editMeta.input_schema.properties.start_anchor, "anchor fields merged");
   assert.ok(editMeta.input_schema.properties.old_string, "native old_string preserved");
-  assert.match(editMeta.description, /ANCHORED EDITING/);
+  assert.match(editMeta.description, /anchored editing/i);
+  assert.match(editMeta.description, /start_anchor \+ end_anchor/);
 });

@@ -408,6 +408,47 @@ function buildToolsProxy(toolNames = []) {
   });
 }
 
+// The single most confusing compile failure models hit: an unescaped backtick
+// inside a template literal (usually embedded script source or prose) closes
+// the literal early, and the literal's tail is parsed as code — V8 then blames
+// innocent text. Flag the hazard when a naive lex of the script ends inside an
+// open template literal, or when the offending line itself carries a backtick.
+// Advisory only (it decorates an already-failed compile), so a rare false
+// positive from e.g. a regex literal containing a backtick is acceptable.
+export function backtickHazardLikely(script, errLineText = "") {
+  if (errLineText.includes("`")) return true;
+  let state = "code";
+  const braces = []; // per-${ expression brace depth inside templates
+  for (let i = 0; i < script.length; i++) {
+    const c = script[i];
+    const n = script[i + 1];
+    if (state === "code") {
+      if (c === "`") state = "template";
+      else if (c === "'") state = "sq";
+      else if (c === '"') state = "dq";
+      else if (c === "/" && n === "/") state = "line";
+      else if (c === "/" && n === "*") { state = "block"; i++; }
+      else if (c === "{" && braces.length) braces[braces.length - 1]++;
+      else if (c === "}" && braces.length) {
+        if (braces[braces.length - 1] === 0) { braces.pop(); state = "template"; }
+        else braces[braces.length - 1]--;
+      }
+    } else if (state === "template") {
+      if (c === "\\") i++;
+      else if (c === "`") state = "code";
+      else if (c === "$" && n === "{") { braces.push(0); state = "code"; i++; }
+    } else if (state === "sq" || state === "dq") {
+      if (c === "\\") i++;
+      else if ((state === "sq" && c === "'") || (state === "dq" && c === '"') || c === "\n") state = "code";
+    } else if (state === "line") {
+      if (c === "\n") state = "code";
+    } else if (state === "block") {
+      if (c === "*" && n === "/") { state = "code"; i++; }
+    }
+  }
+  return state === "template";
+}
+
 async function runScript(script, toolNames) {
   const tools = buildToolsProxy(toolNames);
   const codemode = buildCodemodeGlobal();
@@ -487,7 +528,12 @@ async function runScript(script, toolNames) {
     if (e instanceof SyntaxError) {
       const head = String(e.stack || "").split("\n").slice(0, 3).join("\n");
       const m = head.match(/code-mode-script\.vm:(\d+)/);
-      const err = new SyntaxError(m ? `${e.message} (line ${m[1]})\n${head}` : e.message);
+      const errLineText = m ? String(script.split("\n")[Number(m[1]) - 1] ?? "") : "";
+      let msgText = m ? `${e.message} (line ${m[1]})\n${head}` : e.message;
+      if (backtickHazardLikely(script, errLineText)) {
+        msgText += "\nhint: an unescaped backtick inside a template literal ends the literal early, so the parse error may point at innocent text far from the real mistake. Escape embedded backticks as \\` or build embedded source from regular quoted strings.";
+      }
+      const err = new SyntaxError(msgText);
       err.stack = ""; // location already in the message; no script-owned frames exist
       throw err;
     }

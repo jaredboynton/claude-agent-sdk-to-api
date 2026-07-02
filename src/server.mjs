@@ -65,6 +65,7 @@ import {
   formatCodeError,
   ledgerEntry,
   codeToolInputShape,
+  SCRIPT_FIELD_DESCRIPTION,
   normalizeClientToolMeta,
   extractClientNotices,
 } from "./code-mode.mjs";
@@ -92,6 +93,8 @@ import {
   NOTE_FRESHNESS_HINT,
 } from "./read-recovery.mjs";
 import { checkerFor, runSyntaxCheck, collectGitSnapshot } from "./local-checks.mjs";
+import { getUpdateStatus, triggerUpdateCheck } from "./self-update.mjs";
+import { initDebugRing, recordDebug, recentDebug } from "./debug-ring.mjs";
 
 const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS || process.env.ACP_SESSION_TTL_MS || 10800000); // 3 h
 const HEARTBEAT_MS = Number(process.env.HEARTBEAT_MS || process.env.ACP_HEARTBEAT_MS || 15000);
@@ -124,6 +127,11 @@ const CODE_POST_EDIT_CHECKS = process.env.CODE_POST_EDIT_CHECKS !== "0";
 const CODE_POST_EDIT_CHECK_BUDGET_MS = 3000;
 const CODE_GIT_SNAPSHOT = process.env.CODE_GIT_SNAPSHOT !== "0";
 const CODE_CHECKED_EDIT_TOOLS = new Set(["Edit", "MultiEdit", "Write"]);
+// Consolidation nudge: a successful run that fabricated exactly ONE client tool
+// call spent a whole model round-trip on it — say so in-band (append-only
+// transcript, frozen prefix untouched), capped per session so a legitimate
+// run-one-command turn doesn't accumulate nagging. 0 disables.
+const CODE_NUDGE_MAX_PER_SESSION = Number(process.env.CODE_NUDGE_MAX_PER_SESSION ?? 2);
 const LOG_PREFIX = "[claude-agent-api]";
 
 // Per-request working directory.
@@ -134,9 +142,11 @@ const LOG_PREFIX = "[claude-agent-api]";
 // it has no inherent knowledge of any client's directory — `process.cwd()` is a
 // single global that can't represent N concurrent conversations. The client must
 // therefore tell us, per request, via the `x-claude-cwd` header (launch Claude
-// Code with ANTHROPIC_CUSTOM_HEADERS="x-claude-cwd: $PWD"). We validate it is an
-// existing absolute directory and fall back to CLAUDE_PROXY_CWD, then the
-// daemon's own process.cwd(). Mid-session `cd` drift self-corrects: the SDK
+// Code with ANTHROPIC_CUSTOM_HEADERS="x-claude-cwd: $PWD"). Clients that don't
+// set the header still work: Claude Code embeds "Working directory: /abs/path"
+// in its system prompt <env> block, which we parse as a fallback. Last resort
+// is CLAUDE_PROXY_CWD, then the daemon's own process.cwd(). Mid-session `cd`
+// drift self-corrects: the SDK
 // query() is itself a real Claude Code engine whose Bash tool tracks cwd within
 // the session — we only need the initial dir right.
 const PROXY_CWD_FALLBACK = (() => {
@@ -154,14 +164,18 @@ function isValidCwd(p) {
   }
 }
 
-// Resolve the working directory for a request: a valid x-claude-cwd header wins,
-// otherwise the daemon-wide fallback (CLAUDE_PROXY_CWD or process.cwd()).
-function resolveCwd(headerVal) {
+// Resolve the working directory for a request: a valid x-claude-cwd header
+// wins, then a "Working directory: ..." line in the caller's system prompt
+// (Claude Code's <env> block), then the daemon-wide fallback (CLAUDE_PROXY_CWD
+// or process.cwd()).
+function resolveCwd(headerVal, callerSystem) {
   const h = Array.isArray(headerVal) ? headerVal[0] : headerVal;
   if (isValidCwd(h)) return h;
   if (h != null && h !== "") {
-    process.stderr.write(`${LOG_PREFIX} ignoring invalid x-claude-cwd header (${String(h).slice(0, 120)}); using ${PROXY_CWD_FALLBACK}\n`);
+    process.stderr.write(`${LOG_PREFIX} ignoring invalid x-claude-cwd header (${String(h).slice(0, 120)})\n`);
   }
+  const m = typeof callerSystem === "string" ? callerSystem.match(/^Working directory:[ \t]*(.+?)[ \t]*$/m) : null;
+  if (m && isValidCwd(m[1])) return m[1];
   return PROXY_CWD_FALLBACK;
 }
 
@@ -583,7 +597,15 @@ function buildParkingMcpServer(tools, session, createServer = createSdkMcpServer
       input_schema: t.input_schema || { type: "object", properties: {} },
     }));
 
-  const codeShape = codeToolInputShape(z);
+  // The script field's schema description is cached-prefix bytes too, so it is
+  // frozen with the toolset: legacy blobs (persisted before scriptDesc existed)
+  // resume with NO schema description — the exact bytes those conversations
+  // already cached — while fresh sessions render the current prose.
+  const scriptDesc = frozen
+    ? (typeof frozen.scriptDesc === "string" ? frozen.scriptDesc : "")
+    : SCRIPT_FIELD_DESCRIPTION;
+  session.scriptDesc = scriptDesc;
+  const codeShape = codeToolInputShape(z, scriptDesc);
   // The description's bytes are part of the conversation's cached prefix: a
   // warm-window resume MUST reuse the persisted bytes verbatim (a re-render
   // with a grown tool list or newer prose re-writes the whole prefix at 2x).
@@ -956,7 +978,13 @@ function persistResumeIndex(session, model, system, messages, indexPath = resume
     if (session.codeDescription && Array.isArray(session.toolsetRawTools)) {
       try {
         toolsetHash = saveToolsetBlob(
-          { description: session.codeDescription, tools: session.toolsetRawTools },
+          {
+            description: session.codeDescription,
+            tools: session.toolsetRawTools,
+            // Frozen with the description; omitted for sessions created from a
+            // legacy blob so their re-persisted blob keeps its original hash.
+            ...(session.scriptDesc ? { scriptDesc: session.scriptDesc } : {}),
+          },
           toolsetDirFor(indexPath),
         );
       } catch (e) {
@@ -1073,6 +1101,7 @@ function logTurnDone(session) {
       stateBytes: m.stateBytes,
       codeErrors: m.codeErrors,
       ...(m.codeRecoveries ? { codeRecoveries: m.codeRecoveries } : {}),
+      ...(m.singleCallRuns ? { singleCallRuns: m.singleCallRuns } : {}),
       ...(session.descHash ? { descHash: session.descHash } : {}),
       ...(m.coldReason ? { coldReason: m.coldReason } : {}),
       ttftMs: ttft,
@@ -1221,6 +1250,12 @@ function initMessageProjection(session) {
     sdkToClient: new Map(),
     syntheticCount: 0,
     hadCode: false,
+    // Whether a client-visible message frame is currently open. A frame can
+    // outlive one SDK message: during a code run T0's message_start passes
+    // through but its message_stop is suppressed, and the first fabricated
+    // wave appends its tool_uses to — then closes — that same frame. So this
+    // survives the per-SDK-message reset above.
+    frameOpen: session._proj?.frameOpen ?? false,
   };
 }
 
@@ -1249,6 +1284,7 @@ function hasTurnSink(session) {
 
 function notifyTurnAttached(session) {
   if (!session.currentTurn || !hasTurnSink(session)) return;
+  flushPendingClientEvents(session);
   const waiters = session.turnWaiters ?? [];
   session.turnWaiters = [];
   for (const w of waiters) {
@@ -1404,6 +1440,7 @@ function startCodeRun(session, codeToolUseId, input) {
   session.codeRun = run;
   session.codeDriving = true;
   session.suppressEndTurn = true; // swallow T0's message_stop while the run is active
+  recordDebug({ kind: "code_run", bucket: session.bucket, id: codeToolUseId, head: script });
 
   // Seed the session-start git snapshot into `state.git` exactly once. The
   // one-time flag respects a script that deliberately deletes state.git.
@@ -1483,6 +1520,14 @@ function startCodeRun(session, codeToolUseId, input) {
       );
     }
 
+    recordDebug({
+      kind: result.error ? "code_error" : "code_result",
+      bucket: session.bucket,
+      id: codeToolUseId,
+      head: result.error ? String(result.error) : (collapsed.content?.[0]?.text ?? ""),
+      ...(result.error ? { isError: true } : {}),
+    });
+
     if (stateNote) appendCodeResultNote(collapsed, stateNote);
 
     // The client cut a tool's output before the script saw it. The script may
@@ -1525,6 +1570,18 @@ function startCodeRun(session, codeToolUseId, input) {
         }
       } catch (e) {
         process.stderr.write(`${LOG_PREFIX} post-edit check failed: ${String(e?.message || e).slice(0, 120)}\n`);
+      }
+    }
+
+    // Single-call runs are the dribble pattern the one-call doctrine targets:
+    // count every one (telemetry), nudge the first few (in-band, append-only).
+    // run.callCount counts FABRICATED client calls, so pure-compute runs and
+    // inline __verify/__recall traffic never trip this.
+    if (!result.error && run.callCount === 1) {
+      if (session.turnMetrics) session.turnMetrics.singleCallRuns += 1;
+      if ((session.consolidationNudges || 0) < CODE_NUDGE_MAX_PER_SESSION) {
+        session.consolidationNudges = (session.consolidationNudges || 0) + 1;
+        appendCodeResultNote(collapsed, "[note: this run made a single tool call — each code call costs a full model round-trip. Fold the surrounding steps into one script: batch independent calls with Promise.all, branch on results in-script, and verify edits in the same run.]");
       }
     }
 
@@ -1693,6 +1750,19 @@ async function dispatchCodeWave(session, codeToolUseId, waveNum, calls) {
     validated.push({ syntheticId, tool: name, args: syntheticArgs, inlineError: null, anchorPlan });
   }
 
+  for (const v of validated) {
+    let argsHead = "";
+    try { argsHead = JSON.stringify(v.args) ?? ""; } catch { argsHead = String(v.args); }
+    recordDebug({
+      kind: "tool_use",
+      bucket: session.bucket,
+      id: v.syntheticId,
+      tool: v.tool,
+      head: argsHead,
+      ...(v.inlineError ? { isError: true } : {}),
+    });
+  }
+
   // If all calls in this wave are inline (errors or recalls), return them
   // directly without fabricating a client turn.
   const fabricatable = validated.filter((v) => v.syntheticId !== null);
@@ -1776,6 +1846,12 @@ function fabricateCurrentWave(session) {
 // usage object, replaying the last real upstream usage instead of zeros so
 // statusbar context does not bounce to zero during a code-mode tool wave.
 function beginFabricatedMessage(session) {
+  const p = session._proj;
+  // A frame is already open (T0: the model's own message_start passed through
+  // but its message_stop was suppressed when the run took over). Append to it
+  // instead of opening a second message_start the client would misparse as a
+  // fresh message — discarding the preamble thinking/text it just rendered.
+  if (p?.frameOpen) return;
   writeEvent(session, {
     type: "message_start",
     message: {
@@ -1789,6 +1865,13 @@ function beginFabricatedMessage(session) {
       usage: clientVisibleUsage(session),
     },
   });
+  if (p) {
+    p.frameOpen = true;
+    // Fresh frame: content block indices restart at 0 per the Messages API
+    // per-message contract (fabricated wave turns used to continue T0's
+    // running index, starting at >0).
+    p.clientIndex = 0;
+  }
 }
 
 // Close the fabricated message + HTTP turn. message_delta carries a usage
@@ -1806,6 +1889,7 @@ function finishFabricatedMessage(session) {
     type: "message_stop",
     message: { stop_reason: "tool_use" },
   });
+  if (session._proj) session._proj.frameOpen = false;
   endTurn(session);
 }
 
@@ -1853,7 +1937,12 @@ function projectEvent(session, ev) {
     switch (ev.type) {
       case "content_block_start": {
         const cb = ev.content_block;
-        if (cb?.type === "text" || cb?.type === "thinking") {
+        if (cb?.type === "text" || cb?.type === "thinking" || cb?.type === "redacted_thinking") {
+          // Live content needs a client frame: T0's own message_start already
+          // opened one, but a follow-up message during an active run arrives
+          // with its framing suppressed — open a fabricated frame so the
+          // client never receives orphan content_block events.
+          beginFabricatedMessage(session);
           const idx = p.clientIndex++;
           p.sdkToClient.set(ev.index, idx);
           writeEvent(session, { ...ev, index: idx });
@@ -1875,6 +1964,19 @@ function projectEvent(session, ev) {
 
   switch (ev.type) {
     case "message_start":
+      // A frame opened during a code run (T0 whose message_stop was
+      // suppressed and no wave closed it, or a lazily-opened mid-run frame)
+      // may still be open. Close it before starting the new message so the
+      // client never sees two message_starts inside one frame.
+      if (p.frameOpen) {
+        writeEvent(session, {
+          type: "message_delta",
+          delta: { stop_reason: "end_turn", stop_sequence: null },
+          usage: { output_tokens: session.lastRawUsage?.output_tokens ?? 0 },
+        });
+        writeEvent(session, { type: "message_stop", message: { stop_reason: "end_turn" } });
+      }
+      p.frameOpen = true;
       writeEvent(session, ev);
       break;
     case "content_block_start": {
@@ -1918,6 +2020,7 @@ function projectEvent(session, ev) {
       if (p.syntheticCount > 0 && out.message?.stop_reason) {
         out.message = { ...out.message, stop_reason: "tool_use" };
       }
+      p.frameOpen = false;
       writeEvent(session, out);
       break;
     }
@@ -1926,7 +2029,7 @@ function projectEvent(session, ev) {
   }
 }
 
-function createSession(key, model, tools, callerSystem, bucket, { resume, cwd = PROXY_CWD_FALLBACK, frozenToolset = null } = {}) {
+function createSession(key, model, tools, callerSystem, bucket, { resume, cwd = PROXY_CWD_FALLBACK, frozenToolset = null, maxThinkingTokens = undefined } = {}) {
   // Recheck the profile dir on every new session, not just at startup: the
   // bundled CLI mkdirs $CLAUDE_CONFIG_DIR/session-env/<id> per session, and a
   // profile cleanup can break that (dangling symlink) while the daemon is up.
@@ -2046,6 +2149,7 @@ function createSession(key, model, tools, callerSystem, bucket, { resume, cwd = 
     },
   };
   if (resume) queryOptions.resume = resume;
+  if (maxThinkingTokens) queryOptions.maxThinkingTokens = maxThinkingTokens;
   session.query = query({ prompt: input.iterable, options: queryOptions });
 
   consumeSession(session);
@@ -2185,6 +2289,8 @@ async function consumeSession(session) {
   }
 }
 
+const PENDING_EVENT_BUFFER_MAX = 2000;
+
 function writeEvent(session, ev) {
   if (session.nonStream) {
     accumulateStreamEvent(session.nonStream.blocks, ev);
@@ -2193,7 +2299,23 @@ function writeEvent(session, ev) {
   }
   if (session.res && !session.res.writableEnded) {
     writeSseChunk(session, sseEvent(ev.type, ev));
+    return;
   }
+  // No sink (client is between HTTP turns, e.g. executing a fabricated wave
+  // locally). Events used to be dropped here, permanently losing anything the
+  // model streamed in the gap — buffer them instead and flush them at the
+  // head of the next attached turn (notifyTurnAttached), in original order.
+  const buf = (session.pendingClientEvents ??= []);
+  if (buf.length < PENDING_EVENT_BUFFER_MAX) buf.push(ev);
+}
+
+// Flush events buffered while no HTTP turn was attached. Runs before wave
+// fabrication so buffered content lands ahead of the tool_uses that follow it.
+function flushPendingClientEvents(session) {
+  const buf = session.pendingClientEvents;
+  if (!buf?.length || !hasTurnSink(session)) return;
+  session.pendingClientEvents = [];
+  for (const ev of buf) writeEvent(session, ev);
 }
 
 // Abandon the current tool round: the parked handlers will never receive a
@@ -2216,6 +2338,7 @@ function abandonToolRound(session) {
   session.toolUseAccum.clear();
   session.toolMeta?.clear();
   session.anchorEditPlans?.clear();
+  session.pendingClientEvents = null;
   clearAllCodeState(session);
 }
 
@@ -2443,6 +2566,15 @@ async function resolveCodeModeToolResults(session, toolResults) {
     const flat = result.content?.[0]?.text || "";
     const { text, notices, truncated } = extractClientNotices(flat);
     const isError = !!result.isError;
+    recordDebug({
+      kind: "tool_result",
+      bucket: session.bucket,
+      id: tr.tool_use_id,
+      tool: call.tool,
+      head: text,
+      ...(isError ? { isError: true } : {}),
+      ...(truncated ? { truncated: true } : {}),
+    });
 
     // Recovery-read result: consumed and discarded. NEVER fed to the anchor
     // cache — a small freshness window must not overwrite a full snapshot —
@@ -2709,7 +2841,7 @@ async function handleMessages(req, res) {
     return forwardAnthropicMessages(req, res, body, req.url || "/v1/messages");
   }
 
-  const { model: rawModel, messages, system, stream, tools } = reqBody;
+  const { model: rawModel, messages, system, stream, tools, thinking } = reqBody;
   if (!rawModel || !Array.isArray(messages) || !messages.length) {
     return jsonResp(res, 400, { type: "error", error: { type: "invalid_request_error", message: "model and messages are required" } });
   }
@@ -2740,7 +2872,16 @@ async function handleMessages(req, res) {
 
   // Per-request working directory (see resolveCwd). Part of session identity so
   // two projects never share a session; passed to the SDK query()'s env block.
-  const cwd = resolveCwd(req.headers["x-claude-cwd"]);
+  const cwd = resolveCwd(req.headers["x-claude-cwd"], callerSystem);
+
+  // The client's extended-thinking budget maps to the SDK's maxThinkingTokens.
+  // queryOptions is fixed at session creation, so the first request of a
+  // conversation decides the budget for the whole session; previously the
+  // field was dropped entirely and the client's reasoning toggle had no effect.
+  const maxThinkingTokens =
+    thinking?.type === "enabled" && Number(thinking.budget_tokens) > 0
+      ? Number(thinking.budget_tokens)
+      : undefined;
 
   let session = findSession(messages, system, convId, cwd);
   let resumeCatchupTail = null;
@@ -2822,7 +2963,7 @@ async function handleMessages(req, res) {
           process.stderr.write(`${LOG_PREFIX} warm resume without frozen toolset (${candidate.toolsetHash ? "blob missing" : "legacy entry"}); code description may re-write the cached prefix\n`);
         }
       }
-      session = createSession(randomUUID(), model, tools, callerSystem, b, { resume: candidate.sdkSessionId, cwd, frozenToolset });
+      session = createSession(randomUUID(), model, tools, callerSystem, b, { resume: candidate.sdkSessionId, cwd, frozenToolset, maxThinkingTokens });
       action = candidate.mode;
       if (candidate.mode === "resume-catchup") resumeCatchupTail = candidate.tail;
     }
@@ -2839,11 +2980,11 @@ async function handleMessages(req, res) {
           }
         }
       }
-      session = createSession(randomUUID(), model, tools, callerSystem, b, { cwd });
+      session = createSession(randomUUID(), model, tools, callerSystem, b, { cwd, maxThinkingTokens });
       action = "cold";
     }
   } else {
-    session = createSession(randomUUID(), model, tools, callerSystem, bucketKey(system, messages, convId, cwd), { cwd });
+    session = createSession(randomUUID(), model, tools, callerSystem, bucketKey(system, messages, convId, cwd), { cwd, maxThinkingTokens });
     action = "new";
   }
   if (convId && !session.convId) session.convId = convId;
@@ -2859,7 +3000,8 @@ async function handleMessages(req, res) {
     action, startedAt: Date.now(), firstEventAt: null, textDeltas: 0,
     usage: { input: 0, read: 0, create5m: 0, create1h: 0, output: 0 },
     messages: 0, _curMsgOutput: 0, codeSubCalls: 0, codeWaves: 0, scriptOutBytes: 0,
-    scriptInBytes: 0, spills: 0, stateBytes: 0, codeErrors: 0, codeRecoveries: 0, coldReason,
+    scriptInBytes: 0, spills: 0, stateBytes: 0, codeErrors: 0, codeRecoveries: 0,
+    singleCallRuns: 0, coldReason,
   };
   const turnPromise = new Promise((resolve, reject) => {
     session.currentTurn = { resolve, reject };
@@ -3072,6 +3214,7 @@ async function forwardOauthUsage(req, res, rawUrl) {
 // to process.env by the caller (src/auth.mjs). Returns the http.Server.
 export function startServer({ port = 32809, host = "127.0.0.1", account = null, profileDir = process.env.CLAUDE_CONFIG_DIR, version = null, cacheLog = process.env.CACHE_LOG } = {}) {
   serverProfileDir = profileDir || null;
+  initDebugRing(profileDir || null);
   resumeIndexFile = defaultIndexPath();
   initCacheLog(cacheLog, profileDir);
   const server = http.createServer(async (req, res) => {
@@ -3096,7 +3239,20 @@ export function startServer({ port = 32809, host = "127.0.0.1", account = null, 
         cacheReadTokens: totalCacheReadTokens,
         cacheCreationTokens: totalCacheCreationTokens,
         cacheLog: cacheLogPath() || null,
+        update: getUpdateStatus(),
       });
+    }
+    // Manual update trigger: runs one poll tick immediately (check + gated
+    // apply + drain-aware relaunch), so deploys never wait on the poll cadence.
+    if (req.method === "POST" && (url === "/update/check" || url === "/update/check/")) {
+      const r = await triggerUpdateCheck();
+      return jsonResp(res, 200, { ok: true, outcome: r?.outcome ?? null, detail: r?.detail ?? r?.reason ?? null, update: getUpdateStatus() });
+    }
+    // Post-mortem trail: newest debug-ring entries (code runs, tool_use
+    // dispatches, tool_results). Disk mirror lives at <profileDir>/debug-ring.jsonl.
+    if (req.method === "GET" && (url === "/debug/recent" || url === "/debug/recent/")) {
+      const n = Number(new URLSearchParams(rawUrl.split("?")[1] || "").get("n")) || 100;
+      return jsonResp(res, 200, { entries: recentDebug(n) });
     }
     if (req.method === "POST" && (url === "/v1/messages" || url === "/v1/messages/")) {
       try {

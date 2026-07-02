@@ -290,6 +290,37 @@ function spawnNpm(spawnFn, npmBin, args, cwd) {
   });
 }
 
+// --- status surface ----------------------------------------------------------
+
+// Operator-visible snapshot of the updater, surfaced as `update` in /healthz
+// and refreshed by every tick — waiting on a release is never blind polling.
+const _updateStatus = {
+  currentVersion: null,
+  lastCheckAt: null,
+  lastOutcome: null,
+  lastDetail: null,
+  latestSeen: null,
+  nextCheckAt: null,
+  installing: false,
+  draining: null, // { version, since, hardDeadlineAt } while a relaunch waits on live work
+};
+
+export function getUpdateStatus() {
+  return { ..._updateStatus, draining: _updateStatus.draining ? { ..._updateStatus.draining } : null };
+}
+
+// Set by startAutoUpdateLoop; lets POST /update/check run a tick immediately.
+let _runTickNow = null;
+
+/**
+ * Run one update tick now instead of waiting for the poll. Single-flight: a
+ * trigger while a tick is in flight joins it. Resolves to the tick outcome.
+ */
+export function triggerUpdateCheck() {
+  if (!_runTickNow) return Promise.resolve({ outcome: "loop_not_running" });
+  return _runTickNow();
+}
+
 // --- drain-aware relaunch ---------------------------------------------------
 
 // After a successful install, do NOT kill live turns: the daemon relaunches
@@ -306,10 +337,12 @@ export function scheduleExitWhenIdle({
   exitFn = (code) => process.exit(code),
   nowFn = Date.now,
   setTimeoutFn = setTimeout,
+  version = null,
 } = {}) {
   if (_drainScheduled) return false;
   _drainScheduled = true;
   const startedMs = nowFn();
+  _updateStatus.draining = { version, since: startedMs, hardDeadlineAt: startedMs + hardDeadlineMs };
   let loggedBusy = false;
   const attempt = () => {
     let busy = false;
@@ -325,6 +358,7 @@ export function scheduleExitWhenIdle({
     }
     if (busy) log(`auto-update: drain deadline reached with work still in flight; exiting for launchd relaunch anyway`);
     else log(`auto-update: exiting for launchd relaunch`);
+    _updateStatus.draining = null;
     // Give the log line a beat to flush, then let launchd KeepAlive restart us.
     const t = setTimeoutFn(() => exitFn(0), 250);
     t?.unref?.();
@@ -335,6 +369,7 @@ export function scheduleExitWhenIdle({
 
 export function _resetDrainGuardForTests() {
   _drainScheduled = false;
+  _updateStatus.draining = null;
 }
 
 // --- one tick --------------------------------------------------------------
@@ -376,6 +411,8 @@ export async function autoUpdateTick({
   }
 
   const check = await checkForUpdate({ pkgName, currentVersion, fetchImpl });
+  _updateStatus.lastCheckAt = nowMs;
+  if (check.latestVersion) _updateStatus.latestSeen = check.latestVersion;
   let state = readState(statePath);
   state = recordCheck(state, { check, nowMs });
   writeState(statePath, state);
@@ -391,7 +428,13 @@ export async function autoUpdateTick({
   }
 
   log(`auto-update: installing ${pkgName}@${plan.version} (from ${currentVersion})`);
-  const result = await applyUpdate({ pkgName, version: plan.version, spawnFn });
+  _updateStatus.installing = true;
+  let result;
+  try {
+    result = await applyUpdate({ pkgName, version: plan.version, spawnFn });
+  } finally {
+    _updateStatus.installing = false;
+  }
   state = readState(statePath);
   state = recordRun(state, {
     version: plan.version,
@@ -405,7 +448,7 @@ export async function autoUpdateTick({
     log(`auto-update: installed ${plan.version}`);
     if (shouldExit) {
       // Drain-aware relaunch: never exit under a live turn / code run.
-      scheduleExitWhenIdle({ isBusy, recheckMs: drainRecheckMs, hardDeadlineMs: drainHardDeadlineMs, exitFn });
+      scheduleExitWhenIdle({ isBusy, recheckMs: drainRecheckMs, hardDeadlineMs: drainHardDeadlineMs, exitFn, version: plan.version });
     }
     return { outcome: AutoUpdateOutcome.Done, version: plan.version };
   }
@@ -433,63 +476,95 @@ export function startAutoUpdateLoop({
 } = {}) {
   if (_loopRunning) return;
   _loopRunning = true;
-
-  const tick = async () => {
-    try {
-      const r = await autoUpdateTick({
-        pkgName,
-        ownInstallDir,
-        currentVersion,
-        statePath,
-        appSupportDir,
-        npmPrefix,
-        fetchImpl,
-        spawnFn,
-        isBusy,
-      });
-      switch (r.outcome) {
-        case AutoUpdateOutcome.Disabled:
-          break; // quiet
-        case AutoUpdateOutcome.DevCheckout:
-          if (!_devCheckoutLogged) {
-            log(`auto-update: dev checkout (${ownInstallDir}); skipping self-update`);
-            _devCheckoutLogged = true;
-          }
-          break;
-        case AutoUpdateOutcome.CheckFailed:
-          log(`auto-update: check failed (${r.detail}); retrying next tick`);
-          break;
-        case AutoUpdateOutcome.Current:
-          break; // quiet
-        case AutoUpdateOutcome.Gated:
-          break; // quiet (backoff / done-suppress)
-        case AutoUpdateOutcome.Done:
-        case AutoUpdateOutcome.Failed:
-        case AutoUpdateOutcome.Started:
-          break; // already logged inside the tick
-      }
-    } catch (e) {
-      log(`auto-update: tick error: ${e?.stack || e}`);
-    }
-    scheduleNext();
-  };
+  _updateStatus.currentVersion = currentVersion;
 
   let timer = null;
+  let inFlight = null;
+
   const scheduleNext = () => {
     const jitter = Math.floor(Math.random() * (jitterMs + 1));
-    timer = setTimeout(tick, pollIntervalMs + jitter);
+    const delay = pollIntervalMs + jitter;
+    _updateStatus.nextCheckAt = Date.now() + delay;
+    timer = setTimeout(runTick, delay);
     timer.unref?.();
   };
 
+  // Single-flight tick shared by the poll timer and triggerUpdateCheck(): a
+  // manual trigger while a tick is in flight joins it instead of stacking.
+  const runTick = () => {
+    if (inFlight) return inFlight;
+    if (timer) { clearTimeout(timer); timer = null; }
+    inFlight = (async () => {
+      let r;
+      try {
+        r = await autoUpdateTick({
+          pkgName,
+          ownInstallDir,
+          currentVersion,
+          statePath,
+          appSupportDir,
+          npmPrefix,
+          fetchImpl,
+          spawnFn,
+          isBusy,
+        });
+        switch (r.outcome) {
+          case AutoUpdateOutcome.Disabled:
+            break; // quiet
+          case AutoUpdateOutcome.DevCheckout:
+            if (!_devCheckoutLogged) {
+              log(`auto-update: dev checkout (${ownInstallDir}); skipping self-update`);
+              _devCheckoutLogged = true;
+            }
+            break;
+          case AutoUpdateOutcome.CheckFailed:
+            log(`auto-update: check failed (${r.detail}); retrying next tick`);
+            break;
+          case AutoUpdateOutcome.Current:
+            break; // quiet
+          case AutoUpdateOutcome.Gated:
+            break; // quiet (backoff / done-suppress)
+          case AutoUpdateOutcome.Done:
+          case AutoUpdateOutcome.Failed:
+          case AutoUpdateOutcome.Started:
+            break; // already logged inside the tick
+        }
+      } catch (e) {
+        log(`auto-update: tick error: ${e?.stack || e}`);
+        r = { outcome: "tick_error", detail: String(e?.message || e) };
+      }
+      _updateStatus.lastOutcome = r?.outcome ?? null;
+      _updateStatus.lastDetail = r?.detail ?? r?.reason ?? null;
+      if (r?.latestVersion) _updateStatus.latestSeen = r.latestVersion;
+      inFlight = null;
+      scheduleNext();
+      return r;
+    })();
+    return inFlight;
+  };
+  _runTickNow = runTick;
+
   // Fire one soon after boot (5s) so a fresh launch picks up a pending release
   // promptly, then settle into the cadence.
-  timer = setTimeout(tick, 5000);
+  _updateStatus.nextCheckAt = Date.now() + 5000;
+  timer = setTimeout(runTick, 5000);
   timer.unref?.();
 }
 
 export function _resetLoopGuardForTests() {
   _loopRunning = false;
   _devCheckoutLogged = false;
+  _runTickNow = null;
+  Object.assign(_updateStatus, {
+    currentVersion: null,
+    lastCheckAt: null,
+    lastOutcome: null,
+    lastDetail: null,
+    latestSeen: null,
+    nextCheckAt: null,
+    installing: false,
+    draining: null,
+  });
 }
 
 function log(msg) {
