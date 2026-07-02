@@ -39,6 +39,8 @@ export const RETRY_BACKOFF_MS = 10 * 60 * 1000; // min wait after a failed attem
 export const MAX_ATTEMPTS = 5; // hard cap before a version is parked
 export const DONE_SUPPRESS_MS = 10 * 60 * 1000; // no re-offer right after a success
 export const INSTALL_TIMEOUT_MS = 120_000; // npm install -g watchdog
+export const DRAIN_RECHECK_MS = 15_000; // post-install idle poll while sessions are busy
+export const DRAIN_HARD_DEADLINE_MS = 30 * 60 * 1000; // force relaunch after this even if busy
 export const REGISTRY = "https://registry.npmjs.org";
 export const DISABLE_SENTINEL = "auto-update.disabled";
 export const STATE_SCHEMA_VERSION = 1;
@@ -288,6 +290,53 @@ function spawnNpm(spawnFn, npmBin, args, cwd) {
   });
 }
 
+// --- drain-aware relaunch ---------------------------------------------------
+
+// After a successful install, do NOT kill live turns: the daemon relaunches
+// only once `isBusy()` reports idle (no attached HTTP turn, no executing code
+// run), rechecked on a short poll, with a hard deadline so a wedged/marathon
+// session cannot pin the daemon on stale code forever. Injectable exit/now for
+// tests. Single-flight: a second successful install while a drain is already
+// scheduled does not stack exits.
+let _drainScheduled = false;
+export function scheduleExitWhenIdle({
+  isBusy = null,
+  recheckMs = DRAIN_RECHECK_MS,
+  hardDeadlineMs = DRAIN_HARD_DEADLINE_MS,
+  exitFn = (code) => process.exit(code),
+  nowFn = Date.now,
+  setTimeoutFn = setTimeout,
+} = {}) {
+  if (_drainScheduled) return false;
+  _drainScheduled = true;
+  const startedMs = nowFn();
+  let loggedBusy = false;
+  const attempt = () => {
+    let busy = false;
+    try { busy = !!isBusy?.(); } catch { busy = false; }
+    if (busy && nowFn() - startedMs < hardDeadlineMs) {
+      if (!loggedBusy) {
+        log(`auto-update: installed but sessions have work in flight; draining before relaunch (recheck ${recheckMs}ms, deadline ${hardDeadlineMs}ms)`);
+        loggedBusy = true;
+      }
+      const t = setTimeoutFn(attempt, recheckMs);
+      t?.unref?.();
+      return;
+    }
+    if (busy) log(`auto-update: drain deadline reached with work still in flight; exiting for launchd relaunch anyway`);
+    else log(`auto-update: exiting for launchd relaunch`);
+    // Give the log line a beat to flush, then let launchd KeepAlive restart us.
+    const t = setTimeoutFn(() => exitFn(0), 250);
+    t?.unref?.();
+  };
+  attempt();
+  return true;
+}
+
+export function _resetDrainGuardForTests() {
+  _drainScheduled = false;
+}
+
 // --- one tick --------------------------------------------------------------
 
 export const AutoUpdateOutcome = Object.freeze({
@@ -315,6 +364,10 @@ export async function autoUpdateTick({
   spawnFn = spawn,
   nowMs = Date.now(),
   shouldExit = true,
+  isBusy = null,
+  drainRecheckMs = DRAIN_RECHECK_MS,
+  drainHardDeadlineMs = DRAIN_HARD_DEADLINE_MS,
+  exitFn = (code) => process.exit(code),
 }) {
   if (killSwitchDisabled(appSupportDir)) return { outcome: AutoUpdateOutcome.Disabled };
 
@@ -349,10 +402,10 @@ export async function autoUpdateTick({
   writeState(statePath, state);
 
   if (result.outcome === "done") {
-    log(`auto-update: installed ${plan.version}; exiting for launchd relaunch`);
+    log(`auto-update: installed ${plan.version}`);
     if (shouldExit) {
-      // Give the log line a beat to flush, then let launchd KeepAlive restart us.
-      setTimeout(() => process.exit(0), 250);
+      // Drain-aware relaunch: never exit under a live turn / code run.
+      scheduleExitWhenIdle({ isBusy, recheckMs: drainRecheckMs, hardDeadlineMs: drainHardDeadlineMs, exitFn });
     }
     return { outcome: AutoUpdateOutcome.Done, version: plan.version };
   }
@@ -376,6 +429,7 @@ export function startAutoUpdateLoop({
   spawnFn = spawn,
   pollIntervalMs = POLL_INTERVAL_MS,
   jitterMs = JITTER_MS,
+  isBusy = null,
 } = {}) {
   if (_loopRunning) return;
   _loopRunning = true;
@@ -391,6 +445,7 @@ export function startAutoUpdateLoop({
         npmPrefix,
         fetchImpl,
         spawnFn,
+        isBusy,
       });
       switch (r.outcome) {
         case AutoUpdateOutcome.Disabled:

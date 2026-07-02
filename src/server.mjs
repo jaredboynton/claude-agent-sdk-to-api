@@ -96,14 +96,18 @@ import { checkerFor, runSyntaxCheck, collectGitSnapshot } from "./local-checks.m
 const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS || process.env.ACP_SESSION_TTL_MS || 10800000); // 3 h
 const HEARTBEAT_MS = Number(process.env.HEARTBEAT_MS || process.env.ACP_HEARTBEAT_MS || 15000);
 const TOOL_TIMEOUT_MS = Number(process.env.TOOL_TIMEOUT_MS || process.env.ACP_TOOL_TIMEOUT_MS || 1800000); // 30 min; a tool_result that never arrives returns isError so the SDK loop survives
-// NOTE: there is intentionally NO turn-level timeout/watchdog. A clock-based
-// backstop only masks the real failure (a wedged turn) and silently drops
-// context. Turn teardown is purely EVENT-DRIVEN off the SDK query() lifecycle:
-// when the live query()'s async iterator ends, errors, or is aborted,
-// consumeSession() immediately settles the attached turn (failTurn) and abandons
-// any parked tool round. A turn that never settles means the SDK genuinely never
-// emitted message_stop and never closed — that is a real bug to root-cause from
-// the event stream, not something to paper over with a timer.
+// Turn teardown is primarily EVENT-DRIVEN off the SDK query() lifecycle:
+// message_stop / result / idle settle the turn, and the iterator
+// ending/erroring/aborting fails it (consumeSession). The stall watchdog below
+// is a last-resort BACKSTOP for a turn that is attached but has seen zero
+// activity (no SDK events, no tool traffic — session.lastActivity frozen) for
+// the whole window: instead of hanging the client forever on keep-alives, it
+// dumps the session state to the log and fails the turn with a real SSE error
+// so the wedge is diagnosable and the client can retry. Long thinking and long
+// code scripts both bump lastActivity via their stream/tool events, so a
+// healthy slow turn never trips it. 0 disables.
+const TURN_STALL_TIMEOUT_MS = Number(process.env.TURN_STALL_TIMEOUT_MS ?? 300000); // 5 min
+const TURN_STALL_SWEEP_MS = 30000;
 const CODE_SCRIPT_TIMEOUT_MS = Number(process.env.CODE_SCRIPT_TIMEOUT_MS || 0); // 0 = no cap
 const CODE_MAX_WAVES = Number(process.env.CODE_MAX_WAVES || 0); // 0 = unlimited
 const CODE_MAX_CALLS = Number(process.env.CODE_MAX_CALLS || 0); // 0 = unlimited
@@ -1394,7 +1398,6 @@ function startCodeRun(session, codeToolUseId, input) {
     waveCount: 0,
     callCount: 0,
     aborted: false,
-    preamble: null,          // preserved text/thinking blocks from the SDK code message
     settled: false,
     ledger: [],              // completed-call evidence for the structured error result
   };
@@ -1749,29 +1752,7 @@ function fabricateCurrentWave(session) {
 
   wave.dispatched = true;
 
-  const p = session._proj;
   beginFabricatedMessage(session);
-
-  // Emit any preserved preamble (text/thinking from the SDK code message) on
-  // the first wave only.
-  if (wave.waveNum === 1 && run.preamble && run.preamble.length) {
-    for (const block of run.preamble) {
-      const idx = p.clientIndex++;
-      if (block.type === "text") {
-        writeEvent(session, {
-          type: "content_block_start",
-          index: idx,
-          content_block: { type: "text", text: block.text || "" },
-        });
-        writeEvent(session, {
-          type: "content_block_delta",
-          index: idx,
-          delta: { type: "text_delta", text: block.text || "" },
-        });
-        writeEvent(session, { type: "content_block_stop", index: idx });
-      }
-    }
-  }
 
   // Emit synthetic tool_use blocks for fabricatable calls. A multi-part call
   // (chunked Read) emits one block per part; the results stitch back into a
@@ -1859,24 +1840,37 @@ function projectEvent(session, ev) {
   const p = session._proj;
   if (!p) return;
 
-  // While a dynamic code run is driving, suppress SDK messages entirely.
-  // The bridge fabricates client turns from script waves; the SDK's code
-  // message and its trailing framing are not client-visible.
+  // While a dynamic code run is driving, the bridge owns the message framing
+  // (fabricated wave messages carry the tool_use blocks and close each HTTP
+  // turn), so message_start/message_delta/message_stop from the SDK are
+  // suppressed. Content, however, streams LIVE: text and thinking blocks pass
+  // through with remapped indices so the client never sits behind a silent
+  // gap while the model produces a follow-up message during an active run.
+  // Buffering these as a "preamble" to replay on the next fabricated wave
+  // (the old design) meant seconds-to-minutes of dead air — the UI looked
+  // frozen even though the model was working.
   if (session.codeDriving && session.codeRun) {
-    // Collect preamble (text/thinking) from the SDK code message so we can
-    // re-emit it on the first fabricated wave.
-    if (ev.type === "content_block_start") {
-      const cb = ev.content_block;
-      if (cb?.type === "text" || cb?.type === "thinking") {
-        session.codeRun.preamble = session.codeRun.preamble || [];
-        session.codeRun.preamble.push({ type: cb.type, text: cb.text || cb.thinking || "" });
+    switch (ev.type) {
+      case "content_block_start": {
+        const cb = ev.content_block;
+        if (cb?.type === "text" || cb?.type === "thinking") {
+          const idx = p.clientIndex++;
+          p.sdkToClient.set(ev.index, idx);
+          writeEvent(session, { ...ev, index: idx });
+        }
+        // tool_use blocks (the code call itself) stay suppressed; the
+        // fabricated wave emits the client-visible synthetic tool_uses.
+        return;
       }
+      case "content_block_delta":
+      case "content_block_stop": {
+        const mapped = p.sdkToClient.get(ev.index);
+        if (mapped !== undefined) writeEvent(session, { ...ev, index: mapped });
+        return;
+      }
+      default:
+        return; // message framing suppressed while the run drives the client turn
     }
-    // Update toolUseAccum so consumeSession's code-detection hook fires.
-    if (ev.type === "content_block_start" && ev.content_block?.type === "tool_use") {
-      // already handled by consumeSession
-    }
-    return;
   }
 
   switch (ev.type) {
@@ -1977,7 +1971,7 @@ function createSession(key, model, tools, callerSystem, bucket, { resume, cwd = 
     inputParsers: new Map(),      // toolName -> z.object(shape); canonical parser mirroring MCP validateToolInput
     fifoFallbacks: 0,             // per-session count of correlation FIFO fallbacks (observable)
     clientTools: new Map(),       // code mode: name -> {description, input_schema}
-    codeRun: null,                // active dynamic code run: { codeId, currentWave, waveSeq, waveCount, callCount, aborted, preamble }
+    codeRun: null,                // active dynamic code run: { codeId, currentWave, waveSeq, waveCount, callCount, aborted }
     syntheticToCode: new Map(),   // syntheticId -> codeId (for routing tool_results)
     codeDriving: false,           // bridge controls visible client turns while SDK is parked on code
     suppressEndTurn: false,
@@ -2273,6 +2267,19 @@ function resolveTool(session, toolUseId, result) {
   } else {
     session.resolvedResults.set(toolUseId, result);
   }
+}
+
+// Live-work probe for drain-aware shutdown (self-update): a session with an
+// attached HTTP turn or an executing code run must not be killed by a relaunch.
+export function activeWork() {
+  let turns = 0;
+  let codeRuns = 0;
+  for (const s of sessions.values()) {
+    if (s.closed) continue;
+    if (s.currentTurn) turns++;
+    if (s.codeRun) codeRuns++;
+  }
+  return { turns, codeRuns, busy: turns + codeRuns > 0 };
 }
 
 // Idle sweeper: close sessions past SESSION_TTL_MS.
@@ -2847,6 +2854,7 @@ async function handleMessages(req, res) {
   // Attach this HTTP response as the session's current turn.
   let onClose;
   let heartbeat;
+  let stallTimer;
   session.turnMetrics = {
     action, startedAt: Date.now(), firstEventAt: null, textDeltas: 0,
     usage: { input: 0, read: 0, create5m: 0, create1h: 0, output: 0 },
@@ -2857,25 +2865,58 @@ async function handleMessages(req, res) {
     session.currentTurn = { resolve, reject };
   });
 
+  // Stall watchdog: fail (never hang) a turn whose session has gone completely
+  // silent — zero SDK events and zero tool traffic — for TURN_STALL_TIMEOUT_MS.
+  if (TURN_STALL_TIMEOUT_MS > 0) {
+    const attachedAt = Date.now();
+    stallTimer = setInterval(() => {
+      if (!session.currentTurn) return; // settled; cleanup happens at turn end
+      const idleMs = Date.now() - Math.max(attachedAt, session.lastActivity);
+      if (idleMs < TURN_STALL_TIMEOUT_MS) return;
+      const run = session.codeRun;
+      process.stderr.write(
+        `${LOG_PREFIX} turn STALLED key=${session.key.slice(0, 8)} action=${action} idle_ms=${idleMs}` +
+          ` codeRun=${run ? `codeId=${run.codeId} wave=${run.waveSeq} dispatched=${!!run.currentWave?.dispatched} pending=${run.currentWave?.pending?.size ?? 0}` : "none"}` +
+          ` pendingTools=${session.pendingTools.size} streamedToolUses=${session.streamedToolUses.length}; failing turn\n`
+      );
+      failTurn(session, new Error(`turn stalled: no session activity for ${idleMs}ms (TURN_STALL_TIMEOUT_MS=${TURN_STALL_TIMEOUT_MS})`));
+    }, TURN_STALL_SWEEP_MS);
+    stallTimer.unref?.();
+  }
+
   if (isStream) {
     session.res = res;
     session.sseHeadersWritten = false;
     session.nonStream = null;
     heartbeat = setInterval(() => { if (!res.writableEnded) writeSseChunk(session, `: keep-alive\n\n`); }, HEARTBEAT_MS);
     // A response close before writableEnded means the client did not receive
-    // the full streamed turn. If that turn was a fabricated code wave, no
-    // reliable tool_result can arrive for it, so abort the parked code run.
+    // the full streamed turn (escape / network drop). Nothing this turn was
+    // producing can be delivered or answered: tear down the WHOLE in-flight
+    // round unconditionally — active code run dispatched-wave or not — settle
+    // the turn with a logged failure, and interrupt the live SDK query so it
+    // stops burning tokens on output nobody will receive. The session itself
+    // stays warm so the client can rejoin with its next POST. (The old guard
+    // on codeRun.currentWave.dispatched leaked runs that were between waves at
+    // disconnect time: the run kept executing, its next wave dropped into a
+    // null response, and the turn parked forever with no log line.)
     onClose = () => {
       const aborted = !res.writableEnded;
       if (session.res === res) session.res = null;
       // Stop keep-alive ticks once the response closes; otherwise a disconnect
       // arms a post-close tick that races session.res=null and crashes.
       if (heartbeat) { clearInterval(heartbeat); heartbeat = null; }
-      if (aborted && session.codeRun?.currentWave?.dispatched) {
-        process.stderr.write(`${LOG_PREFIX} client disconnected during code wave key=${session.key.slice(0, 8)}; aborting code run\n`);
-        if (session.currentTurn) failTurn(session, new Error("client disconnected during code wave"));
-        else abandonToolRound(session);
-      }
+      if (!aborted) return;
+      const run = session.codeRun;
+      process.stderr.write(
+        `${LOG_PREFIX} client disconnected mid-turn key=${session.key.slice(0, 8)}` +
+          ` codeRun=${run ? `wave=${run.waveSeq} dispatched=${!!run.currentWave?.dispatched}` : "none"}` +
+          `; aborting in-flight work\n`
+      );
+      // interrupt() is async fire-and-forget: the SDK aborts its current
+      // assistant turn; the query stream stays alive for the next push.
+      try { session.query?.interrupt?.().catch(() => {}); } catch {}
+      if (session.currentTurn) failTurn(session, new Error("client disconnected mid-turn"));
+      else abandonToolRound(session);
     };
     res.on("close", onClose);
   } else {
@@ -2956,11 +2997,13 @@ async function handleMessages(req, res) {
       if (!res.headersSent) jsonResp(res, 500, { type: "error", error: { type: "api_error", message: String(e?.message || e) } });
     }
     if (heartbeat) clearInterval(heartbeat);
+    if (stallTimer) clearInterval(stallTimer);
     if (onClose) res.off("close", onClose);
     return;
   }
 
   if (heartbeat) clearInterval(heartbeat);
+  if (stallTimer) clearInterval(stallTimer);
   if (onClose) res.off("close", onClose);
 
   persistResumeIndex(session, model, system, messages);
@@ -3130,9 +3173,15 @@ export function startServer({ port = 32809, host = "127.0.0.1", account = null, 
     process.stderr.write(`${LOG_PREFIX} stateful session bridge (TTL ${SESSION_TTL_MS}ms ≈ ${Math.round(SESSION_TTL_MS / 60000)}min) — one live query() per conversation\n`);
   });
 
-  const shutdown = () => { try { server.close(); } catch {} process.exit(0); };
-  process.on("SIGTERM", shutdown);
-  process.on("SIGINT", shutdown);
+  // Every intentional exit logs its reason so a dead daemon is diagnosable
+  // from the log alone (no more anonymous deaths between log lines).
+  const shutdown = (signal) => () => {
+    process.stderr.write(`${LOG_PREFIX} ${signal} received; shutting down\n`);
+    try { server.close(); } catch {}
+    process.exit(0);
+  };
+  process.on("SIGTERM", shutdown("SIGTERM"));
+  process.on("SIGINT", shutdown("SIGINT"));
 
   return server;
 }

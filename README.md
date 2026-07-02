@@ -136,6 +136,7 @@ Every `Read` result inside code mode also carries an `.anchored` view with stabl
 | `HOST` | `127.0.0.1` | Listen host (also `--host`) |
 | `SESSION_TTL_MS` | `10800000` | Idle session eviction (3 h default) |
 | `TOOL_TIMEOUT_MS` | `1800000` | Parked-tool watchdog; returns an error result so the loop survives |
+| `TURN_STALL_TIMEOUT_MS` | `300000` | Turn stall backstop: an attached turn whose session shows zero activity (no SDK events, no tool traffic) for this long is failed with a logged state dump and a real SSE error instead of hanging on keep-alives; `0` disables |
 | `HEARTBEAT_MS` | `15000` | SSE keep-alive interval |
 | `CODE_SCRIPT_TIMEOUT_MS` | `0` (no cap) | Optional Worker wall-clock cap on a `code` script's own compute; `0` = unlimited |
 | `CODE_SCRIPT_MAX_OUTPUT_BYTES` | `16384` | Max bytes for a code script's return value (+console); over-cap output is truncated head+tail (never errored) with the full text spilled to a session artifact reachable via `codemode.recall(id)`; `0` = unlimited |

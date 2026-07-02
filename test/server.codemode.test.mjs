@@ -657,23 +657,41 @@ test("buildParkingMcpServer exposes only code while preserving script tool catal
 // projectEvent (buffered projection while codeDriving)
 // ---------------------------------------------------------------------------
 
-test("projectEvent suppresses SDK events while codeDriving", () => {
+test("projectEvent streams text/thinking live while codeDriving, suppresses framing and tool_use", () => {
   const events = [];
   const session = fakeCodeSession({
     codeDriving: true,
-    codeRun: { codeId: "c1", preamble: [] },
+    codeRun: { codeId: "c1" },
     res: { writableEnded: false, write: (s) => { const m = s.match(/^data: (.+)\n\n$/m); if (m) events.push(JSON.parse(m[1])); } },
   });
   initMessageProjection(session);
   projectEvent(session, { type: "message_start", message: { role: "assistant" } });
-  projectEvent(session, { type: "content_block_start", index: 0, content_block: { type: "text", text: "hi" } });
+  projectEvent(session, { type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "" } });
+  projectEvent(session, { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "hmm" } });
   projectEvent(session, { type: "content_block_stop", index: 0 });
+  projectEvent(session, { type: "content_block_start", index: 1, content_block: { type: "text", text: "" } });
+  projectEvent(session, { type: "content_block_delta", index: 1, delta: { type: "text_delta", text: "hi" } });
+  projectEvent(session, { type: "content_block_stop", index: 1 });
+  projectEvent(session, { type: "content_block_start", index: 2, content_block: { type: "tool_use", id: "t1", name: "code", input: {} } });
+  projectEvent(session, { type: "content_block_delta", index: 2, delta: { type: "input_json_delta", partial_json: "{}" } });
+  projectEvent(session, { type: "content_block_stop", index: 2 });
+  projectEvent(session, { type: "message_delta", delta: { stop_reason: "tool_use" } });
   projectEvent(session, { type: "message_stop", message: { stop_reason: "end_turn" } });
-  // Nothing should reach the client while codeDriving.
-  assert.equal(events.length, 0);
-  // Preamble should have captured the text block.
-  assert.equal(session.codeRun.preamble.length, 1);
-  assert.equal(session.codeRun.preamble[0].text, "hi");
+
+  // Content streams live: thinking + text blocks (start/delta/stop each).
+  const types = events.map((e) => e.type);
+  assert.deepEqual(types, [
+    "content_block_start", "content_block_delta", "content_block_stop",
+    "content_block_start", "content_block_delta", "content_block_stop",
+  ]);
+  assert.equal(events[0].content_block.type, "thinking");
+  assert.equal(events[1].delta.thinking, "hmm");
+  assert.equal(events[3].content_block.type, "text");
+  assert.equal(events[4].delta.text, "hi");
+  // Message framing and the code tool_use are suppressed (no message_start/
+  // message_stop, no tool_use block, no input_json deltas).
+  assert.equal(events.some((e) => e.type === "message_start" || e.type === "message_stop" || e.type === "message_delta"), false);
+  assert.equal(events.some((e) => e.content_block?.type === "tool_use"), false);
 });
 
 test("projectEvent projects normally when not codeDriving (no code block)", () => {

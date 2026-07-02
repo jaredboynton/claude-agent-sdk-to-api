@@ -4,13 +4,11 @@ Anthropic-compatible HTTP bridge over the Claude Agent SDK. See [README.md](READ
 
 ## Safe-Change Rules
 
-### No timeout backstops
+### No timeout backstops that mask work
 
-Do not add clock-based timeouts (turn watchdogs, park timers, HTTP turn deadlines, vm timeouts, etc.) to mask slow or hung work. They hide real failures and silently drop context instead of surfacing the bug to fix.
+Do not add clock-based timeouts (park timers, HTTP turn deadlines, vm timeouts, etc.) that silently cut off slow-but-healthy work. Agentic coding interfaces legitimately have long tool calls — large searches, builds, test runs, multi-wave code mode, client-side approval flows. Let work run until it completes or fails for a real, observable reason.
 
-Agentic coding interfaces legitimately have long tool calls — large searches, builds, test runs, multi-wave code mode, client-side approval flows. Let work run until it completes or fails for a real, observable reason.
-
-Turn teardown is event-driven off the SDK `query()` lifecycle: when the async iterator ends, errors, or is aborted, settle the turn immediately. A turn that never settles means the SDK stream genuinely never closed; root-cause that from the event stream rather than papering over it with a timer.
+Turn teardown is event-driven off the SDK `query()` lifecycle: when the async iterator ends, errors, or is aborted, settle the turn immediately. The one sanctioned clock is the turn stall watchdog (`TURN_STALL_TIMEOUT_MS`): it fires only when an attached turn's session has had ZERO activity (no SDK events, no tool traffic) for the whole window, and it must LOUDLY dump session state and fail the turn with a real SSE error — never silently drop or retry. Healthy slow work bumps `lastActivity` and never trips it; a trip is a bug report, not a recovery.
 
 ### The `code` description is cache-critical
 

@@ -22,7 +22,7 @@ import { homedir, platform } from "node:os";
 import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync } from "node:fs";
 
 import { setupAuth, resolveProfileDir, readProfileAccount, expandHome, preflightProfileDir } from "../src/auth.mjs";
-import { startServer } from "../src/server.mjs";
+import { startServer, activeWork } from "../src/server.mjs";
 import { loadProfilesConfig, defaultConfigPath } from "../src/config.mjs";
 import { startAutoUpdateLoop, defaultStatePath } from "../src/self-update.mjs";
 
@@ -60,6 +60,18 @@ function die(msg, code = 1) {
 // run — one bridge, foreground.
 // ---------------------------------------------------------------------------
 function cmdRun(args) {
+  // Never die anonymously: a daemon that vanishes between log lines is
+  // undiagnosable. Any crash writes its stack to stderr (the launchd err.log)
+  // before exiting so launchd's relaunch is attributable to a cause.
+  process.on("uncaughtException", (e) => {
+    process.stderr.write(`claude-agent-api: FATAL uncaughtException: ${e?.stack || e}\n`);
+    process.exit(1);
+  });
+  process.on("unhandledRejection", (e) => {
+    process.stderr.write(`claude-agent-api: FATAL unhandledRejection: ${e?.stack || e}\n`);
+    process.exit(1);
+  });
+
   const port = Number(args.port || process.env.PORT || process.env.ACP_BRIDGE_PORT || 32809);
   const host = args.host || process.env.HOST || process.env.ACP_BRIDGE_HOST || "127.0.0.1";
   const profile = args.profile || args["config-dir"];
@@ -98,6 +110,9 @@ function cmdRun(args) {
       ownInstallDir: PKG_ROOT,
       currentVersion: PKG.version,
       statePath: defaultStatePath(HOME),
+      // Drain-aware relaunch: after a successful install, wait for live turns
+      // and code runs to finish before exiting for launchd to restart us.
+      isBusy: () => activeWork().busy,
     });
   }
 }

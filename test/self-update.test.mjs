@@ -28,6 +28,8 @@ import {
   RETRY_BACKOFF_MS,
   MAX_ATTEMPTS,
   DONE_SUPPRESS_MS,
+  scheduleExitWhenIdle,
+  _resetDrainGuardForTests,
 } from "../src/self-update.mjs";
 
 const PKG = "@jaredboynton/claude-agent-api";
@@ -407,4 +409,82 @@ test("autoUpdateTick holds (Gated) when the offered version is in backoff", asyn
   assert.equal(r.outcome, AutoUpdateOutcome.Gated);
   assert.equal(calls.length, 0, "must not spawn npm install while in backoff");
   s.cleanup();
+});
+
+// ---------------------------------------------------------------------------
+// scheduleExitWhenIdle — drain-aware relaunch
+// ---------------------------------------------------------------------------
+
+test("scheduleExitWhenIdle exits immediately when idle", () => {
+  _resetDrainGuardForTests();
+  const exits = [];
+  const timers = [];
+  scheduleExitWhenIdle({
+    isBusy: () => false,
+    exitFn: (c) => exits.push(c),
+    setTimeoutFn: (fn) => { timers.push(fn); return { unref() {} }; },
+  });
+  assert.equal(exits.length, 0, "exit rides a flush timeout, not synchronous");
+  assert.equal(timers.length, 1);
+  timers[0]();
+  assert.deepEqual(exits, [0]);
+});
+
+test("scheduleExitWhenIdle drains: waits while busy, exits once idle", () => {
+  _resetDrainGuardForTests();
+  const exits = [];
+  const timers = [];
+  let busy = true;
+  scheduleExitWhenIdle({
+    isBusy: () => busy,
+    recheckMs: 10,
+    exitFn: (c) => exits.push(c),
+    setTimeoutFn: (fn) => { timers.push(fn); return { unref() {} }; },
+  });
+  // Busy: one recheck timer scheduled, no exit.
+  assert.equal(exits.length, 0);
+  assert.equal(timers.length, 1);
+  timers[0](); // still busy -> another recheck
+  assert.equal(exits.length, 0);
+  assert.equal(timers.length, 2);
+  busy = false;
+  timers[1](); // idle now -> schedules the flush-exit timeout
+  assert.equal(timers.length, 3);
+  timers[2]();
+  assert.deepEqual(exits, [0]);
+});
+
+test("scheduleExitWhenIdle forces exit at the hard deadline even if busy", () => {
+  _resetDrainGuardForTests();
+  const exits = [];
+  const timers = [];
+  let now = 0;
+  scheduleExitWhenIdle({
+    isBusy: () => true,
+    recheckMs: 10,
+    hardDeadlineMs: 100,
+    nowFn: () => now,
+    exitFn: (c) => exits.push(c),
+    setTimeoutFn: (fn) => { timers.push(fn); return { unref() {} }; },
+  });
+  assert.equal(exits.length, 0);
+  now = 101; // past deadline
+  timers[0](); // recheck fires -> deadline reached -> flush-exit timeout
+  timers[1]();
+  assert.deepEqual(exits, [0]);
+});
+
+test("scheduleExitWhenIdle is single-flight", () => {
+  _resetDrainGuardForTests();
+  const first = scheduleExitWhenIdle({
+    isBusy: () => true,
+    setTimeoutFn: () => ({ unref() {} }),
+  });
+  const second = scheduleExitWhenIdle({
+    isBusy: () => true,
+    setTimeoutFn: () => ({ unref() {} }),
+  });
+  assert.equal(first, true);
+  assert.equal(second, false);
+  _resetDrainGuardForTests();
 });
